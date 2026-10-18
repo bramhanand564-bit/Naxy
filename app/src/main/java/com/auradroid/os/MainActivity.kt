@@ -1,5 +1,6 @@
 package com.auradroid.os
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
@@ -12,6 +13,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.speech.RecognizerIntent
 import android.util.TypedValue
@@ -26,8 +29,10 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import kotlinx.coroutines.*
 import org.json.JSONArray
+import java.io.File
 
 @SuppressLint("SetJavaScriptEnabled")
 class MainActivity : AppCompatActivity() {
@@ -43,6 +48,7 @@ class MainActivity : AppCompatActivity() {
     private val accentRoyalBlue = Color.parseColor("#3B82F6")
     private val accentEmerald = Color.parseColor("#10B981")
 
+    private lateinit var serviceBadge: TextView
     private lateinit var tabContainers: Array<View>
     private lateinit var bottomNavButtons: Array<TextView>
 
@@ -50,9 +56,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var chatMessagesLayout: LinearLayout
     private lateinit var chatInputBox: EditText
     private val chatHistoryBuilder = StringBuilder()
-    private var latestPlanTitle = ""
-    private var latestPlannedSteps = listOf<String>()
-    private var latestPlanMode = "LIVE_PHONE"
+
+    // Folder & Video Picker Input Reference
+    private lateinit var folderPathEditText: EditText
 
     // In-App Full Control Browser
     private var studioWebView: WebView? = null
@@ -66,12 +72,16 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val REQ_VOICE_INPUT = 201
         private const val REQ_PICK_TRAINING_VIDEO = 202
+        private const val REQ_PICK_FOLDER_TREE = 203
+        private const val REQ_PICK_SINGLE_VIDEO_FOR_YT = 204
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.statusBarColor = bgMatteDark
         window.navigationBarColor = Color.parseColor("#181B20")
+
+        requestStoragePermissionsIfNeeded()
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -98,10 +108,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        val serviceBadge = TextView(this).apply {
-            val active = AutoTouchService.instance != null
-            text = if (active) "● 24/7 Active" else "○ Enable Body"
-            setTextColor(if (active) accentEmerald else Color.parseColor("#F59E0B"))
+        serviceBadge = TextView(this).apply {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             setPadding(dp(12), dp(6), dp(12), dp(6))
             background = roundedBox(Color.parseColor("#222630"), dp(16), borderSubtle)
@@ -109,11 +116,11 @@ class MainActivity : AppCompatActivity() {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
         }
+        refreshServiceBadge()
 
         header.addView(titleView)
         header.addView(serviceBadge)
 
-        // Content Frame for the 5 Tabs
         val contentFrame = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -134,7 +141,6 @@ class MainActivity : AppCompatActivity() {
             contentFrame.addView(view)
         }
 
-        // Bottom 5-Tab Navigation Bar
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.parseColor("#181B20"))
@@ -162,6 +168,52 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
     }
 
+    override fun onResume() {
+        super.onResume()
+        refreshServiceBadge()
+    }
+
+    private fun refreshServiceBadge() {
+        if (!::serviceBadge.isInitialized) return
+        val active = AutoTouchService.instance != null
+        serviceBadge.text = if (active) "● 24/7 Active" else "○ Enable Body"
+        serviceBadge.setTextColor(if (active) accentEmerald else Color.parseColor("#F59E0B"))
+    }
+
+    private fun requestStoragePermissionsIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.READ_MEDIA_IMAGES),
+                101
+            )
+        } else {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE),
+                101
+            )
+        }
+    }
+
+    private fun ensureAllFilesStorageAccess(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            Toast.makeText(this, "कृपया 'All Files Access' ऑन करें ताकि हर फोल्डर की वीडियो पढ़ी जा सके!", Toast.LENGTH_LONG).show()
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            } catch (_: Exception) {
+                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            }
+            return false
+        }
+        return true
+    }
+
     private fun switchTab(index: Int) {
         tabContainers.forEachIndexed { i, v ->
             v.visibility = if (i == index) View.VISIBLE else View.GONE
@@ -179,7 +231,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * TAB 1: Interactive AI Chat & Detailed Sub-Task Planner (Discuss -> Breakdown -> Start)
+     * TAB 1: Interactive AI Chat & Detailed Sub-Task Planner
      */
     private fun buildTab1ChatAndPlanner(): View {
         val container = LinearLayout(this).apply {
@@ -282,9 +334,6 @@ class MainActivity : AppCompatActivity() {
             addChatBubble("AuraDroid ($modelUsed)", reply, isUser = false)
 
             if (ready && stepsList.isNotEmpty()) {
-                latestPlanTitle = title
-                latestPlannedSteps = stepsList
-                latestPlanMode = mode
                 addDetailedPlanCardToChat(title, mode, stepsList, userMsg)
             }
             scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
@@ -390,7 +439,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * TAB 2: Universal Automations, Folder Video -> YouTube (Oldest/Newest) & Google Flow 8s Daily Scheduler
+     * TAB 2: Universal Automations with Native Folder Picker, Single Video Picker & Quick Folder Chips
      */
     private fun buildTab2AutomationsAndScheduler(): View {
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -400,17 +449,57 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(24))
         }
 
-        // Card 1: Local Folder Video -> YouTube Shorts Direct App Uploader (Oldest vs Newest)
-        val ytCard = createSectionCard("🎬 Folder Video ➔ YouTube Shorts Auto-Uploader")
+        val ytCard = createSectionCard("🎬 Folder / Video ➔ YouTube Shorts Auto-Uploader")
         val defaultFolder = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
-        val folderInput = createCleanInput(
+        folderPathEditText = createCleanInput(
             prefs.getString("yt_folder_path", defaultFolder) ?: defaultFolder,
-            "Video Folder Path (e.g. /storage/emulated/0/Download)"
+            "Video Folder Path"
         )
+
+        // Row of Quick Folder Chips (Download, Camera, Movies) so user never has to type manually!
+        val chipsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(4))
+        }
+
+        fun chipBtn(title: String, path: String): TextView {
+            return TextView(this).apply {
+                text = title
+                setTextColor(textPureWhite)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(dp(10), dp(7), dp(10), dp(7))
+                background = roundedBox(Color.parseColor("#262B36"), dp(8), borderSubtle)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginEnd = dp(6)
+                }
+                gravity = Gravity.CENTER
+                setOnClickListener {
+                    folderPathEditText.setText(path)
+                    prefs.edit().putString("yt_folder_path", path).apply()
+                }
+            }
+        }
+
+        val dlPath = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
+        val camPath = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "Camera").absolutePath
+        val movPath = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES).absolutePath
+
+        chipsRow.addView(chipBtn("📥 Download", dlPath))
+        chipsRow.addView(chipBtn("🎥 Camera", camPath))
+        chipsRow.addView(chipBtn("🎬 Movies", movPath))
+
+        // Native Folder Picker Button (Opens Android File Manager to select any folder)
+        val browseFolderBtn = createPrimaryButton("📂 फोन से फोल्डर चुनें (Browse Folder)", accentRoyalBlue) {
+            if (ensureAllFilesStorageAccess()) {
+                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                startActivityForResult(intent, REQ_PICK_FOLDER_TREE)
+            }
+        }
 
         var pickOldest = prefs.getBoolean("yt_pick_oldest", true)
         val orderToggleBtn = TextView(this).apply {
-            text = if (pickOldest) "📂 Order: Oldest Video First (पुरानी पहले)" else "📂 Order: Newest Video First (नई पहले)"
+            text = if (pickOldest) "🔃 Order: Oldest Video First (पुरानी पहले)" else "🔃 Order: Newest Video First (नई पहले)"
             setTextColor(textPureWhite)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             setPadding(dp(14), dp(10), dp(14), dp(10))
@@ -418,26 +507,48 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener {
                 pickOldest = !pickOldest
                 prefs.edit().putBoolean("yt_pick_oldest", pickOldest).apply()
-                text = if (pickOldest) "📂 Order: Oldest Video First (पुरानी पहले)" else "📂 Order: Newest Video First (नई पहले)"
+                text = if (pickOldest) "🔃 Order: Oldest Video First (पुरानी पहले)" else "🔃 Order: Newest Video First (नई पहले)"
             }
         }
 
-        val runYtNowBtn = createPrimaryButton("🚀 Instant Test: अभी 1 वीडियो YouTube पर अपलोड करें", accentEmerald) {
-            val path = folderInput.text.toString().trim()
+        val runYtNowBtn = createPrimaryButton("🚀 Instant Test: फोल्डर से 1 वीडियो YouTube पर अपलोड करें", accentEmerald) {
+            if (!ensureAllFilesStorageAccess()) return@createPrimaryButton
+            val path = folderPathEditText.text.toString().trim()
             prefs.edit().putString("yt_folder_path", path).apply()
             val svc = AutoTouchService.instance
             if (svc == null) {
-                Toast.makeText(this, "Accessibility ऑन करें!", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "पहले Accessibility Service ऑन करें!", Toast.LENGTH_SHORT).show()
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             } else {
                 svc.startYouTubeFolderAutoUpload(path, pickOldest)
             }
         }
 
-        ytCard.addView(folderInput)
+        // Direct Single Video Picker Button (Select any 1 video file from Gallery/File Manager and upload immediately)
+        val pickSingleVideoBtn = createPrimaryButton("🎬 सीधे गैलरी से 1 वीडियो चुनें और अभी अपलोड करें", Color.parseColor("#0D9488")) {
+            val svc = AutoTouchService.instance
+            if (svc == null) {
+                Toast.makeText(this, "पहले Accessibility Service ऑन करें!", Toast.LENGTH_SHORT).show()
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            } else {
+                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "video/*"
+                }
+                startActivityForResult(intent, REQ_PICK_SINGLE_VIDEO_FOR_YT)
+            }
+        }
+
+        ytCard.addView(folderPathEditText)
+        ytCard.addView(chipsRow)
+        ytCard.addView(spacer(dp(8)))
+        ytCard.addView(browseFolderBtn)
         ytCard.addView(spacer(dp(8)))
         ytCard.addView(orderToggleBtn)
         ytCard.addView(spacer(dp(12)))
         ytCard.addView(runYtNowBtn)
+        ytCard.addView(spacer(dp(8)))
+        ytCard.addView(pickSingleVideoBtn)
 
         // Card 2: Google Flow (1000 Credits) -> 8s Video -> YouTube Shorts Pipeline
         val flowCard = createSectionCard("✨ Google Flow (8s Video) ➔ YouTube Pipeline")
@@ -455,7 +566,7 @@ class MainActivity : AppCompatActivity() {
             val count = creditLimitInput.text.toString().toIntOrNull()?.coerceIn(1, 3) ?: 1
             prefs.edit().putString("flow_topic", topic).putInt("flow_daily_videos", count).apply()
             AutoTouchService.instance?.startGoogleFlowToYouTubePipeline(topic, count)
-                ?: Toast.makeText(this, "Accessibility ऑन करें!", Toast.LENGTH_SHORT).show()
+                ?: Toast.makeText(this, "पहले Accessibility Service ऑन करें!", Toast.LENGTH_SHORT).show()
         }
 
         flowCard.addView(topicInput)
@@ -464,7 +575,7 @@ class MainActivity : AppCompatActivity() {
         flowCard.addView(spacer(dp(12)))
         flowCard.addView(runFlowNowBtn)
 
-        // Card 3: 24/7 Daily Time Scheduler (e.g. 19:00 / 7:00 PM or 20:00 / 8:00 PM)
+        // Card 3: 24/7 Daily Time Scheduler
         val schedCard = createSectionCard("⏰ 24/7 Daily Auto-Scheduler (7:00 PM / 8:00 PM)")
         val timeInput = createCleanInput(
             prefs.getString("schedule_time_hm", "19:00") ?: "19:00",
@@ -513,7 +624,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * TAB 3: Full-Control In-App Browser (Manual Gmail Login + Back/Next/Refresh/Desktop/Downloads/Save Page)
+     * TAB 3: Full-Control In-App Browser
      */
     private fun buildTab3FullControlBrowser(): View {
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -521,7 +632,6 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
         }
 
-        // Top Navigation & Control Bar
         val navBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -559,7 +669,6 @@ class MainActivity : AppCompatActivity() {
             studioWebView?.loadUrl(u)
         })
 
-        // Second Action Strip: Google Login, Desktop Toggle, Downloads, Pin Target Page
         val toolStrip = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -628,7 +737,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * TAB 4: On-Demand Stuck/Human-Fix App Folders (Memory/Instagram, Memory/YouTube) + Screen Recording Video Trainer
+     * TAB 4: Memory Folders & Screen Recording Video Trainer
      */
     private fun buildTab4MemoryAndVideoTrainer(): View {
         val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
@@ -638,7 +747,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(24))
         }
 
-        // Card 1: Video Trainer (Upload Screen Recording Video -> Gemini 3.8/Pro learns every frame)
         val trainerCard = createSectionCard("📹 Video Trainer (वीडियो दिखाकर नया काम सिखाएं)")
         val catInput = createCleanInput("Instagram", "App Folder Name (e.g. Instagram, YouTube, WhatsApp)")
         val noteInput = createCleanInput(
@@ -660,14 +768,12 @@ class MainActivity : AppCompatActivity() {
         trainerCard.addView(spacer(dp(12)))
         trainerCard.addView(pickVideoBtn)
 
-        // Card 2: App-Wise Learned Fixes Folders (Only Stuck & Human Fixes)
         val foldersCard = createSectionCard("📁 App-Wise Stuck & Human-Fix Memory Folders")
         memoryCategoriesLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
         foldersCard.addView(memoryCategoriesLayout)
 
-        // Card 3: Personal Info & Web Form Auto-Fill Vault
         val profileCard = createSectionCard("🔐 Personal Profile & Form Auto-Fill Memory")
         val profileInput = createCleanInput(
             vault.getUserProfileRules(),
@@ -740,7 +846,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * TAB 5: Engine Settings, Live vs Background Switch, Passive Teach Toggle, Free-Tier Model Ladder & Body Calibration
+     * TAB 5: Engine Settings & Body Permissions
      */
     private fun buildTab5EngineAndBodySettings(): View {
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -750,7 +856,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(24))
         }
 
-        // Card 1: Gemini API Key & Free-Tier Model Ladder (2.5 Flash -> 3.1 -> 3.5 -> 3.8 Pro)
         val apiCard = createSectionCard("🔑 Gemini API & Free-Tier Model Ladder")
         val keyInput = createCleanInput(
             prefs.getString("gemini_api_key", "") ?: "",
@@ -776,7 +881,6 @@ class MainActivity : AppCompatActivity() {
         apiCard.addView(saveKeyBtn)
         apiCard.addView(ladderInfo)
 
-        // Card 2: Execution Mode (Live Real Touch vs Background Web) & Passive Teach Mode
         val modeCard = createSectionCard("🎛️ Execution Mode & Human-Fix Learning")
 
         var currentMode = prefs.getString("execution_mode", "LIVE_PHONE") ?: "LIVE_PHONE"
@@ -805,7 +909,6 @@ class MainActivity : AppCompatActivity() {
         modeCard.addView(spacer(dp(10)))
         modeCard.addView(teachSwitchBtn)
 
-        // Card 3: Calibrated Device Body Specs & Permissions
         val bodyCard = createSectionCard("🦾 Calibrated Phone Body & 24/7 Permissions")
         val specs = AutoTouchService.instance?.getCalibratedDeviceBodySpecs()
         val specsTv = TextView(this).apply {
@@ -814,7 +917,7 @@ class MainActivity : AppCompatActivity() {
                     "• Real Full-Screen Pixels: ${specs.screenWidth} × ${specs.screenHeight} px\n" +
                     "• Top Punch-Hole / Cutout Safe Zone: 0 to ${specs.cutoutSafeTop} px\n" +
                     "• Bottom Nav Bar Height: ${specs.navBarHeight} px\n" +
-                    "• Screenshot Format: HD WebP (85% Crystal Clear)"
+                    "• Screenshot Format: HD WebP (2.5s Non-Blocking Timeout)"
             } else {
                 "Enable Accessibility Service below to calibrate your screen, notch & punch-hole cutout."
             }
@@ -835,7 +938,13 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
 
-        val batteryBtn = createPrimaryButton("🔋 3. Enable 24/7 Unstoppable Battery Mode", accentEmerald) {
+        val storageBtn = createPrimaryButton("📁 3. Grant All Files Access (For Video Folders)", Color.parseColor("#0D9488")) {
+            if (ensureAllFilesStorageAccess()) {
+                Toast.makeText(this, "All Files Access Already Granted!", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        val batteryBtn = createPrimaryButton("🔋 4. Enable 24/7 Unstoppable Battery Mode", accentEmerald) {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
                 startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
@@ -849,6 +958,8 @@ class MainActivity : AppCompatActivity() {
         bodyCard.addView(overlayBtn)
         bodyCard.addView(spacer(dp(8)))
         bodyCard.addView(accessBtn)
+        bodyCard.addView(spacer(dp(8)))
+        bodyCard.addView(storageBtn)
         bodyCard.addView(spacer(dp(8)))
         bodyCard.addView(batteryBtn)
 
@@ -864,37 +975,78 @@ class MainActivity : AppCompatActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (resultCode != Activity.RESULT_OK || data == null) return
 
-        if (requestCode == REQ_VOICE_INPUT) {
-            val spoken = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull() ?: return
-            chatInputBox.setText(spoken)
-        } else if (requestCode == REQ_PICK_TRAINING_VIDEO) {
-            val videoUri = data.data ?: return
-            Toast.makeText(this, "Extracting video frames for Gemini 3.8/Pro...", Toast.LENGTH_LONG).show()
-            val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
-            val brain = AutoTouchService.instance?.geminiBrain ?: GeminiBrain(prefs.getString("gemini_api_key", "") ?: "")
-            val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+        when (requestCode) {
+            REQ_VOICE_INPUT -> {
+                val spoken = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull() ?: return
+                chatInputBox.setText(spoken)
+            }
 
-            uiScope.launch(Dispatchers.IO) {
-                val frames = vault.extractKeyFramesBase64FromVideo(videoUri, maxFrames = 6)
-                val learnedWorkflow = brain.analyzeTrainingVideoFrames(
-                    appCategory = selectedTrainingCategory,
-                    userInstruction = "Learn step-by-step workflow from this user screen recording",
-                    framesBase64 = frames
-                )
-                vault.saveStuckOrHumanFix(
-                    category = selectedTrainingCategory,
-                    screenSignature = "video_training",
-                    problemDescription = "Video Trained Workflow",
-                    solutionRule = learnedWorkflow,
-                    tapXRatio = 0.5f,
-                    tapYRatio = 0.5f
-                )
-                withContext(Dispatchers.Main) {
-                    refreshMemoryFoldersList()
-                    Toast.makeText(this@MainActivity, "✅ Video Trained & Saved in Memory/$selectedTrainingCategory!", Toast.LENGTH_LONG).show()
+            REQ_PICK_FOLDER_TREE -> {
+                val treeUri = data.data ?: return
+                val docId = DocumentsContract.getTreeDocumentId(treeUri)
+                val split = docId.split(":")
+                val resolvedPath = if (split.size >= 2) {
+                    "${Environment.getExternalStorageDirectory().absolutePath}/${split[1]}"
+                } else {
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
+                }
+                folderPathEditText.setText(resolvedPath)
+                getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+                    .edit().putString("yt_folder_path", resolvedPath).apply()
+                Toast.makeText(this, "📂 Selected Folder: $resolvedPath", Toast.LENGTH_SHORT).show()
+            }
+
+            REQ_PICK_SINGLE_VIDEO_FOR_YT -> {
+                val videoUri = data.data ?: return
+                try {
+                    contentResolver.takePersistableUriPermission(videoUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                } catch (_: Exception) {}
+                val displayName = getFileNameFromUri(videoUri)
+                AutoTouchService.instance?.startSinglePickedVideoYouTubeUpload(videoUri, displayName)
+            }
+
+            REQ_PICK_TRAINING_VIDEO -> {
+                val videoUri = data.data ?: return
+                Toast.makeText(this, "Extracting video frames for Gemini 3.8/Pro...", Toast.LENGTH_LONG).show()
+                val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+                val brain = AutoTouchService.instance?.geminiBrain ?: GeminiBrain(prefs.getString("gemini_api_key", "") ?: "")
+                val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+
+                uiScope.launch(Dispatchers.IO) {
+                    val frames = vault.extractKeyFramesBase64FromVideo(videoUri, maxFrames = 6)
+                    val learnedWorkflow = brain.analyzeTrainingVideoFrames(
+                        appCategory = selectedTrainingCategory,
+                        userInstruction = "Learn step-by-step workflow from this user screen recording",
+                        framesBase64 = frames
+                    )
+                    vault.saveStuckOrHumanFix(
+                        category = selectedTrainingCategory,
+                        screenSignature = "video_training",
+                        problemDescription = "Video Trained Workflow",
+                        solutionRule = learnedWorkflow,
+                        tapXRatio = 0.5f,
+                        tapYRatio = 0.5f
+                    )
+                    withContext(Dispatchers.Main) {
+                        refreshMemoryFoldersList()
+                        Toast.makeText(this@MainActivity, "✅ Video Trained & Saved in Memory/$selectedTrainingCategory!", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
         }
+    }
+
+    private fun getFileNameFromUri(uri: Uri): String {
+        var name = "viral_short_video.mp4"
+        try {
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0 && cursor.moveToFirst()) {
+                    name = cursor.getString(idx) ?: name
+                }
+            }
+        } catch (_: Exception) {}
+        return name
     }
 
     private fun startVoiceInput() {
