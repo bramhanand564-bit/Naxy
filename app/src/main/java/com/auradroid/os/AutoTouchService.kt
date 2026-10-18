@@ -10,26 +10,42 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
 import android.net.Uri
-import android.os.*
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.PowerManager
+import android.os.StrictMode
 import android.provider.Settings
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.webkit.WebView
 import androidx.core.app.NotificationCompat
-import androidx.core.content.FileProvider
-import kotlinx.coroutines.*
-import org.json.JSONArray
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.net.URL
 import java.util.Locale
 import kotlin.coroutines.resume
+import kotlin.math.hypot
 
 data class TaggedUiElement(
     val tagId: Int,
@@ -55,7 +71,9 @@ class AutoTouchService : AccessibilityService() {
             val line = "[$time] $msg"
             synchronized(liveLogs) {
                 liveLogs.add(0, line)
-                if (liveLogs.size > 120) liveLogs.removeLast()
+                if (liveLogs.size > 120) {
+                    liveLogs.removeAt(liveLogs.lastIndex)
+                }
             }
         }
     }
@@ -125,7 +143,12 @@ class AutoTouchService : AccessibilityService() {
                 .setSmallIcon(android.R.drawable.sym_def_app_icon)
                 .setOngoing(true)
                 .build()
-            startForeground(1001, notif)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(1001, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(1001, notif)
+            }
         } catch (_: Exception) {}
     }
 
@@ -188,8 +211,7 @@ class AutoTouchService : AccessibilityService() {
 
     /**
      * Trigger 1: On-Demand Human-Fix Watcher!
-     * Only records to MemoryVault when user manually taps to fix a screen during an active/stuck task
-     * or when Passive Teach Mode is enabled.
+     * Only records to MemoryVault when user manually taps to fix a screen during an active/stuck task.
      */
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
@@ -247,7 +269,7 @@ class AutoTouchService : AccessibilityService() {
     }
 
     /**
-     * Universal Autonomous Goal-Based Executor (No 25-step limit! Runs 24/7 until goal completed or Stopped)
+     * Universal Autonomous Goal-Based Executor (Runs 24/7 until goal completed or Stopped)
      */
     fun startUniversalTask(
         goal: String,
@@ -281,7 +303,7 @@ class AutoTouchService : AccessibilityService() {
                     return@launch
                 }
 
-                // LIVE REAL PHONE CONTROL LOOP (No step limit — runs until goal is achieved)
+                // LIVE REAL PHONE CONTROL LOOP
                 while (isActive && isAgentRunning) {
                     stepNumber++
                     val specs = getCalibratedDeviceBodySpecs()
@@ -300,7 +322,6 @@ class AutoTouchService : AccessibilityService() {
 
                     val isStuck = consecutiveSameScreenCount >= 2
 
-                    // Take HD Screenshot
                     hud.updateStatus(
                         if (isStuck) "🧠 Stuck Recall ($currentAppCategory)..." else "👁️ Step $stepNumber Scanning...",
                         if (isStuck) BotMood.THINKING else BotMood.WORKING,
@@ -413,7 +434,6 @@ class AutoTouchService : AccessibilityService() {
                             stepHistory.add("Typed '${decision.text.take(20)}'")
                             delay(1200L)
 
-                            // WhatsApp / Chat Auto-Send Guarantee
                             if (activePkg.contains("whatsapp") || isContinuousMonitor) {
                                 clickWhatsAppSendIfPresent()
                             }
@@ -439,7 +459,6 @@ class AutoTouchService : AccessibilityService() {
                     }
                 }
             } catch (_: CancellationException) {
-                // Clean cancellation without any StandaloneCoroutine error!
                 hud.updateStatus("Stopped", BotMood.IDLE, taskRunning = false)
             } catch (e: Exception) {
                 log("⚠️ Task Warning: ${e.message}")
@@ -452,8 +471,7 @@ class AutoTouchService : AccessibilityService() {
     }
 
     /**
-     * Tested 100% Working Local Video Folder -> YouTube Shorts Direct App Auto-Uploader
-     * Supports Oldest or Newest video selection + Single Clean Paste + 96.4% Physical Upload Short Tap
+     * Local Video Folder -> YouTube Shorts Direct App Auto-Uploader (Oldest or Newest Video)
      */
     fun startYouTubeFolderAutoUpload(folderPath: String, pickOldestFirst: Boolean) {
         currentTaskJob?.cancel()
@@ -511,7 +529,6 @@ class AutoTouchService : AccessibilityService() {
     private suspend fun uploadVideoFileToYouTubeShorts(videoFile: File, viralTitle: String) {
         val specs = getCalibratedDeviceBodySpecs()
 
-        // Launch YouTube directly with ACTION_SEND video intent
         withContext(Dispatchers.Main) {
             val uri = Uri.fromFile(videoFile)
             StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
@@ -527,7 +544,6 @@ class AutoTouchService : AccessibilityService() {
         hud.updateStatus("Opening YouTube Shorts...", BotMood.WORKING, taskRunning = true)
         delay(4500L)
 
-        // Step 1 & 2: Click Next on Trimmer and Editor screens until Add details / Caption screen opens
         for (attempt in 1..8) {
             if (!isAgentRunning) return
             val elements = scanScreenInteractiveElements(specs)
@@ -546,13 +562,11 @@ class AutoTouchService : AccessibilityService() {
                 tapDeadCenterOfElement(nextBtn)
                 delay(3800L)
             } else {
-                // Fallback top-right / bottom-right Next button tap
                 performPhysicalTap((specs.screenWidth * 0.88f).toInt(), (specs.screenHeight * 0.93f).toInt())
                 delay(3500L)
             }
         }
 
-        // Step 3: Single Clean Title Paste into Caption your Short
         hud.updateStatus("Typing Viral Caption...", BotMood.WORKING, taskRunning = true)
         val detailsElements = scanScreenInteractiveElements(specs)
         val captionNode = detailsElements.find {
@@ -567,15 +581,12 @@ class AutoTouchService : AccessibilityService() {
         }
         delay(1500L)
 
-        // Single clean paste (prevents double pasting)
         typeAndPasteTextReliably(viralTitle)
         delay(1400L)
 
-        // Close keyboard with Back action so bottom Upload Short button is 100% uncovered
         performGlobalAction(GLOBAL_ACTION_BACK)
         delay(1600L)
 
-        // Step 4: Guaranteed Physical Finger Tap on White 'Upload Short' Button Center (96.4% real screen height)
         for (retry in 1..3) {
             if (!isAgentRunning) return
             val postElements = scanScreenInteractiveElements(specs)
@@ -638,7 +649,6 @@ class AutoTouchService : AccessibilityService() {
                     }
                     delay(5000L)
 
-                    // Single-Shot Credit Lock: Type prompt into "What do you want to create?" & submit ONCE
                     hud.updateStatus("Flow: Submitting 8s Prompt...", BotMood.WORKING, taskRunning = true)
                     val jsSubmit = """
                         (function() {
@@ -668,7 +678,6 @@ class AutoTouchService : AccessibilityService() {
                         webView.evaluateJavascript(jsSubmit, null)
                     }
 
-                    // Smart Watcher Mode: Wait up to 4 minutes for 8s video stream (<video src="...">) to finish rendering
                     var downloadedVideoFile: File? = null
                     for (waitTick in 1..48) {
                         if (!isAgentRunning) break
@@ -709,7 +718,6 @@ class AutoTouchService : AccessibilityService() {
             if (!isAgentRunning) break
             hud.updateStatus("🌐 Web Step $step...", BotMood.WORKING, taskRunning = true)
 
-            // Inject Visual Number Stickers [0], [1], [2] into Background WebView DOM before Canvas Screenshot
             val domTagList = injectVisualNumberStickersInWebView(webView)
             delay(400L)
             val webBitmap = hud.captureWebViewCanvasBitmap()
@@ -829,7 +837,7 @@ class AutoTouchService : AccessibilityService() {
         }
 
     /**
-     * 24/7 Daily Background Scheduler Loop (Runs scheduled pipelines at user-configured HH:mm)
+     * 24/7 Daily Background Scheduler Loop
      */
     private fun startDailySchedulerLoop() {
         schedulerJob?.cancel()
@@ -917,9 +925,6 @@ class AutoTouchService : AccessibilityService() {
         return pkg + ":" + elements.take(15).joinToString("|") { "${it.label}@${it.centerY / 40}" }
     }
 
-    /**
-     * Converts 0..1000 Gemini normalized coordinates into calibrated physical pixels
-     */
     private fun convertNormalizedX(valX: Int, specs: DeviceBodySpecs): Int {
         return if (valX <= 1000) {
             ((valX / 1000f) * specs.screenWidth).toInt().coerceIn(10, specs.screenWidth - 10)
@@ -937,13 +942,10 @@ class AutoTouchService : AccessibilityService() {
 
     private fun findNearestElementToSnap(px: Int, py: Int, elements: List<TaggedUiElement>): TaggedUiElement? {
         return elements.filter { it.node?.isClickable == true }
-            .minByOrNull { kotlin.math.hypot((it.centerX - px).toDouble(), (it.centerY - py).toDouble()) }
-            ?.takeIf { kotlin.math.hypot((it.centerX - px).toDouble(), (it.centerY - py).toDouble()) <= 85.0 }
+            .minByOrNull { hypot((it.centerX - px).toDouble(), (it.centerY - py).toDouble()) }
+            ?.takeIf { hypot((it.centerX - px).toDouble(), (it.centerY - py).toDouble()) <= 85.0 }
     }
 
-    /**
-     * Taps the Exact Mathematical Center of a UI Element + Shows Plump Baymax Hand
-     */
     private suspend fun tapDeadCenterOfElement(element: TaggedUiElement) {
         performPhysicalTap(element.centerX, element.centerY)
     }
@@ -981,9 +983,6 @@ class AutoTouchService : AccessibilityService() {
         delay(420L)
     }
 
-    /**
-     * Single Clean Text Entry & Clipboard Paste (Prevents double paste on Litho / YouTube / Instagram views)
-     */
     private suspend fun typeAndPasteTextReliably(textToType: String) {
         if (textToType.isBlank()) return
         withContext(Dispatchers.Main) {
@@ -1059,9 +1058,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Direct App Launcher Power (Opens any installed app in 0.1s without hunting on the home screen)
-     */
     private fun launchAppByNameOrPackage(query: String) {
         val q = query.trim().lowercase(Locale.ROOT)
         val knownMap = mapOf(
@@ -1094,9 +1090,6 @@ class AutoTouchService : AccessibilityService() {
         log("⚠️ App not found for '$query'")
     }
 
-    /**
-     * Direct Phone Settings Fixer Power
-     */
     private fun openSystemSettingsSection(section: String) {
         val s = section.lowercase(Locale.ROOT)
         val action = when {
