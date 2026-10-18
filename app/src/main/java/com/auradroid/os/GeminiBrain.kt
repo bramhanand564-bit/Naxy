@@ -9,6 +9,7 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Locale
 
 data class DeviceBodySpecs(
     val modelName: String,
@@ -21,7 +22,7 @@ data class DeviceBodySpecs(
 )
 
 data class AgentStepDecision(
-    val action: String,         // CLICK_TAG, CLICK_XY, LONG_PRESS_XY, TYPE, SWIPE, LAUNCH_APP, OPEN_SETTINGS, WAIT, ASK_USER, DONE
+    val action: String,         // CLICK_TAG, CLICK_XY, LONG_PRESS_XY, TYPE, SWIPE, LAUNCH_APP, OPEN_SETTINGS, WAIT, DONE
     val tagId: Int = -1,
     val x: Int = 0,
     val y: Int = 0,
@@ -57,7 +58,6 @@ class GeminiBrain(private var apiKey: String) {
         "gemini-2.5-flash"
     )
 
-    // Automatically blocks models returning 404/403 so we never waste time on them again
     private val blockedModels = mutableSetOf<String>()
 
     fun updateApiKey(newKey: String) {
@@ -73,17 +73,25 @@ class GeminiBrain(private var apiKey: String) {
     /**
      * Converts any Screenshot Bitmap into sharp HD WebP (85% quality) Base64
      */
+    @Suppress("DEPRECATION")
     fun bitmapToHdWebpBase64(bitmap: Bitmap, maxHeight: Int = 1280): String {
         val ratio = bitmap.width.toFloat() / bitmap.height.toFloat()
         val targetH = bitmap.height.coerceAtMost(maxHeight)
         val targetW = (targetH * ratio).toInt().coerceAtLeast(360)
         val scaled = if (bitmap.height > targetH) {
             Bitmap.createScaledBitmap(bitmap, targetW, targetH, true)
-        } else bitmap
+        } else {
+            bitmap
+        }
 
         val bos = ByteArrayOutputStream()
         scaled.compress(Bitmap.CompressFormat.WEBP, 85, bos)
         return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+    }
+
+    private fun parseCleanJson(raw: String): JSONObject {
+        val body = raw.substringAfter("{").substringBeforeLast("}")
+        return JSONObject("{$body}")
     }
 
     /**
@@ -112,7 +120,6 @@ class GeminiBrain(private var apiKey: String) {
             }
         }
 
-        // Dynamic ListModels Fallback if standard names shifted
         val discovered = discoverAvailableFlashModel()
         if (discovered != null) {
             val res = executeSingleModelCall(discovered, prompt, imagesBase64)
@@ -199,7 +206,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 1. Interactive Chat & Detailed Task Planner (Discuss -> Breakdown into Small Sub-Tasks -> Execute)
+     * 1. Interactive Chat & Detailed Task Planner
      */
     suspend fun chatAndBuildDetailedPlan(
         userMessage: String,
@@ -236,11 +243,10 @@ class GeminiBrain(private var apiKey: String) {
 
         val (raw, model) = callWithLadder(sysPrompt, useHighThinkingFirst = false)
         return try {
-            val clean = raw.substringAfter("{").substringBeforeLast("}")
-            JSONObject("{$clean}").put("modelUsed", model)
+            parseCleanJson(raw).put("modelUsed", model)
         } catch (_: Exception) {
             JSONObject().apply {
-                put("reply", if (raw.isNotBlank()) raw else "भाई, अपनी Gemini API Key एक बार Settings टैब में चेक कर लो।")
+                put("reply", if (raw.isNotBlank()) raw else "भाई, अपनी Gemini API Key एक बार Engine टैब में चेक कर लो।")
                 put("readyToExecute", false)
                 put("steps", JSONArray())
             }
@@ -249,7 +255,6 @@ class GeminiBrain(private var apiKey: String) {
 
     /**
      * 2. Real-Time Vision + Set-of-Mark Tagging + Device Body Calibration Step Engine
-     * Notes: Only loads Learned Memory if `isStuck == true` so normal steps run blazing fast!
      */
     suspend fun decideNextStep(
         goal: String,
@@ -265,15 +270,23 @@ class GeminiBrain(private var apiKey: String) {
         val imgList = if (screenshotBitmap != null) listOf(bitmapToHdWebpBase64(screenshotBitmap)) else emptyList()
 
         val memoryBlock = if (isStuck && recalledFixes.isNotEmpty()) {
-            "🚨 STUCK RECOVERY MEMORY (Past Human Fixes for this App):\n" +
+            "STUCK RECOVERY MEMORY (Past Human Fixes for this App):\n" +
                 recalledFixes.joinToString("\n") {
-                    "- When stuck on [${it.problemDescription}]:${it.solutionRule} (Tap ratio X=${it.tapXRatio}, Y=${it.tapYRatio})"
+                    "- When stuck on [${it.problemDescription}]: ${it.solutionRule} (Tap ratio X=${it.tapXRatio}, Y=${it.tapYRatio})"
                 }
-        } else ""
+        } else {
+            ""
+        }
 
         val monitorRule = if (isContinuousMonitor) {
-            "IMPORTANT: This is a CONTINUOUS MONITORING / LIVE CHAT task. NEVER return DONE after sending 1 reply! After sending a message, return WAIT to watch for the next incoming message on the left side."
-        } else ""
+            "IMPORTANT: This is a CONTINUOUS MONITORING / LIVE CHAT task. NEVER return DONE after sending 1 reply! After sending a message, return WAIT to watch for the next incoming message."
+        } else {
+            ""
+        }
+
+        val plannedJoined = planSteps.joinToString(" -> ")
+        val recentJoined = currentStepHistory.takeLast(6).joinToString(" | ")
+        val navTop = bodySpecs.screenHeight - bodySpecs.navBarHeight
 
         val prompt = """
             You are AuraDroid OS Autonomous Vision Engine controlling an Android device.
@@ -282,22 +295,23 @@ class GeminiBrain(private var apiKey: String) {
             - Phone Model: ${bodySpecs.modelName}
             - Exact Full Screen Resolution: ${bodySpecs.screenWidth}x${bodySpecs.screenHeight} px
             - Top Punch-Hole / Status Bar Unsafe Zone: Y = 0 to ${bodySpecs.cutoutSafeTop} px (NEVER tap inside this top status bar!)
-            - Bottom Navigation Bar Zone: Y = ${bodySpecs.screenHeight - bodySpecs.navBarHeight} to${bodySpecs.screenHeight} px
+            - Bottom Navigation Bar Zone: Y = $navTop to ${bodySpecs.screenHeight} px
             
             OVERALL GOAL: $goal
-            PLANNED SUB-TASKS: ${planSteps.joinToString(" -> ")}
-            RECENT ACTIONS TAKEN: ${currentStepHistory.takeLast(6).joinToString(" | ")}
-            $monitorRule$memoryBlock
+            PLANNED SUB-TASKS: $plannedJoined
+            RECENT ACTIONS TAKEN: $recentJoined
+            $monitorRule
+            $memoryBlock
             
             INTERACTIVE ELEMENTS ON SCREEN (with [TAG_ID] and exact Center X,Y):
             $numberedNodesList
             
             INSTRUCTIONS:
             1. Look carefully at the attached HD screenshot and the interactive element list.
-            2. Prefer "CLICK_TAG" with the exact "tagId" whenever the target button/box is in the list (this guarantees dead-center tap!).
-            3. If an icon/element is visible in the screenshot but NOT in the tag list, use "CLICK_XY" with 0..1000 normalized coordinates (where 0,0 is top-left and 1000,1000 is bottom-right).
-            4. If you need to open an app (like Instagram, YouTube, WhatsApp, Chrome) and it's not open yet, return "LAUNCH_APP" with "packageNameOrSetting" set to the app name (e.g. "instagram", "youtube", "whatsapp", "chrome").
-            5. If you need to fix a phone setting (Wi-Fi, Bluetooth, Battery, Sound, Display, Accessibility), return "OPEN_SETTINGS" with "packageNameOrSetting" (e.g. "battery", "wifi", "sound", "display").
+            2. Prefer "CLICK_TAG" with the exact "tagId" whenever the target button/box is in the list (guarantees dead-center tap!).
+            3. If an icon/element is visible in the screenshot but NOT in the tag list, use "CLICK_XY" with 0..1000 normalized coordinates.
+            4. If you need to open an app (like Instagram, YouTube, WhatsApp, Chrome) and it's not open yet, return "LAUNCH_APP" with "packageNameOrSetting" set to the app name.
+            5. If you need to fix a phone setting (Wi-Fi, Bluetooth, Battery, Sound, Display, Accessibility), return "OPEN_SETTINGS" with "packageNameOrSetting".
             6. To type text into a focused input or search bar, return "TYPE" with "tagId" (or x,y) and "text".
             7. To scroll or swipe Reels/Pages, return "SWIPE" with start x,y and endX,endY (in 0..1000 scale).
             
@@ -311,17 +325,15 @@ class GeminiBrain(private var apiKey: String) {
               "endY": 200,
               "text": "",
               "packageNameOrSetting": "",
-              "reason": "Brief 5-word status of what you are doing"
+              "reason": "Brief 5-word status"
             }
         """.trimIndent()
 
-        // If stuck, automatically escalate to High-Thinking 3.8 / Pro models!
         val (raw, modelUsed) = callWithLadder(prompt, imgList, useHighThinkingFirst = isStuck)
         return try {
-            val clean = raw.substringAfter("{").substringBeforeLast("}")
-            val j = JSONObject("{$clean}")
+            val j = parseCleanJson(raw)
             AgentStepDecision(
-                action = j.optString("action", "WAIT").uppercase(),
+                action = j.optString("action", "WAIT").uppercase(Locale.ROOT),
                 tagId = j.optInt("tagId", -1),
                 x = j.optInt("x", 500),
                 y = j.optInt("y", 500),
@@ -338,7 +350,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 3. High-Thinking Memory Analyzer (Triggered when Human fixes a stuck screen or uploads a Training Video)
+     * 3. High-Thinking Memory Analyzer (Triggered when Human fixes a stuck screen)
      */
     suspend fun analyzeHumanFixWithProModel(
         appCategory: String,
@@ -349,10 +361,13 @@ class GeminiBrain(private var apiKey: String) {
         clickedNodeDesc: String
     ): Pair<String, String> {
         val imgs = if (stuckScreenshot != null) listOf(bitmapToHdWebpBase64(stuckScreenshot)) else emptyList()
+        val xFormatted = String.format(Locale.US, "%.2f", humanTapXRatio)
+        val yFormatted = String.format(Locale.US, "%.2f", humanTapYRatio)
+
         val prompt = """
             You are the High-Thinking Memory Architect (Gemini 3.8 / Pro) for AuraDroid OS.
             While executing "$goal" inside "$appCategory", the agent got stuck or the human intervened.
-            The human tapped at screen ratio X=${"%.2f".format(humanTapXRatio)}, Y=${"\%.2f".format(humanTapYRatio)} (Element: $clickedNodeDesc).
+            The human tapped at screen ratio X=$xFormatted, Y=$yFormatted (Element: $clickedNodeDesc).
             
             Look at the screenshot and create a permanent rule for future runs in "$appCategory".
             Return ONLY JSON:
@@ -364,13 +379,13 @@ class GeminiBrain(private var apiKey: String) {
 
         val (raw, _) = callWithLadder(prompt, imgs, useHighThinkingFirst = true)
         return try {
-            val j = JSONObject("{${raw.substringAfter("{").substringBeforeLast("}")}}")
+            val j = parseCleanJson(raw)
             Pair(
                 j.optString("problem", "Stuck screen in $appCategory"),
-                j.optString("solutionRule", "Tap element '$clickedNodeDesc' at ratio ($humanTapXRatio,$humanTapYRatio)")
+                j.optString("solutionRule", "Tap element '$clickedNodeDesc' at ratio ($xFormatted, $yFormatted)")
             )
         } catch (_: Exception) {
-            Pair("User Intervention in $appCategory", "Tap '$clickedNodeDesc' at ratio ($humanTapXRatio,$humanTapYRatio)")
+            Pair("User Intervention in $appCategory", "Tap '$clickedNodeDesc' at ratio ($xFormatted, $yFormatted)")
         }
     }
 
@@ -385,15 +400,15 @@ class GeminiBrain(private var apiKey: String) {
             Keep it concise and actionable.
         """.trimIndent()
         val (raw, model) = callWithLadder(prompt, framesBase64, useHighThinkingFirst = true)
-        return if (raw.isNotBlank()) "[$model]$raw" else "Workflow saved for $appCategory."
+        return if (raw.isNotBlank()) "[$model] $raw" else "Workflow saved for $appCategory."
     }
 
     /**
      * 4. Zero-Policy-Violation Safe Video Prompt + Viral YouTube Shorts Title Generator
      */
     suspend fun generateFlowSafePromptAndTitle(topic: String): Pair<String, String> {
-        val sanitizedTopic = topic
-            .replace(Regex("(?i)\\b(boy|girl|child|kid|minor|baby|skin)\\b"), "cybernetic explorer")
+        val safeRegex = Regex("(?i)\\b(boy|girl|child|kid|minor|baby|skin)\\b")
+        val sanitizedTopic = topic.replace(safeRegex, "cybernetic explorer")
 
         val prompt = """
             Create:
@@ -404,21 +419,21 @@ class GeminiBrain(private var apiKey: String) {
             Return ONLY JSON:
             {
               "videoPrompt": "Cinematic 8k vertical video of...",
-              "youtubeTitle": "Amazing Title! 🔥✨ #shorts #viral"
+              "youtubeTitle": "Amazing Title! #shorts #viral"
             }
         """.trimIndent()
 
         val (raw, _) = callWithLadder(prompt, useHighThinkingFirst = false)
         return try {
-            val j = JSONObject("{${raw.substringAfter("{").substringBeforeLast("}")}}")
+            val j = parseCleanJson(raw)
             Pair(
                 j.optString("videoPrompt", "Cinematic 8k vertical sci-fi scene of $sanitizedTopic, dramatic lighting, ultra detailed"),
-                j.optString("youtubeTitle", "$sanitizedTopic 🔥✨ #shorts #viral")
+                j.optString("youtubeTitle", "$sanitizedTopic #shorts #viral")
             )
         } catch (_: Exception) {
             Pair(
                 "Cinematic 8k vertical sci-fi scene of $sanitizedTopic, unreal engine 5, hyper-realistic lighting",
-                "$sanitizedTopic 🔥✨ #shorts #viral"
+                "$sanitizedTopic #shorts #viral"
             )
         }
     }
