@@ -20,6 +20,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
 import android.os.StrictMode
+import android.provider.MediaStore
 import android.provider.Settings
 import android.util.DisplayMetrics
 import android.view.Display
@@ -39,6 +40,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -87,7 +89,6 @@ class AutoTouchService : AccessibilityService() {
     lateinit var memoryVault: MemoryVault
     lateinit var geminiBrain: GeminiBrain
 
-    // Real-Time Stuck & Human-Fix State Tracking
     @Volatile
     private var isAgentRunning = false
     private var currentTaskGoal = ""
@@ -122,9 +123,6 @@ class AutoTouchService : AccessibilityService() {
         super.onDestroy()
     }
 
-    /**
-     * 24/7 Unstoppable Foreground Notification + WakeLock Manager
-     */
     private fun start24x7ForegroundProtection() {
         try {
             val channelId = "auradroid_24_7_channel"
@@ -169,9 +167,6 @@ class AutoTouchService : AccessibilityService() {
         } catch (_: Exception) {}
     }
 
-    /**
-     * Power 1: Auto Screen Size, Punch-Hole / Notch Cutout & Nav Bar Calibrator
-     */
     fun getCalibratedDeviceBodySpecs(): DeviceBodySpecs {
         val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val realMetrics = DisplayMetrics()
@@ -209,10 +204,6 @@ class AutoTouchService : AccessibilityService() {
         )
     }
 
-    /**
-     * Trigger 1: On-Demand Human-Fix Watcher!
-     * Only records to MemoryVault when user manually taps to fix a screen during an active/stuck task.
-     */
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -234,7 +225,7 @@ class AutoTouchService : AccessibilityService() {
             val cat = currentAppCategory
             val goal = currentTaskGoal
 
-            log("🎓 Human Fix Detected on [$nodeDesc]! Sending to Pro Model Memory...")
+            log("🎓 Human Fix Detected on [$nodeDesc]! Saving to Memory...")
             serviceScope.launch(Dispatchers.IO) {
                 val (prob, rule) = geminiBrain.analyzeHumanFixWithProModel(
                     appCategory = cat,
@@ -269,7 +260,8 @@ class AutoTouchService : AccessibilityService() {
     }
 
     /**
-     * Universal Autonomous Goal-Based Executor (Runs 24/7 until goal completed or Stopped)
+     * Universal Autonomous Goal-Based Executor
+     * Includes Instant Target App Pre-Launch & Non-Hanging 2.5s Screenshot Timeout!
      */
     fun startUniversalTask(
         goal: String,
@@ -303,12 +295,36 @@ class AutoTouchService : AccessibilityService() {
                     return@launch
                 }
 
+                // Instant Pre-Launch: If user mentioned Instagram, YouTube, WhatsApp, or Chrome, open it immediately!
+                val lowerGoal = goal.lowercase(Locale.ROOT)
+                val autoTargetApp = when {
+                    lowerGoal.contains("instagram") || lowerGoal.contains("इंस्टाग्राम") -> "instagram"
+                    lowerGoal.contains("whatsapp") || lowerGoal.contains("व्हाट्सएप") -> "whatsapp"
+                    lowerGoal.contains("youtube") || lowerGoal.contains("यूट्यूब") -> "youtube"
+                    lowerGoal.contains("chrome") || lowerGoal.contains("क्रोम") -> "chrome"
+                    lowerGoal.contains("setting") || lowerGoal.contains("सेटिंग") -> "settings"
+                    else -> null
+                }
+
+                if (autoTargetApp != null) {
+                    hud.updateStatus("🚀 Opening $autoTargetApp...", BotMood.WORKING, taskRunning = true)
+                    launchAppByNameOrPackage(autoTargetApp)
+                    stepHistory.add("Directly launched $autoTargetApp app")
+                    delay(3200L)
+                }
+
                 // LIVE REAL PHONE CONTROL LOOP
                 while (isActive && isAgentRunning) {
                     stepNumber++
                     val specs = getCalibratedDeviceBodySpecs()
                     val activePkg = rootInActiveWindow?.packageName?.toString() ?: "android"
                     currentAppCategory = memoryVault.resolveCategoryFolder(activePkg, goal)
+
+                    // If we are still inside AuraDroid OS on Step 1 without a target app, go to Home Screen first
+                    if (stepNumber == 1 && activePkg == packageName && autoTargetApp == null) {
+                        performGlobalAction(GLOBAL_ACTION_HOME)
+                        delay(1500L)
+                    }
 
                     val taggedElements = scanScreenInteractiveElements(specs)
                     val currentSig = buildScreenSignature(activePkg, taggedElements)
@@ -323,16 +339,17 @@ class AutoTouchService : AccessibilityService() {
                     val isStuck = consecutiveSameScreenCount >= 2
 
                     hud.updateStatus(
-                        if (isStuck) "🧠 Stuck Recall ($currentAppCategory)..." else "👁️ Step $stepNumber Scanning...",
+                        if (isStuck) "🧠 Stuck Recall ($currentAppCategory)..." else "👁️ Step $stepNumber Reading...",
                         if (isStuck) BotMood.THINKING else BotMood.WORKING,
                         taskRunning = true
                     )
-                    val screenshot = takeHdDisplayScreenshot()
+
+                    // Non-Hanging 2.5s Timeout Screenshot! Never gets stuck on "Step 1 Scanning..."
+                    val screenshot = takeHdDisplayScreenshotWithTimeout(2500L)
                     if (isStuck && screenshot != null) {
                         lastStuckScreenshot = screenshot
                     }
 
-                    // On-Demand Memory Rule: Recall fixes ONLY when stuck!
                     val recalledFixes = if (isStuck) {
                         log("🚨 Stuck detected on $currentAppCategory! Loading Memory/$currentAppCategory fixes...")
                         memoryVault.recallFixesForApp(currentAppCategory)
@@ -342,17 +359,21 @@ class AutoTouchService : AccessibilityService() {
                         "[${it.tagId}] ${it.label} (${it.className}) -> Center(${it.centerX}, ${it.centerY})"
                     }
 
-                    val decision = geminiBrain.decideNextStep(
-                        goal = goal,
-                        planSteps = plannedSteps,
-                        currentStepHistory = stepHistory,
-                        bodySpecs = specs,
-                        numberedNodesList = nodesPromptList,
-                        screenshotBitmap = screenshot,
-                        isStuck = isStuck,
-                        recalledFixes = recalledFixes,
-                        isContinuousMonitor = isContinuousMonitor
-                    )
+                    hud.updateStatus("🧠 Step $stepNumber Thinking...", BotMood.THINKING, taskRunning = true)
+
+                    val decision = withTimeoutOrNull(30000L) {
+                        geminiBrain.decideNextStep(
+                            goal = goal,
+                            planSteps = plannedSteps,
+                            currentStepHistory = stepHistory,
+                            bodySpecs = specs,
+                            numberedNodesList = nodesPromptList,
+                            screenshotBitmap = screenshot,
+                            isStuck = isStuck,
+                            recalledFixes = recalledFixes,
+                            isContinuousMonitor = isContinuousMonitor
+                        )
+                    } ?: AgentStepDecision(action = "WAIT", reason = "Retrying AI connection...")
 
                     log("Step $stepNumber [${decision.modelUsed}] -> ${decision.action}: ${decision.reason}")
                     hud.updateStatus("Step $stepNumber • ${decision.reason}", BotMood.WORKING, taskRunning = true)
@@ -393,7 +414,7 @@ class AutoTouchService : AccessibilityService() {
                                 performPhysicalTap(px, py)
                                 stepHistory.add("Tapped XY($px,$py)")
                             }
-                            delay(2200L)
+                            delay(2400L)
                         }
 
                         "CLICK_XY" -> {
@@ -407,7 +428,7 @@ class AutoTouchService : AccessibilityService() {
                                 performPhysicalTap(px, py)
                                 stepHistory.add("Tapped XY($px,$py)")
                             }
-                            delay(2200L)
+                            delay(2400L)
                         }
 
                         "LONG_PRESS_XY" -> {
@@ -422,13 +443,13 @@ class AutoTouchService : AccessibilityService() {
                             val target = taggedElements.find { it.tagId == decision.tagId }
                             if (target != null) {
                                 tapDeadCenterOfElement(target)
-                                delay(600L)
+                                delay(700L)
                             } else if (decision.x > 0 && decision.y > 0) {
                                 performPhysicalTap(
                                     convertNormalizedX(decision.x, specs),
                                     convertNormalizedY(decision.y, specs)
                                 )
-                                delay(600L)
+                                delay(700L)
                             }
                             typeAndPasteTextReliably(decision.text)
                             stepHistory.add("Typed '${decision.text.take(20)}'")
@@ -436,8 +457,11 @@ class AutoTouchService : AccessibilityService() {
 
                             if (activePkg.contains("whatsapp") || isContinuousMonitor) {
                                 clickWhatsAppSendIfPresent()
+                            } else if (activePkg.contains("instagram") || activePkg.contains("youtube")) {
+                                // Press Enter/Search key or tap search suggestion
+                                clickSearchOrEnterIfPresent()
                             }
-                            delay(1500L)
+                            delay(1800L)
                         }
 
                         "SWIPE" -> {
@@ -452,7 +476,7 @@ class AutoTouchService : AccessibilityService() {
 
                         "WAIT" -> {
                             hud.updateStatus("⏳ ${decision.reason}", BotMood.THINKING, taskRunning = true)
-                            delay(4000L)
+                            delay(3500L)
                         }
 
                         else -> delay(2500L)
@@ -471,9 +495,9 @@ class AutoTouchService : AccessibilityService() {
     }
 
     /**
-     * Local Video Folder -> YouTube Shorts Direct App Auto-Uploader (Oldest or Newest Video)
+     * Direct Single Picked Video URI -> YouTube Shorts Auto-Uploader
      */
-    fun startYouTubeFolderAutoUpload(folderPath: String, pickOldestFirst: Boolean) {
+    fun startSinglePickedVideoYouTubeUpload(videoUri: Uri, rawDisplayName: String) {
         currentTaskJob?.cancel()
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
         geminiBrain.updateApiKey(prefs.getString("gemini_api_key", "") ?: "")
@@ -482,17 +506,58 @@ class AutoTouchService : AccessibilityService() {
             try {
                 isAgentRunning = true
                 acquireWakeLock()
-                val dir = File(folderPath)
+                hud.updateStatus("Generating Viral Title...", BotMood.THINKING, taskRunning = true)
+                val cleanTopic = rawDisplayName.substringBeforeLast(".").replace("_", " ").ifBlank { "Amazing Viral Short Video" }
+                val (_, viralTitle) = geminiBrain.generateFlowSafePromptAndTitle(cleanTopic)
+                log("✨ Selected Video Title: $viralTitle")
+                uploadVideoUriToYouTubeShorts(videoUri, viralTitle)
+            } catch (_: CancellationException) {
+                hud.updateStatus("Stopped", BotMood.IDLE, taskRunning = false)
+            } catch (e: Exception) {
+                log("⚠️ Upload Error: ${e.message}")
+                hud.updateStatus("Upload Paused", BotMood.ERROR, taskRunning = false)
+            } finally {
+                isAgentRunning = false
+                releaseWakeLock()
+            }
+        }
+    }
+
+    /**
+     * Smart Folder Video Resolver (Supports shorthand names like 'download', 'storage', sub-folders & MediaStore fallback!)
+     */
+    fun startYouTubeFolderAutoUpload(folderInputRaw: String, pickOldestFirst: Boolean) {
+        currentTaskJob?.cancel()
+        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+        geminiBrain.updateApiKey(prefs.getString("gemini_api_key", "") ?: "")
+
+        currentTaskJob = serviceScope.launch {
+            try {
+                isAgentRunning = true
+                acquireWakeLock()
+
+                val resolvedDir = resolveSmartFolderPath(folderInputRaw)
                 val uploadedSet = prefs.getStringSet("uploaded_videos_set", emptySet())?.toMutableSet() ?: mutableSetOf()
 
-                val videos = dir.listFiles { f ->
-                    f.isFile && (f.name.endsWith(".mp4", true) || f.name.endsWith(".mov", true) || f.name.endsWith(".mkv", true)) &&
-                        !uploadedSet.contains(f.absolutePath)
-                }?.toList() ?: emptyList()
+                // Search both top-level and 1-level sub-folders for .mp4/.mov/.mkv/.webm
+                val videos = findVideoFilesInDirectory(resolvedDir, uploadedSet)
 
                 if (videos.isEmpty()) {
-                    hud.updateStatus("No new videos in folder!", BotMood.ERROR, taskRunning = false)
-                    log("📁 Folder [$folderPath] has no un-uploaded .mp4 videos.")
+                    // Fallback: Query Android MediaStore for videos matching folder name
+                    val mediaUriPair = queryMediaStoreVideoByFolderName(folderInputRaw, pickOldestFirst, uploadedSet)
+                    if (mediaUriPair != null) {
+                        val (uri, name) = mediaUriPair
+                        log("🎬 Found via MediaStore: $name")
+                        hud.updateStatus("Generating Viral Title...", BotMood.THINKING, taskRunning = true)
+                        val (_, viralTitle) = geminiBrain.generateFlowSafePromptAndTitle(name.substringBeforeLast("."))
+                        uploadVideoUriToYouTubeShorts(uri, viralTitle)
+                        uploadedSet.add(uri.toString())
+                        prefs.edit().putStringSet("uploaded_videos_set", uploadedSet).apply()
+                        return@launch
+                    }
+
+                    hud.updateStatus("No videos found! Grant Storage or Pick Video", BotMood.ERROR, taskRunning = false)
+                    log("📁 No un-uploaded videos found in [${resolvedDir.absolutePath}].")
                     return@launch
                 }
 
@@ -510,7 +575,7 @@ class AutoTouchService : AccessibilityService() {
                 )
                 log("✨ AI Viral Title: $viralTitle")
 
-                uploadVideoFileToYouTubeShorts(chosenVideo, viralTitle)
+                uploadVideoUriToYouTubeShorts(Uri.fromFile(chosenVideo), viralTitle)
 
                 uploadedSet.add(chosenVideo.absolutePath)
                 prefs.edit().putStringSet("uploaded_videos_set", uploadedSet).apply()
@@ -526,16 +591,114 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    private suspend fun uploadVideoFileToYouTubeShorts(videoFile: File, viralTitle: String) {
+    /**
+     * Converts user shorthand like "download", "/storage/download/", "camera", "movies", or "storage"
+     * into real Android paths (/storage/emulated/0/Download, etc.)
+     */
+    private fun resolveSmartFolderPath(rawInput: String): File {
+        val rootStorage = Environment.getExternalStorageDirectory() // /storage/emulated/0
+        val cleaned = rawInput.trim()
+        val lower = cleaned.lowercase(Locale.ROOT)
+
+        if (cleaned.isEmpty() || lower == "download" || lower == "downloads" || lower == "/storage/download" || lower == "/storage/download/") {
+            return Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        }
+        if (lower == "storage" || lower == "/storage" || lower == "/storage/") {
+            return rootStorage
+        }
+        if (lower == "camera" || lower == "dcim") {
+            return File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "Camera")
+        }
+        if (lower == "movies" || lower == "video" || lower == "videos") {
+            return Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+        }
+
+        val directFile = File(cleaned)
+        if (directFile.exists() && directFile.isDirectory) return directFile
+
+        // Try relative to /storage/emulated/0/
+        val relative = File(rootStorage, cleaned.removePrefix("/").removePrefix("storage/"))
+        if (relative.exists() && relative.isDirectory) return relative
+
+        return Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+    }
+
+    private fun findVideoFilesInDirectory(dir: File, uploadedSet: Set<String>): List<File> {
+        val results = mutableListOf<File>()
+        if (!dir.exists()) return results
+
+        fun isVideo(f: File): Boolean {
+            val n = f.name.lowercase(Locale.ROOT)
+            return f.isFile && (n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".mkv") || n.endsWith(".webm")) &&
+                !uploadedSet.contains(f.absolutePath)
+        }
+
+        dir.listFiles()?.forEach { f ->
+            if (isVideo(f)) {
+                results.add(f)
+            } else if (f.isDirectory && !f.name.startsWith(".")) {
+                f.listFiles()?.forEach { sub ->
+                    if (isVideo(sub)) results.add(sub)
+                }
+            }
+        }
+        return results
+    }
+
+    private fun queryMediaStoreVideoByFolderName(
+        folderKeyword: String,
+        pickOldestFirst: Boolean,
+        uploadedSet: Set<String>
+    ): Pair<Uri, String>? {
+        return try {
+            val projection = arrayOf(
+                MediaStore.Video.Media._ID,
+                MediaStore.Video.Media.DISPLAY_NAME,
+                MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
+                MediaStore.Video.Media.DATE_ADDED
+            )
+            val sortOrder = if (pickOldestFirst) "${MediaStore.Video.Media.DATE_ADDED} ASC" else "${MediaStore.Video.Media.DATE_ADDED} DESC"
+            val cursor = contentResolver.query(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                null,
+                null,
+                sortOrder
+            ) ?: return null
+
+            val kw = folderKeyword.trim().lowercase(Locale.ROOT).removePrefix("/storage/").removeSuffix("/")
+            cursor.use { c ->
+                val idCol = c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                val nameCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+                val bucketCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.BUCKET_DISPLAY_NAME)
+
+                while (c.moveToNext()) {
+                    val id = c.getLong(idCol)
+                    val name = c.getString(nameCol) ?: "video.mp4"
+                    val bucket = (c.getString(bucketCol) ?: "").lowercase(Locale.ROOT)
+                    val contentUri = Uri.withAppendedPath(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id.toString())
+
+                    val matchesBucket = kw.isEmpty() || kw == "storage" || kw == "video" || bucket.contains(kw) || kw.contains(bucket)
+                    if (matchesBucket && !uploadedSet.contains(contentUri.toString())) {
+                        return Pair(contentUri, name)
+                    }
+                }
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private suspend fun uploadVideoUriToYouTubeShorts(videoUri: Uri, viralTitle: String) {
         val specs = getCalibratedDeviceBodySpecs()
 
         withContext(Dispatchers.Main) {
-            val uri = Uri.fromFile(videoFile)
             StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
             val intent = Intent(Intent.ACTION_SEND).apply {
                 type = "video/*"
                 setPackage("com.google.android.youtube")
-                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_STREAM, videoUri)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             startActivity(intent)
@@ -615,9 +778,6 @@ class AutoTouchService : AccessibilityService() {
         log("🎉 YouTube Short Uploaded Successfully: $viralTitle")
     }
 
-    /**
-     * Google Flow (1000 Credits Saver) -> 8-Second Video Generation -> Download -> YouTube Shorts Pipeline
-     */
     fun startGoogleFlowToYouTubePipeline(topic: String, maxVideosToCreate: Int = 1) {
         currentTaskJob?.cancel()
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -694,7 +854,7 @@ class AutoTouchService : AccessibilityService() {
 
                     if (downloadedVideoFile != null && downloadedVideoFile.exists()) {
                         log("✅ Downloaded 8s Video: ${downloadedVideoFile.absolutePath}")
-                        uploadVideoFileToYouTubeShorts(downloadedVideoFile, viralTitle)
+                        uploadVideoUriToYouTubeShorts(Uri.fromFile(downloadedVideoFile), viralTitle)
                     } else {
                         log("⚠️ Could not auto-catch MP4 stream; check Google Flow login or credits.")
                         hud.updateStatus("Check Flow Login/Credits", BotMood.ERROR, taskRunning = false)
@@ -836,9 +996,6 @@ class AutoTouchService : AccessibilityService() {
             }
         }
 
-    /**
-     * 24/7 Daily Background Scheduler Loop
-     */
     private fun startDailySchedulerLoop() {
         schedulerJob?.cancel()
         schedulerJob = serviceScope.launch {
@@ -872,9 +1029,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Scans all interactive nodes on screen and calculates their exact mathematical Dead-Center (centerX, centerY)
-     */
     private fun scanScreenInteractiveElements(specs: DeviceBodySpecs): List<TaggedUiElement> {
         val root = rootInActiveWindow ?: return emptyList()
         val result = mutableListOf<TaggedUiElement>()
@@ -1001,6 +1155,9 @@ class AutoTouchService : AccessibilityService() {
                 }
                 if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
                     setSuccess = true
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                    }
                     return
                 }
                 if (node.performAction(AccessibilityNodeInfo.ACTION_PASTE)) {
@@ -1017,6 +1174,12 @@ class AutoTouchService : AccessibilityService() {
         delay(400L)
     }
 
+    private suspend fun clickSearchOrEnterIfPresent() {
+        val specs = getCalibratedDeviceBodySpecs()
+        // Tap bottom-right keyboard Search / Enter key area
+        performPhysicalTap((specs.screenWidth * 0.90f).toInt(), (specs.screenHeight * 0.91f).toInt())
+    }
+
     private suspend fun clickWhatsAppSendIfPresent() {
         val specs = getCalibratedDeviceBodySpecs()
         val elements = scanScreenInteractiveElements(specs)
@@ -1030,30 +1193,35 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    private suspend fun takeHdDisplayScreenshot(): Bitmap? {
+    /**
+     * Non-hanging screenshot with strict timeout so "Step 1 Scanning..." never freezes!
+     */
+    private suspend fun takeHdDisplayScreenshotWithTimeout(timeoutMs: Long = 2500L): Bitmap? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
-        return suspendCancellableCoroutine { cont ->
-            try {
-                takeScreenshot(
-                    Display.DEFAULT_DISPLAY,
-                    mainExecutor,
-                    object : TakeScreenshotCallback {
-                        override fun onSuccess(screenshotResult: ScreenshotResult) {
-                            val hwBuffer = screenshotResult.hardwareBuffer
-                            val colorSpace = screenshotResult.colorSpace
-                            val bmp = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
-                                ?.copy(Bitmap.Config.ARGB_8888, false)
-                            hwBuffer.close()
-                            if (cont.isActive) cont.resume(bmp)
-                        }
+        return withTimeoutOrNull(timeoutMs) {
+            suspendCancellableCoroutine { cont ->
+                try {
+                    takeScreenshot(
+                        Display.DEFAULT_DISPLAY,
+                        mainExecutor,
+                        object : TakeScreenshotCallback {
+                            override fun onSuccess(screenshotResult: ScreenshotResult) {
+                                val hwBuffer = screenshotResult.hardwareBuffer
+                                val colorSpace = screenshotResult.colorSpace
+                                val bmp = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
+                                    ?.copy(Bitmap.Config.ARGB_8888, false)
+                                hwBuffer.close()
+                                if (cont.isActive) cont.resume(bmp)
+                            }
 
-                        override fun onFailure(errorCode: Int) {
-                            if (cont.isActive) cont.resume(null)
+                            override fun onFailure(errorCode: Int) {
+                                if (cont.isActive) cont.resume(null)
+                            }
                         }
-                    }
-                )
-            } catch (_: Exception) {
-                if (cont.isActive) cont.resume(null)
+                    )
+                } catch (_: Exception) {
+                    if (cont.isActive) cont.resume(null)
+                }
             }
         }
     }
@@ -1081,7 +1249,7 @@ class AutoTouchService : AccessibilityService() {
         if (targetPkg != null) {
             val launchIntent = pm.getLaunchIntentForPackage(targetPkg)
             if (launchIntent != null) {
-                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 startActivity(launchIntent)
                 log("📱 Directly Launched App: $targetPkg")
                 return
