@@ -7,6 +7,7 @@ import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.*
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -20,12 +21,13 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import kotlin.math.atan2
-import kotlin.math.cos
 import kotlin.math.hypot
-import kotlin.math.sin
 
 /**
  * 20 Expressive Pure-Solid Baymax Eye Moods (Zero Pink, Zero Blush!)
@@ -60,14 +62,21 @@ class AiOverlayHud(
 ) {
     private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val prefs = context.getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
 
     private var podRootLayout: LinearLayout? = null
     private var podParams: WindowManager.LayoutParams? = null
     private var baymaxFaceView: BaymaxFaceView? = null
-    private var sideBarContainer: LinearLayout? = null
+
+    // Movie-Safe Notch / Dynamic Island Capsule Views
+    private var notchCapsuleContainer: LinearLayout? = null
     private var statusTextView: TextView? = null
     private var stopButtonView: TextView? = null
     private var peekWebButton: TextView? = null
+    private var notchProgressBar: ProgressBar? = null
+    private var downloadBadgeView: TextView? = null
+    private var dailyLogBadgeView: TextView? = null
+    private var notchDetailsSection: LinearLayout? = null
 
     // Mini / Full Pop-out Live Web Card
     private var webCardContainer: LinearLayout? = null
@@ -80,7 +89,12 @@ class AiOverlayHud(
 
     private var isAdded = false
     private var isTaskActivelyRunning = false
+    private var isNotchExpandedByUser = false
     private var manualTapMoodIndex = 0
+
+    // Live Background Pipeline State
+    private var currentProgressPercent = 0
+    private var isVideoDownloadedInSession = false
 
     private val funIdleMoods = listOf(
         BotMood.IDLE,
@@ -93,13 +107,21 @@ class AiOverlayHud(
         BotMood.SLEEPY
     )
 
+    /**
+     * Movie-Safe Auto-Collapse:
+     * Even when a task is running in the background, if the user isn't interacting with the capsule,
+     * collapse the text panel after 3.5 seconds so ONLY the expressive Baymax face stays visible while watching movies!
+     * Tapping Baymax anytime opens the full Notch Capsule with Download & Daily Action status!
+     */
     private val autoCollapseRunnable = Runnable {
-        if (!isTaskActivelyRunning) {
-            sideBarContainer?.visibility = View.GONE
-            if (webCardContainer?.visibility == View.VISIBLE) {
+        if (!isNotchExpandedByUser) {
+            notchCapsuleContainer?.visibility = View.GONE
+            if (webCardContainer?.visibility == View.VISIBLE && !isTaskActivelyRunning) {
                 setWebCardVisibility(false)
             }
-            baymaxFaceView?.setMood(BotMood.IDLE)
+            if (!isTaskActivelyRunning) {
+                baymaxFaceView?.setMood(BotMood.IDLE)
+            }
         }
     }
 
@@ -162,9 +184,6 @@ class AiOverlayHud(
         }
     }
 
-    /**
-     * Automatically maps the statusText & base mood into one of the 20 expressive Baymax eye states!
-     */
     private fun resolveSmartExpression20(statusText: String, baseMood: BotMood): BotMood {
         val s = statusText.lowercase(Locale.ROOT)
         return when {
@@ -176,15 +195,80 @@ class AiOverlayHud(
             s.contains("search") || s.contains("find") || s.contains("folder") -> BotMood.SEARCHING
             s.contains("like") || s.contains("heart") -> BotMood.HEART_EYES
             s.contains("opening") || s.contains("launch") || s.contains("starting") || s.contains("🚀") -> BotMood.ROCKET_LAUNCH
-            s.contains("upload") -> BotMood.UPLOAD_UP
+            s.contains("upload") || s.contains("download") || s.contains("📥") -> BotMood.UPLOAD_UP
             s.contains("viral") || s.contains("flow") || s.contains("title") || s.contains("✨") -> BotMood.STAR_EYES
-            s.contains("watch") || s.contains("wait") || s.contains("⏳") -> BotMood.QUESTION
+            s.contains("watch") || s.contains("wait") || s.contains("generating") || s.contains("⏳") -> BotMood.QUESTION
             s.contains("next") || s.contains("send") || s.contains("share") -> BotMood.FOCUSED_SQUINT
             s.contains("stopped") || s.contains("paused") -> BotMood.SLEEPY
             baseMood == BotMood.HAPPY -> BotMood.HAPPY
             baseMood == BotMood.THINKING -> BotMood.THINKING
             baseMood == BotMood.WORKING -> BotMood.WORKING
             else -> baseMood
+        }
+    }
+
+    /**
+     * Automatically tracks Flow creation, Video Download status, and Daily Action Log ("किस दिन की कार्रवाई हुई")
+     */
+    private fun updateNotchTelemetryFromStatus(statusText: String, taskRunning: Boolean) {
+        val s = statusText.lowercase(Locale.ROOT)
+        val todayStr = SimpleDateFormat("dd MMM", Locale.getDefault()).format(Date())
+        val timeStr = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+
+        when {
+            s.contains("starting") || s.contains("creating prompt") -> {
+                currentProgressPercent = 15
+                if (s.contains("flow")) isVideoDownloadedInSession = false
+            }
+            s.contains("submitting") -> {
+                currentProgressPercent = 30
+            }
+            s.contains("generating 8s video") -> {
+                currentProgressPercent = (currentProgressPercent + 4).coerceIn(35, 75)
+            }
+            s.contains("downloading") || s.contains("📥") -> {
+                currentProgressPercent = 82
+                isVideoDownloadedInSession = true
+                prefs.edit()
+                    .putString("last_download_status", "📥 Video Downloaded ✅ ($todayStr $timeStr)")
+                    .apply()
+            }
+            s.contains("opening youtube") || s.contains("next") -> {
+                currentProgressPercent = 88
+            }
+            s.contains("caption") || s.contains("upload short") -> {
+                currentProgressPercent = 94
+            }
+            s.contains("success") || s.contains("complete") -> {
+                currentProgressPercent = 100
+                val summary = if (s.contains("upload")) {
+                    "✅ $todayStr ($timeStr): YouTube Short Uploaded!"
+                } else {
+                    "✅ $todayStr ($timeStr): Task Completed!"
+                }
+                prefs.edit().putString("last_daily_action_log", summary).apply()
+            }
+            !taskRunning && s.contains("error") -> {
+                prefs.edit().putString("last_daily_action_log", "⚠️ $todayStr ($timeStr): $statusText").apply()
+            }
+        }
+
+        notchProgressBar?.progress = if (taskRunning) currentProgressPercent.coerceAtLeast(15) else 100
+
+        val savedDl = prefs.getString("last_download_status", "📥 Video Download: अभी कोई नया डाउनलोड नहीं")
+        downloadBadgeView?.text = if (isVideoDownloadedInSession) {
+            "📥 Video Status: Downloaded & Ready ✅"
+        } else {
+            savedDl
+        }
+
+        val schedOn = prefs.getBoolean("scheduler_enabled", false)
+        val schedTime = prefs.getString("schedule_time_hm", "19:00") ?: "19:00"
+        val lastDaily = prefs.getString("last_daily_action_log", "📅 आज अभी कोई टास्क पूरा नहीं हुआ")
+        dailyLogBadgeView?.text = if (schedOn) {
+            "$lastDaily\n⏰ Daily Auto-Schedule: ON ($schedTime)"
+        } else {
+            "$lastDaily\n⏰ Daily Auto-Schedule: OFF"
         }
     }
 
@@ -196,19 +280,21 @@ class AiOverlayHud(
             baymaxFaceView?.setMood(smartMood)
             statusTextView?.text = statusText
 
+            updateNotchTelemetryFromStatus(statusText, taskRunning)
+
             if (smartMood == BotMood.CELEBRATE || mood == BotMood.HAPPY) {
                 val dm = context.resources.displayMetrics
                 handOverlayView?.triggerPlumpThumbsUp(dm.widthPixels / 2f, dm.heightPixels * 0.45f)
             }
 
             mainHandler.removeCallbacks(autoCollapseRunnable)
-            if (taskRunning) {
-                sideBarContainer?.visibility = View.VISIBLE
-                stopButtonView?.visibility = View.VISIBLE
-            } else {
-                stopButtonView?.visibility = View.GONE
-                mainHandler.postDelayed(autoCollapseRunnable, 2600L)
-            }
+            notchCapsuleContainer?.visibility = View.VISIBLE
+            stopButtonView?.visibility = if (taskRunning) View.VISIBLE else View.GONE
+
+            // Movie-Safe Mode: If user hasn't manually pinned the Notch open, auto-hide the text bar after 3.2s
+            // so ONLY the expressive Baymax face stays visible while watching movies!
+            val hideDelay = if (taskRunning) 3200L else 2500L
+            mainHandler.postDelayed(autoCollapseRunnable, hideDelay)
         }
     }
 
@@ -289,8 +375,8 @@ class AiOverlayHud(
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = dp(14)
-            y = dp(110)
+            x = dp(12)
+            y = dp(90)
         }
 
         podRootLayout = LinearLayout(context).apply {
@@ -304,19 +390,18 @@ class AiOverlayHud(
 
         // 1. Soft-White Circular Baymax Face with 2x Larger Expressive Solid Eyes
         baymaxFaceView = BaymaxFaceView(context).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(60), dp(60))
+            layoutParams = LinearLayout.LayoutParams(dp(58), dp(58))
         }
 
-        // 2. Collapsible Matte Dark Side Bar
-        sideBarContainer = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+        // 2. Dynamic Notch Island Capsule (Expandable with Live Progress, Download Status & Daily Log!)
+        notchCapsuleContainer = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(12), dp(8), dp(10), dp(8))
-            background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(Color.parseColor("#181B20"))
-                cornerRadius = dp(24).toFloat()
-                setStroke(dp(1), Color.parseColor("#2E3440"))
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#E6111318")) // Sleek deep Dynamic Island dark glass
+                cornerRadius = dp(20).toFloat()
+                setStroke(dp(1), Color.parseColor("#334155"))
             }
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -326,18 +411,25 @@ class AiOverlayHud(
             }
         }
 
+        val capsuleHeaderRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
         statusTextView = TextView(context).apply {
-            text = "Ready"
+            text = "AuraDroid Ready"
             setTextColor(Color.parseColor("#F8FAFC"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            maxWidth = dp(190)
+            typeface = Typeface.DEFAULT_BOLD
+            maxWidth = dp(185)
             maxLines = 1
         }
 
         peekWebButton = TextView(context).apply {
-            text = " 🌐 "
-            setTextColor(Color.parseColor("#94A3B8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            text = " 👁️ Web "
+            setTextColor(Color.parseColor("#38BDF8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(6), dp(2), dp(6), dp(2))
             setOnClickListener {
                 toggleWebCardVisibility()
@@ -355,19 +447,54 @@ class AiOverlayHud(
             }
         }
 
-        sideBarContainer?.addView(statusTextView)
-        sideBarContainer?.addView(peekWebButton)
-        sideBarContainer?.addView(stopButtonView)
+        capsuleHeaderRow.addView(statusTextView)
+        capsuleHeaderRow.addView(peekWebButton)
+        capsuleHeaderRow.addView(stopButtonView)
+
+        // Expandable Notch Details (Shows when user taps Baymax!)
+        notchDetailsSection = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(0, dp(6), 0, dp(2))
+        }
+
+        notchProgressBar = ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = 100
+            layoutParams = LinearLayout.LayoutParams(dp(230), dp(5)).apply {
+                bottomMargin = dp(6)
+            }
+        }
+
+        downloadBadgeView = TextView(context).apply {
+            text = "📥 Video Download: Ready"
+            setTextColor(Color.parseColor("#10B981"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setPadding(0, 0, 0, dp(3))
+        }
+
+        dailyLogBadgeView = TextView(context).apply {
+            text = "📅 आज की कार्रवाई: Ready"
+            setTextColor(Color.parseColor("#94A3B8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        }
+
+        notchDetailsSection?.addView(notchProgressBar)
+        notchDetailsSection?.addView(downloadBadgeView)
+        notchDetailsSection?.addView(dailyLogBadgeView)
+
+        notchCapsuleContainer?.addView(capsuleHeaderRow)
+        notchCapsuleContainer?.addView(notchDetailsSection)
 
         topRow.addView(baymaxFaceView)
-        topRow.addView(sideBarContainer)
+        topRow.addView(notchCapsuleContainer)
 
-        // 3. Pop-out Live Web Workspace Card
+        // 3. Pop-out Live Web Workspace Card (For Background Flow AI / Web Tasks)
         webCardContainer = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
             setPadding(dp(8), dp(8), dp(8), dp(8))
-            background = android.graphics.drawable.GradientDrawable().apply {
+            background = GradientDrawable().apply {
                 setColor(Color.parseColor("#121316"))
                 cornerRadius = dp(16).toFloat()
                 setStroke(dp(1), Color.parseColor("#334155"))
@@ -384,7 +511,7 @@ class AiOverlayHud(
         }
 
         val webTitle = TextView(context).apply {
-            text = "Background Workspace"
+            text = "🎬 Live Background Flow / Web"
             setTextColor(Color.parseColor("#E2E8F0"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
@@ -458,6 +585,7 @@ class AiOverlayHud(
         podRootLayout?.addView(topRow)
         podRootLayout?.addView(webCardContainer)
 
+        updateNotchTelemetryFromStatus("Ready", false)
         setupDragAndTapOnBaymaxFace()
         podRootLayout?.let { root ->
             podParams?.let { params ->
@@ -496,7 +624,7 @@ class AiOverlayHud(
         baymaxFaceView?.setOnTouchListener { _, event ->
             val params = podParams ?: return@setOnTouchListener false
             val dm = context.resources.displayMetrics
-            val maxX = (dm.widthPixels - dp(62)).coerceAtLeast(100)
+            val maxX = (dm.widthPixels - dp(60)).coerceAtLeast(100)
             val maxY = (dm.heightPixels - dp(95)).coerceAtLeast(200)
 
             when (event.actionMasked) {
@@ -532,20 +660,40 @@ class AiOverlayHud(
         }
     }
 
+    /**
+     * Tapping Baymax toggles the Dynamic Notch Island Dashboard showing:
+     * - Current Step & Progress Bar
+     * - Video Download Status (Downloaded ✅ or Waiting)
+     * - Daily Action Log (किस दिन की कार्रवाई हो गई)
+     */
     private fun onBaymaxFaceTapped() {
         mainHandler.removeCallbacks(autoCollapseRunnable)
         if (!isTaskActivelyRunning) {
             manualTapMoodIndex = (manualTapMoodIndex + 1) % funIdleMoods.size
             baymaxFaceView?.setMood(funIdleMoods[manualTapMoodIndex])
         }
-        if (sideBarContainer?.visibility == View.VISIBLE && !isTaskActivelyRunning) {
-            sideBarContainer?.visibility = View.GONE
+
+        val isCapsuleVisible = notchCapsuleContainer?.visibility == View.VISIBLE
+        val isDetailsVisible = notchDetailsSection?.visibility == View.VISIBLE
+
+        if (isCapsuleVisible && isDetailsVisible) {
+            // Collapse everything back to just the Baymax Face (Movie-Safe view!)
+            isNotchExpandedByUser = false
+            notchDetailsSection?.visibility = View.GONE
+            notchCapsuleContainer?.visibility = View.GONE
             setWebCardVisibility(false)
         } else {
-            sideBarContainer?.visibility = View.VISIBLE
-            if (!isTaskActivelyRunning) {
-                mainHandler.postDelayed(autoCollapseRunnable, 3200L)
-            }
+            // Expand the full Notch Dashboard Capsule!
+            isNotchExpandedByUser = true
+            updateNotchTelemetryFromStatus(statusTextView?.text?.toString() ?: "Ready", isTaskActivelyRunning)
+            notchCapsuleContainer?.visibility = View.VISIBLE
+            notchDetailsSection?.visibility = View.VISIBLE
+            // Auto-collapse after 6 seconds so user's movie isn't blocked if they forget to close it
+            mainHandler.postDelayed({
+                isNotchExpandedByUser = false
+                notchDetailsSection?.visibility = View.GONE
+                notchCapsuleContainer?.visibility = View.GONE
+            }, 6500L)
         }
     }
 
@@ -652,17 +800,16 @@ class AiOverlayHud(
 
         fun setMood(mood: BotMood) {
             currentMood = mood
-            // Strictly Bold Solid Colors — NO Pink anywhere!
             val solidColor = when (mood) {
-                BotMood.IDLE, BotMood.WINK, BotMood.COOL_SHADES, BotMood.SURPRISED -> Color.parseColor("#0F172A") // Pure Deep Black
-                BotMood.THINKING, BotMood.SEARCHING, BotMood.QUESTION -> Color.parseColor("#2563EB")              // Royal Blue
-                BotMood.SCANNING, BotMood.TYPING -> Color.parseColor("#0284C7")                                   // Cyber Cyan-Blue
+                BotMood.IDLE, BotMood.WINK, BotMood.COOL_SHADES, BotMood.SURPRISED -> Color.parseColor("#0F172A")
+                BotMood.THINKING, BotMood.SEARCHING, BotMood.QUESTION -> Color.parseColor("#2563EB")
+                BotMood.SCANNING, BotMood.TYPING -> Color.parseColor("#0284C7")
                 BotMood.WORKING, BotMood.HAPPY, BotMood.FOCUSED_SQUINT,
-                BotMood.UPLOAD_UP, BotMood.CELEBRATE -> Color.parseColor("#10B981")                               // Emerald Green
-                BotMood.STAR_EYES, BotMood.ROCKET_LAUNCH -> Color.parseColor("#D97706")                           // Golden Amber
-                BotMood.SLEEPY -> Color.parseColor("#475569")                                                     // Matte Slate
-                BotMood.DIZZY -> Color.parseColor("#EA580C")                                                      // Deep Orange
-                BotMood.ERROR, BotMood.HEART_EYES -> Color.parseColor("#DC2626")                                  // Pure Crimson Red
+                BotMood.UPLOAD_UP, BotMood.CELEBRATE -> Color.parseColor("#10B981")
+                BotMood.STAR_EYES, BotMood.ROCKET_LAUNCH -> Color.parseColor("#D97706")
+                BotMood.SLEEPY -> Color.parseColor("#475569")
+                BotMood.DIZZY -> Color.parseColor("#EA580C")
+                BotMood.ERROR, BotMood.HEART_EYES -> Color.parseColor("#DC2626")
             }
 
             eyeFillPaint.color = solidColor
@@ -684,24 +831,20 @@ class AiOverlayHud(
             val cy = height / 2f
             val headRadius = (width.coerceAtMost(height) / 2f) - dp(3.5f)
 
-            // 1. Draw Soft-White Circular Baymax Head
             canvas.drawCircle(cx, cy, headRadius, headPaint)
             canvas.drawCircle(cx, cy, headRadius, borderPaint)
 
-            // 2. 2x Larger Expressive Eye Geometry
             val eyeSpacing = headRadius * 0.44f
             val r = headRadius * 0.34f // 2x Bolder & Larger Eye Radius!
             val lx = cx - eyeSpacing + gazeOffsetX
             val rx = cx + eyeSpacing + gazeOffsetX
             val ey = cy + gazeOffsetY
 
-            // Draw classic Baymax connector line between the eyes
             if (currentMood != BotMood.COOL_SHADES) {
                 canvas.drawLine(lx + r * 0.55f, ey, rx - r * 0.55f, ey, bridgePaint)
             }
 
             when (currentMood) {
-                // 1. IDLE: 2x Big Solid Circular Eyes
                 BotMood.IDLE -> {
                     canvas.save()
                     canvas.scale(1f, blinkScaleY, cx, ey)
@@ -709,8 +852,6 @@ class AiOverlayHud(
                     canvas.drawCircle(rx, ey, r, eyeFillPaint)
                     canvas.restore()
                 }
-
-                // 2. THINKING: Left eye slightly squinted, Right eye full looking up
                 BotMood.THINKING -> {
                     canvas.save()
                     canvas.scale(1f, blinkScaleY, cx, ey)
@@ -718,8 +859,6 @@ class AiOverlayHud(
                     canvas.drawCircle(rx, ey - dp(1f), r, eyeFillPaint)
                     canvas.restore()
                 }
-
-                // 3. WORKING: Heroic Angled Determined Eyes
                 BotMood.WORKING -> {
                     canvas.save()
                     canvas.scale(1f, blinkScaleY, cx, ey)
@@ -727,16 +866,12 @@ class AiOverlayHud(
                     drawHeroicEye(canvas, rx, ey, r, isLeft = false)
                     canvas.restore()
                 }
-
-                // 4. HAPPY: Bold Upward Curved Arcs (^ ^)
                 BotMood.HAPPY -> {
                     val arcL = RectF(lx - r, ey - r * 0.8f, lx + r, ey + r)
                     val arcR = RectF(rx - r, ey - r * 0.8f, rx + r, ey + r)
                     canvas.drawArc(arcL, 195f, 150f, false, eyeStrokePaint)
                     canvas.drawArc(arcR, 195f, 150f, false, eyeStrokePaint)
                 }
-
-                // 5. ERROR: Bold X Eyes (✕ ✕)
                 BotMood.ERROR -> {
                     val d = r * 0.72f
                     canvas.drawLine(lx - d, ey - d, lx + d, ey + d, eyeStrokePaint)
@@ -744,27 +879,19 @@ class AiOverlayHud(
                     canvas.drawLine(rx - d, ey - d, rx + d, ey + d, eyeStrokePaint)
                     canvas.drawLine(rx + d, ey - d, rx - d, ey + d, eyeStrokePaint)
                 }
-
-                // 6. WINK: Left Solid Eye + Right Playful Arc (● ^)
                 BotMood.WINK -> {
                     canvas.drawCircle(lx, ey, r, eyeFillPaint)
                     val arcR = RectF(rx - r, ey - r * 0.8f, rx + r, ey + r)
                     canvas.drawArc(arcR, 195f, 150f, false, eyeStrokePaint)
                 }
-
-                // 7. STAR_EYES: 4-Point Sparkle Star Eyes (✦ ✦)
                 BotMood.STAR_EYES -> {
                     drawFourPointStar(canvas, lx, ey, r * 1.15f)
                     drawFourPointStar(canvas, rx, ey, r * 1.15f)
                 }
-
-                // 8. HEART_EYES: Bold Geometric Hearts (♥ ♥ - Crimson, Zero Blush!)
                 BotMood.HEART_EYES -> {
                     drawSolidHeart(canvas, lx, ey, r * 1.1f)
                     drawSolidHeart(canvas, rx, ey, r * 1.1f)
                 }
-
-                // 9. SCANNING: Outer Target Ring + Inner Center Dot (◎ ◎)
                 BotMood.SCANNING -> {
                     eyeStrokePaint.strokeWidth = dp(2.2f)
                     canvas.drawCircle(lx, ey, r, eyeStrokePaint)
@@ -774,84 +901,60 @@ class AiOverlayHud(
                     canvas.drawCircle(rx, ey, innerR, eyeFillPaint)
                     eyeStrokePaint.strokeWidth = dp(3.2f)
                 }
-
-                // 10. TYPING: Digital Visor Rectangles (▬ ▬)
                 BotMood.TYPING -> {
                     val h = r * 0.55f
                     val shift = if (pulsePhase > 0.5f) dp(1.5f) else -dp(1.5f)
                     canvas.drawRoundRect(RectF(lx - r + shift, ey - h, lx + r + shift, ey + h), dp(4f), dp(4f), eyeFillPaint)
                     canvas.drawRoundRect(RectF(rx - r + shift, ey - h, rx + r + shift, ey + h), dp(4f), dp(4f), eyeFillPaint)
                 }
-
-                // 11. SEARCHING: Magnifier Asymmetric Eyes (Normal Left, 1.25x Zoom Right)
                 BotMood.SEARCHING -> {
                     canvas.drawCircle(lx, ey, r * 0.82f, eyeFillPaint)
                     canvas.drawCircle(rx, ey, r * 1.18f, eyeStrokePaint)
                     canvas.drawCircle(rx, ey, r * 0.55f, eyeFillPaint)
                 }
-
-                // 12. SURPRISED: Wide Open Hollow Rings (◯ ◯)
                 BotMood.SURPRISED -> {
                     canvas.drawCircle(lx, ey, r * 1.05f, eyeStrokePaint)
                     canvas.drawCircle(rx, ey, r * 1.05f, eyeStrokePaint)
                 }
-
-                // 13. SLEEPY: Downward Relaxed Half-Moons (◡ ◡)
                 BotMood.SLEEPY -> {
                     val arcL = RectF(lx - r, ey - r, lx + r, ey + r * 0.8f)
                     val arcR = RectF(rx - r, ey - r, rx + r, ey + r * 0.8f)
                     canvas.drawArc(arcL, 15f, 150f, false, eyeStrokePaint)
                     canvas.drawArc(arcR, 15f, 150f, false, eyeStrokePaint)
                 }
-
-                // 14. COOL_SHADES: Cyber Sunglasses Visor (■━■)
                 BotMood.COOL_SHADES -> {
                     val visorH = r * 0.85f
                     canvas.drawLine(cx - headRadius * 0.88f, ey - visorH * 0.3f, cx + headRadius * 0.88f, ey - visorH * 0.3f, eyeStrokePaint)
                     canvas.drawRoundRect(RectF(lx - r * 1.1f, ey - visorH * 0.5f, lx + r * 1.05f, ey + visorH), dp(3f), dp(3f), eyeFillPaint)
                     canvas.drawRoundRect(RectF(rx - r * 1.05f, ey - visorH * 0.5f, rx + r * 1.1f, ey + visorH), dp(3f), dp(3f), eyeFillPaint)
                 }
-
-                // 15. FOCUSED_SQUINT: Precision Horizontal Slits (━ ━)
                 BotMood.FOCUSED_SQUINT -> {
                     val h = r * 0.38f
                     canvas.drawRoundRect(RectF(lx - r, ey - h, lx + r, ey + h), dp(3f), dp(3f), eyeFillPaint)
                     canvas.drawRoundRect(RectF(rx - r, ey - h, rx + r, ey + h), dp(3f), dp(3f), eyeFillPaint)
                 }
-
-                // 16. DIZZY: Inward Chevrons (> <)
                 BotMood.DIZZY -> {
                     val d = r * 0.75f
-                    // Left '>'
                     canvas.drawLine(lx - d, ey - d, lx + d * 0.6f, ey, eyeStrokePaint)
                     canvas.drawLine(lx - d, ey + d, lx + d * 0.6f, ey, eyeStrokePaint)
-                    // Right '<'
                     canvas.drawLine(rx + d, ey - d, rx - d * 0.6f, ey, eyeStrokePaint)
                     canvas.drawLine(rx + d, ey + d, rx - d * 0.6f, ey, eyeStrokePaint)
                 }
-
-                // 17. ROCKET_LAUNCH: Double Upward Boost Chevrons (︽ ︽)
                 BotMood.ROCKET_LAUNCH -> {
                     drawUpChevron(canvas, lx, ey - dp(2f), r * 0.8f)
                     drawUpChevron(canvas, lx, ey + dp(3.5f), r * 0.8f)
                     drawUpChevron(canvas, rx, ey - dp(2f), r * 0.8f)
                     drawUpChevron(canvas, rx, ey + dp(3.5f), r * 0.8f)
                 }
-
-                // 18. UPLOAD_UP: Upward Arrows Inside Eyes (↑ ↑)
                 BotMood.UPLOAD_UP -> {
                     drawUpArrowEye(canvas, lx, ey, r)
                     drawUpArrowEye(canvas, rx, ey, r)
                 }
-
-                // 19. CELEBRATE: High Victory Peaks (∧ ∧) + Center Diamond
                 BotMood.CELEBRATE -> {
                     drawUpChevron(canvas, lx, ey, r * 0.95f)
                     drawUpChevron(canvas, rx, ey, r * 0.95f)
                     canvas.drawCircle(cx, ey - r * 0.9f, dp(2.2f), eyeFillPaint)
                 }
-
-                // 20. QUESTION: Curious Asymmetric Raised Eye (● •)
                 BotMood.QUESTION -> {
                     canvas.drawCircle(lx, ey - dp(2f), r * 1.08f, eyeFillPaint)
                     canvas.drawCircle(rx, ey + dp(1.5f), r * 0.72f, eyeFillPaint)
@@ -865,7 +968,6 @@ class AiOverlayHud(
             canvas.save()
             canvas.clipPath(reusablePath)
             canvas.drawCircle(x, y, r, eyeFillPaint)
-            // Cut an angled heroic brow along the top
             reusablePath.reset()
             if (isLeft) {
                 reusablePath.moveTo(x - r * 1.2f, y - r * 1.2f)
@@ -919,17 +1021,13 @@ class AiOverlayHud(
     }
 
     /**
-     * Upgraded 3D-Styled Plump Baymax Hand Gestures Overlay:
-     * 1. TAP Gesture: Full plump 4-finger Baymax glove + thumb + wrist cuff + dual sonar target pulse
-     * 2. SWIPE Gesture: Auto-rotates hand in swipe direction + motion chevrons
-     * 3. THUMBS-UP Gesture: Celebratory Baymax Thumbs-Up on task completion
+     * 3D-Styled Plump Baymax Hand Gestures Overlay
      */
     private inner class BaymaxHandOverlayView(context: Context) : View(context) {
         private var gestureMode = 0 // 0=TAP, 1=SWIPE, 2=THUMBS_UP
         private var handX = -100f
         private var handY = -100f
         private var swipeAngleDeg = 0f
-        private var animProgress = 0f
         private var handAlpha = 0
         private var rippleRadius = 0f
         private var pressScale = 1f
@@ -988,10 +1086,8 @@ class AiOverlayHud(
                 interpolator = DecelerateInterpolator()
                 addUpdateListener { anim ->
                     val f = anim.animatedValue as Float
-                    animProgress = f
                     handAlpha = ((1f - f * 0.85f) * 255).toInt().coerceIn(0, 255)
                     rippleRadius = dp(8f) + (dp(34f) * f)
-                    // Realistic downward press bounce: 1.15 -> 0.82 -> 1.02
                     pressScale = when {
                         f < 0.28f -> 1.15f - (f / 0.28f) * 0.33f
                         f < 0.65f -> 0.82f + ((f - 0.28f) / 0.37f) * 0.20f
@@ -1015,7 +1111,6 @@ class AiOverlayHud(
             gestureMode = 1
             val dx = endX - startX
             val dy = endY - startY
-            // Calculate rotation so the pointing finger tilts naturally in the direction of motion
             val rawAngle = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat() + 90f
             swipeAngleDeg = (rawAngle * 0.25f).coerceIn(-35f, 35f)
             alpha = 1f
@@ -1025,7 +1120,6 @@ class AiOverlayHud(
                 interpolator = DecelerateInterpolator()
                 addUpdateListener { anim ->
                     val f = anim.animatedValue as Float
-                    animProgress = f
                     handX = startX + dx * f
                     handY = startY + dy * f
                     handAlpha = if (f < 0.82f) 245 else ((1f - f) * 1300).toInt().coerceIn(0, 255)
@@ -1056,7 +1150,6 @@ class AiOverlayHud(
                 interpolator = OvershootInterpolator()
                 addUpdateListener { anim ->
                     val f = anim.animatedValue as Float
-                    animProgress = f
                     handAlpha = if (f < 0.75f) 250 else ((1f - f) * 950).toInt().coerceIn(0, 255)
                     pressScale = f.coerceIn(0.4f, 1.12f)
                     rippleRadius = dp(20f) + dp(25f) * f
@@ -1088,17 +1181,14 @@ class AiOverlayHud(
                 return
             }
 
-            // 1. Target Sonar Rings right at the exact (handX, handY) contact point
             canvas.drawCircle(handX, handY, rippleRadius, primaryRipplePaint)
             canvas.drawCircle(handX, handY, dp(5.5f), secondaryRipplePaint)
 
-            // 2. Draw Plump 3D-Styled Baymax Glove Hand pointing at (0, 0)
             canvas.save()
             canvas.translate(handX, handY)
             canvas.rotate(swipeAngleDeg)
             canvas.scale(pressScale, pressScale)
 
-            // Plump Thumb on the left side
             canvas.save()
             canvas.translate(-dp(13f), dp(16f))
             canvas.rotate(-32f)
@@ -1107,7 +1197,6 @@ class AiOverlayHud(
             canvas.drawRoundRect(thumbRect, dp(6f), dp(6f), gloveStrokePaint)
             canvas.restore()
 
-            // Two curled plump fingers on the right side
             val midFingerRect = RectF(dp(4f), dp(7f), dp(14f), dp(25f))
             val ringFingerRect = RectF(dp(11f), dp(11f), dp(20f), dp(27f))
             canvas.drawRoundRect(ringFingerRect, dp(5f), dp(5f), gloveFillPaint)
@@ -1115,17 +1204,14 @@ class AiOverlayHud(
             canvas.drawRoundRect(midFingerRect, dp(5.5f), dp(5.5f), gloveFillPaint)
             canvas.drawRoundRect(midFingerRect, dp(5.5f), dp(5.5f), gloveStrokePaint)
 
-            // Main Pointing Index Finger (Tip touches 0,0)
             val indexRect = RectF(-dp(6.5f), -dp(2f), dp(6.5f), dp(24f))
             canvas.drawRoundRect(indexRect, dp(6.5f), dp(6.5f), gloveFillPaint)
             canvas.drawRoundRect(indexRect, dp(6.5f), dp(6.5f), gloveStrokePaint)
 
-            // Soft Rounded Inflatable Palm
             val palmRect = RectF(-dp(14f), dp(13f), dp(18f), dp(39f))
             canvas.drawRoundRect(palmRect, dp(13f), dp(13f), gloveFillPaint)
             canvas.drawRoundRect(palmRect, dp(13f), dp(13f), gloveStrokePaint)
 
-            // Baymax Wrist Cuff Band at bottom of palm
             val cuffRect = RectF(-dp(10f), dp(36f), dp(14f), dp(42f))
             canvas.drawRoundRect(cuffRect, dp(4f), dp(4f), cuffAccentPaint)
             canvas.drawRoundRect(cuffRect, dp(4f), dp(4f), gloveStrokePaint)
@@ -1138,22 +1224,18 @@ class AiOverlayHud(
             canvas.translate(handX, handY)
             canvas.scale(pressScale, pressScale)
 
-            // Emerald Glow Ring
             primaryRipplePaint.color = Color.parseColor("#10B981")
             canvas.drawCircle(0f, 0f, rippleRadius, primaryRipplePaint)
             primaryRipplePaint.color = Color.parseColor("#3B82F6")
 
-            // Upright Plump Thumb
             val thumbUpRect = RectF(-dp(14f), -dp(26f), -dp(1f), dp(4f))
             canvas.drawRoundRect(thumbUpRect, dp(7f), dp(7f), gloveFillPaint)
             canvas.drawRoundRect(thumbUpRect, dp(7f), dp(7f), gloveStrokePaint)
 
-            // Fist Palm
             val fistRect = RectF(-dp(16f), -dp(6f), dp(14f), dp(22f))
             canvas.drawRoundRect(fistRect, dp(10f), dp(10f), gloveFillPaint)
             canvas.drawRoundRect(fistRect, dp(10f), dp(10f), gloveStrokePaint)
 
-            // 3 Curled Knuckles on right
             for (i in 0..2) {
                 val top = -dp(4f) + i * dp(8f)
                 val knuckle = RectF(dp(6f), top, dp(18f), top + dp(7.5f))
