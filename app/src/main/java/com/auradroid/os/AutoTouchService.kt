@@ -49,6 +49,7 @@ import java.net.URL
 import java.util.Locale
 import kotlin.coroutines.resume
 import kotlin.math.hypot
+import kotlin.random.Random
 
 data class TaggedUiElement(
     val tagId: Int,
@@ -97,10 +98,12 @@ class AutoTouchService : AccessibilityService() {
     private var currentAppCategory = "General"
     private var lastStepScreenshot: Bitmap? = null
     private var lastAgentTapTimestamp = 0L
+    private var lastScreenshotTimestamp = 0L
+    private var lastAiCallTimestamp = 0L
     private var consecutiveSameScreenCount = 0
     private var lastScreenSignature = ""
 
-    // Run Session Tracking for Post-Run Gemini 3.8 Auto-Reflection
+    // Run Session Tracking for Post-Run Gemini 3.8 Auto-Reflection (Capped to prevent OOM)
     private val currentRunBitmaps = mutableListOf<Bitmap>()
     private val currentRunSteps = mutableListOf<String>()
     private val currentPlannedSteps = mutableListOf<String>()
@@ -134,6 +137,17 @@ class AutoTouchService : AccessibilityService() {
         serviceScope.cancel()
         instance = null
         super.onDestroy()
+    }
+
+    private fun recordRunBitmapSafely(bmp: Bitmap?) {
+        if (bmp == null) return
+        lastStepScreenshot = bmp
+        synchronized(currentRunBitmaps) {
+            if (currentRunBitmaps.size >= 10) {
+                currentRunBitmaps.removeAt(0)
+            }
+            currentRunBitmaps.add(bmp)
+        }
     }
 
     private fun start24x7ForegroundProtection() {
@@ -226,7 +240,7 @@ class AutoTouchService : AccessibilityService() {
         val teachEnabled = prefs.getBoolean("passive_teach_mode", true)
 
         val timeSinceAgentTap = System.currentTimeMillis() - lastAgentTapTimestamp
-        if (teachEnabled && isAgentRunning && timeSinceAgentTap > 900L &&
+        if (teachEnabled && isAgentRunning && timeSinceAgentTap > 1100L &&
             event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED
         ) {
             val pkg = event.packageName?.toString() ?: ""
@@ -252,10 +266,8 @@ class AutoTouchService : AccessibilityService() {
 
             serviceScope.launch {
                 delay(1200L)
-                val afterBitmap = takeHdDisplayScreenshotWithTimeout(2000L)
-                if (afterBitmap != null) {
-                    currentRunBitmaps.add(afterBitmap)
-                }
+                val afterBitmap = takeHdDisplayScreenshotWithTimeout(2200L)
+                recordRunBitmapSafely(afterBitmap)
                 withContext(Dispatchers.IO) {
                     val (prob, rule) = geminiBrain.analyzeBeforeAfterHumanTouchWith38Flash(
                         appCategory = cat,
@@ -298,7 +310,7 @@ class AutoTouchService : AccessibilityService() {
         val rGoal = currentTaskGoal
         val rPlanned = currentPlannedSteps.toList()
         val rSteps = currentRunSteps.toList()
-        val rBitmaps = currentRunBitmaps.toList()
+        val rBitmaps = synchronized(currentRunBitmaps) { currentRunBitmaps.toList() }
 
         memoryVault.saveAutomationRunSession(
             runId = rId,
@@ -376,7 +388,7 @@ class AutoTouchService : AccessibilityService() {
         activeRunId = "run_${System.currentTimeMillis()}"
         activeRunTitle = goal.take(35)
         activeRunFinalized = false
-        currentRunBitmaps.clear()
+        synchronized(currentRunBitmaps) { currentRunBitmaps.clear() }
         currentRunSteps.clear()
         currentPlannedSteps.clear()
         currentPlannedSteps.addAll(plannedSteps)
@@ -388,6 +400,7 @@ class AutoTouchService : AccessibilityService() {
                 acquireWakeLock()
                 currentTaskGoal = goal
                 consecutiveSameScreenCount = 0
+                lastScreenSignature = ""
                 val stepHistory = mutableListOf<String>()
                 var stepNumber = 0
 
@@ -402,7 +415,7 @@ class AutoTouchService : AccessibilityService() {
 
                 val lowerGoal = goal.lowercase(Locale.ROOT)
                 val autoTargetApp = when {
-                    lowerGoal.contains("instagram") || lowerGoal.contains("इंस्टाग्राम") -> "instagram"
+                    lowerGoal.contains("instagram") || lowerGoal.contains("इंस्टाग्राम") || lowerGoal.contains("insta") -> "instagram"
                     lowerGoal.contains("whatsapp") || lowerGoal.contains("व्हाट्सएप") -> "whatsapp"
                     lowerGoal.contains("youtube") || lowerGoal.contains("यूट्यूब") -> "youtube"
                     lowerGoal.contains("chrome") || lowerGoal.contains("क्रोम") -> "chrome"
@@ -432,11 +445,30 @@ class AutoTouchService : AccessibilityService() {
                     val taggedElements = scanScreenInteractiveElements(specs)
                     val currentSig = buildScreenSignature(activePkg, taggedElements)
 
-                    if (currentSig == lastScreenSignature) {
+                    if (currentSig == lastScreenSignature && stepNumber > 1) {
                         consecutiveSameScreenCount++
                     } else {
                         consecutiveSameScreenCount = 0
                         lastScreenSignature = currentSig
+                    }
+
+                    // Auto-recover if stuck on exact same screen 3 times in a row
+                    if (consecutiveSameScreenCount >= 3) {
+                        log("⚠️ Screen unchanged for 3 steps! Performing smart unstick...")
+                        if (isSoftKeyboardOpen()) {
+                            performGlobalAction(GLOBAL_ACTION_BACK)
+                            stepHistory.add("Closed keyboard to unstick view")
+                        } else {
+                            performPhysicalSwipe(
+                                specs.screenWidth / 2,
+                                (specs.screenHeight * 0.70f).toInt(),
+                                specs.screenWidth / 2,
+                                (specs.screenHeight * 0.35f).toInt()
+                            )
+                            stepHistory.add("Slightly scrolled screen to reveal hidden buttons")
+                        }
+                        consecutiveSameScreenCount = 1
+                        delay(1500L)
                     }
 
                     val hasLimitedComments = taggedElements.any {
@@ -464,23 +496,33 @@ class AutoTouchService : AccessibilityService() {
 
                     hud.updateStatus("📸 Step $stepNumber Capturing...", BotMood.WORKING, taskRunning = true)
                     val screenshot = takeHdDisplayScreenshotWithTimeout(2500L)
-                    if (screenshot != null) {
-                        lastStepScreenshot = screenshot
-                        currentRunBitmaps.add(screenshot)
-                    }
+                    recordRunBitmapSafely(screenshot)
 
                     val recalledFixes = memoryVault.recallFixesForApp(currentAppCategory)
-                    val nodesPromptList = taggedElements.take(48).joinToString("\n") {
+                    val nodesPromptList = taggedElements.take(55).joinToString("\n") {
                         "[${it.tagId}] ${it.label} (${it.className}) -> Center(${it.centerX}, ${it.centerY})"
                     }
 
-                    hud.updateStatus("🧠 Step $stepNumber Thinking...", BotMood.THINKING, taskRunning = true)
+                    // Free-Tier Rate Limit Pacing: Ensure at least 3.2s gap between Gemini API calls to prevent HTTP 429
+                    val elapsedSinceLastAi = System.currentTimeMillis() - lastAiCallTimestamp
+                    if (elapsedSinceLastAi in 1..3199L) {
+                        delay(3200L - elapsedSinceLastAi)
+                    }
 
-                    val decision = withTimeoutOrNull(30000L) {
+                    hud.updateStatus("🧠 Step $stepNumber Thinking...", BotMood.THINKING, taskRunning = true)
+                    lastAiCallTimestamp = System.currentTimeMillis()
+
+                    val effectiveHistory = if (isStuck) {
+                        stepHistory + "⚠️ WARNING: Screen did NOT change after last action! Try a different TAG_ID or use CLICK_XY on the visual screenshot button!"
+                    } else {
+                        stepHistory
+                    }
+
+                    val decision = withTimeoutOrNull(32000L) {
                         geminiBrain.decideNextStep(
                             goal = goal,
                             planSteps = plannedSteps,
-                            currentStepHistory = stepHistory,
+                            currentStepHistory = effectiveHistory,
                             bodySpecs = specs,
                             numberedNodesList = nodesPromptList,
                             screenshotBitmap = screenshot,
@@ -529,7 +571,7 @@ class AutoTouchService : AccessibilityService() {
                         "CLICK_TAG" -> {
                             val target = taggedElements.find { it.tagId == decision.tagId }
                             if (target != null) {
-                                tapDeadCenterOfElement(target)
+                                tapElementSmartly(target, forceAccessibilityClick = isStuck)
                                 stepHistory.add("Tapped [${target.tagId}] ${target.label}")
                             } else {
                                 val px = convertNormalizedX(decision.x, specs)
@@ -537,21 +579,21 @@ class AutoTouchService : AccessibilityService() {
                                 performPhysicalTap(px, py)
                                 stepHistory.add("Tapped XY($px,$py)")
                             }
-                            delay(2400L)
+                            delay(2200L + Random.nextLong(150L, 400L))
                         }
 
                         "CLICK_XY" -> {
                             val px = convertNormalizedX(decision.x, specs)
                             val py = convertNormalizedY(decision.y, specs)
                             val snapped = findNearestElementToSnap(px, py, taggedElements)
-                            if (snapped != null) {
-                                tapDeadCenterOfElement(snapped)
-                                stepHistory.add("Tapped ${snapped.label}")
+                            if (snapped != null && !isStuck) {
+                                tapElementSmartly(snapped, forceAccessibilityClick = false)
+                                stepHistory.add("Tapped ${snapped.label} at ($px,$py)")
                             } else {
                                 performPhysicalTap(px, py)
                                 stepHistory.add("Tapped XY($px,$py)")
                             }
-                            delay(2400L)
+                            delay(2200L + Random.nextLong(150L, 400L))
                         }
 
                         "LONG_PRESS_XY" -> {
@@ -564,26 +606,28 @@ class AutoTouchService : AccessibilityService() {
 
                         "TYPE" -> {
                             val target = taggedElements.find { it.tagId == decision.tagId }
+                            val targetLabel = target?.label ?: ""
                             if (target != null) {
-                                tapDeadCenterOfElement(target)
-                                delay(750L)
+                                tapElementSmartly(target, forceAccessibilityClick = false)
+                                delay(850L)
                             } else if (decision.x > 0 && decision.y > 0) {
                                 performPhysicalTap(
                                     convertNormalizedX(decision.x, specs),
                                     convertNormalizedY(decision.y, specs)
                                 )
-                                delay(750L)
+                                delay(850L)
                             }
-                            typeAndPasteTextReliably(decision.text)
+
+                            val typedOk = typeAndPasteTextReliably(decision.text, target?.node)
                             stepHistory.add("Typed '${decision.text}'")
-                            delay(1200L)
+                            delay(1000L)
 
                             if (activePkg.contains("whatsapp") || isContinuousMonitor) {
                                 clickWhatsAppSendIfPresent()
                             } else if (activePkg.contains("instagram") || activePkg.contains("youtube")) {
-                                clickSearchOrPostIfPresent(decision.text)
+                                handleSmartPostOrSearchAfterType(decision.text, targetLabel, decision.reason, typedOk)
                             }
-                            delay(1800L)
+                            delay(2000L)
                         }
 
                         "SWIPE" -> {
@@ -633,7 +677,7 @@ class AutoTouchService : AccessibilityService() {
         currentTaskGoal = "Upload video $rawDisplayName to YouTube Shorts"
         currentPlannedSteps.clear()
         currentPlannedSteps.addAll(listOf("Click Next on Trimmer", "Click Next on Editor", "Paste Caption", "Click Upload Short"))
-        currentRunBitmaps.clear()
+        synchronized(currentRunBitmaps) { currentRunBitmaps.clear() }
         currentRunSteps.clear()
 
         currentTaskJob = serviceScope.launch {
@@ -675,7 +719,7 @@ class AutoTouchService : AccessibilityService() {
         currentTaskGoal = "Upload video from folder $folderInputRaw to YouTube Shorts"
         currentPlannedSteps.clear()
         currentPlannedSteps.addAll(listOf("Select Video", "Tap Next twice", "Paste Title in Caption box", "Tap Upload Short"))
-        currentRunBitmaps.clear()
+        synchronized(currentRunBitmaps) { currentRunBitmaps.clear() }
         currentRunSteps.clear()
 
         currentTaskJob = serviceScope.launch {
@@ -857,30 +901,35 @@ class AutoTouchService : AccessibilityService() {
         // Step 1 & 2: Advance past Trimmer & Editor screens (max 2 Next clicks)
         for (attempt in 1..2) {
             if (!isAgentRunning) return
-            takeHdDisplayScreenshotWithTimeout(2000L)?.let { currentRunBitmaps.add(it) }
-            val fallbackX = (specs.screenWidth * 0.88f).toInt()
-            val fallbackY = (specs.screenHeight * 0.94f).toInt()
+            recordRunBitmapSafely(takeHdDisplayScreenshotWithTimeout(2000L))
+            val screenElements = scanScreenInteractiveElements(specs)
+            val nextNode = screenElements.find {
+                it.label.equals("Next", true) || it.label.equals("आगे बढ़ें", true)
+            }
+            val tapX = nextNode?.centerX ?: (specs.screenWidth * 0.88f).toInt()
+            val tapY = nextNode?.centerY ?: (specs.screenHeight * 0.94f).toInt()
             hud.updateStatus("Tap: Next (#$attempt)", BotMood.WORKING, taskRunning = true)
-            log("👆 Tapping Next button ($fallbackX, $fallbackY)")
-            performPhysicalTap(fallbackX, fallbackY)
-            currentRunSteps.add("Tapped Next (#$attempt) at ($fallbackX, $fallbackY)")
+            log("👆 Tapping Next button ($tapX, $tapY)")
+            performPhysicalTap(tapX, tapY)
+            currentRunSteps.add("Tapped Next (#$attempt) at ($tapX, $tapY)")
             delay(4200L)
         }
 
         // Step 3: Tap 'Caption your Short' & Paste Viral Title
-        takeHdDisplayScreenshotWithTimeout(2000L)?.let {
-            lastStepScreenshot = it
-            currentRunBitmaps.add(it)
-        }
+        recordRunBitmapSafely(takeHdDisplayScreenshotWithTimeout(2000L))
         hud.updateStatus("Typing Viral Caption...", BotMood.WORKING, taskRunning = true)
-        val capX = (specs.screenWidth * 0.52f).toInt()
-        val capY = (specs.screenHeight * 0.16f).toInt()
+        val detailsElements = scanScreenInteractiveElements(specs)
+        val captionNode = detailsElements.find {
+            it.label.contains("Caption", true) || it.className.contains("EditText", true)
+        }
+        val capX = captionNode?.centerX ?: (specs.screenWidth * 0.52f).toInt()
+        val capY = captionNode?.centerY ?: (specs.screenHeight * 0.16f).toInt()
         log("👆 Tapping Caption Box ($capX, $capY)")
         performPhysicalTap(capX, capY)
         currentRunSteps.add("Tapped Caption Box at ($capX, $capY)")
         delay(1600L)
 
-        typeAndPasteTextReliably(viralTitle)
+        typeAndPasteTextReliably(viralTitle, captionNode?.node)
         currentRunSteps.add("Pasted Viral Title: $viralTitle")
         delay(1200L)
 
@@ -893,7 +942,7 @@ class AutoTouchService : AccessibilityService() {
         // Step 4: Tap White 'Upload Short' Button at Bottom Center (96.4% height)
         for (retry in 1..3) {
             if (!isAgentRunning) return
-            takeHdDisplayScreenshotWithTimeout(2000L)?.let { currentRunBitmaps.add(it) }
+            recordRunBitmapSafely(takeHdDisplayScreenshotWithTimeout(2000L))
             val postElements = scanScreenInteractiveElements(specs)
             val uploadNode = postElements.find {
                 it.label.contains("Upload Short", true) || it.label.equals("Upload", true)
@@ -1032,9 +1081,7 @@ class AutoTouchService : AccessibilityService() {
             val domTagList = injectVisualNumberStickersInWebView(webView)
             delay(400L)
             val webBitmap = hud.captureWebViewCanvasBitmap()
-            if (webBitmap != null) {
-                currentRunBitmaps.add(webBitmap)
-            }
+            recordRunBitmapSafely(webBitmap)
 
             val decision = geminiBrain.decideNextStep(
                 goal = goal,
@@ -1057,7 +1104,7 @@ class AutoTouchService : AccessibilityService() {
 
             executeWebStepInDom(webView, decision)
             history.add("${decision.action}: ${decision.reason}")
-            delay(3000L)
+            delay(3200L)
         }
     }
 
@@ -1184,41 +1231,56 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
+    /**
+     * Scans active application window(s) while ignoring our own HUD overlay
+     */
     private fun scanScreenInteractiveElements(specs: DeviceBodySpecs): List<TaggedUiElement> {
-        val root = rootInActiveWindow ?: return emptyList()
         val result = mutableListOf<TaggedUiElement>()
+        val seenBoundsLabels = mutableSetOf<String>()
         var idCounter = 0
 
         fun traverse(node: AccessibilityNodeInfo?) {
             if (node == null || !node.isVisibleToUser) return
+            val nodePkg = node.packageName?.toString() ?: ""
+            if (nodePkg == packageName) return // Never scan our own HUD overlay
+
             val rect = Rect()
             node.getBoundsInScreen(rect)
 
-            val isValidSize = rect.width() > 16 && rect.height() > 16 &&
+            val isValidSize = rect.width() > 14 && rect.height() > 14 &&
                 rect.bottom > specs.cutoutSafeTop && rect.top < specs.screenHeight
 
             val text = node.text?.toString()?.trim() ?: ""
             val desc = node.contentDescription?.toString()?.trim() ?: ""
+            val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                node.hintText?.toString()?.trim() ?: ""
+            } else ""
             val viewId = node.viewIdResourceName?.substringAfterLast('/') ?: ""
+
             val label = when {
                 text.isNotEmpty() -> text
                 desc.isNotEmpty() -> desc
+                hint.isNotEmpty() -> hint
                 viewId.isNotEmpty() -> viewId
                 else -> ""
             }
 
-            if (isValidSize && (node.isClickable || node.isEditable || node.isCheckable || label.isNotEmpty())) {
-                result.add(
-                    TaggedUiElement(
-                        tagId = idCounter++,
-                        node = node,
-                        label = label.ifEmpty { "Element" }.take(55),
-                        className = node.className?.toString()?.substringAfterLast('.') ?: "View",
-                        bounds = rect,
-                        centerX = rect.centerX(),
-                        centerY = rect.centerY()
+            if (isValidSize && (node.isClickable || node.isEditable || node.isCheckable || node.isFocused || label.isNotEmpty())) {
+                val cleanLabel = label.ifEmpty { "Button" }.replace("\n", " ").take(55)
+                val dedupKey = "${cleanLabel}_${rect.centerX() / 12}_${rect.centerY() / 12}"
+                if (seenBoundsLabels.add(dedupKey)) {
+                    result.add(
+                        TaggedUiElement(
+                            tagId = idCounter++,
+                            node = node,
+                            label = cleanLabel,
+                            className = node.className?.toString()?.substringAfterLast('.') ?: "View",
+                            bounds = rect,
+                            centerX = rect.centerX(),
+                            centerY = rect.centerY()
+                        )
                     )
-                )
+                }
             }
 
             for (i in 0 until node.childCount) {
@@ -1226,12 +1288,36 @@ class AutoTouchService : AccessibilityService() {
             }
         }
 
-        traverse(root)
+        val activeRoot = rootInActiveWindow
+        if (activeRoot != null) {
+            traverse(activeRoot)
+        }
+
+        // Also check floating dialogs / bottom sheets in other application windows
+        try {
+            for (win in windows) {
+                if (win.type == AccessibilityWindowInfo.TYPE_APPLICATION ||
+                    win.type == AccessibilityWindowInfo.TYPE_SPLIT_SCREEN_DIVIDER
+                ) {
+                    val r = win.root
+                    if (r != null && r != activeRoot) {
+                        traverse(r)
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
         return result
     }
 
+    /**
+     * Builds a comprehensive signature covering top, middle, and bottom sheet UI elements
+     */
     private fun buildScreenSignature(pkg: String, elements: List<TaggedUiElement>): String {
-        return pkg + ":" + elements.take(15).joinToString("|") { "${it.label}@${it.centerY / 40}" }
+        if (elements.isEmpty()) return "$pkg:empty:${isSoftKeyboardOpen()}"
+        val topPart = elements.take(10).joinToString("|") { "${it.label}@${it.centerY / 45}" }
+        val bottomPart = elements.takeLast(10).joinToString("|") { "${it.label}@${it.centerY / 45}" }
+        return "$pkg:${elements.size}:kb=${isSoftKeyboardOpen()}:$topPart#$bottomPart"
     }
 
     private fun convertNormalizedX(valX: Int, specs: DeviceBodySpecs): Int {
@@ -1250,24 +1336,53 @@ class AutoTouchService : AccessibilityService() {
     }
 
     private fun findNearestElementToSnap(px: Int, py: Int, elements: List<TaggedUiElement>): TaggedUiElement? {
-        return elements.filter { it.node?.isClickable == true }
+        return elements.filter { it.node?.isClickable == true || it.node?.isEditable == true }
             .minByOrNull { hypot((it.centerX - px).toDouble(), (it.centerY - py).toDouble()) }
-            ?.takeIf { hypot((it.centerX - px).toDouble(), (it.centerY - py).toDouble()) <= 85.0 }
+            ?.takeIf { hypot((it.centerX - px).toDouble(), (it.centerY - py).toDouble()) <= 78.0 }
+    }
+
+    /**
+     * Smart hybrid tap: uses physical gesture tap with tiny human jitter,
+     * and falls back to Accessibility ACTION_CLICK on node/parent if stuck.
+     */
+    private suspend fun tapElementSmartly(element: TaggedUiElement, forceAccessibilityClick: Boolean = false) {
+        if (forceAccessibilityClick && element.node != null) {
+            var curr: AccessibilityNodeInfo? = element.node
+            var clicked = false
+            for (depth in 0..3) {
+                if (curr == null) break
+                if (curr.isClickable && curr.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                    clicked = true
+                    break
+                }
+                curr = curr.parent
+            }
+            if (clicked) {
+                lastAgentTapTimestamp = System.currentTimeMillis()
+                hud.animateHandTap(element.centerX.toFloat(), element.centerY.toFloat())
+                delay(150L)
+                return
+            }
+        }
+        performPhysicalTap(element.centerX, element.centerY)
     }
 
     private suspend fun tapDeadCenterOfElement(element: TaggedUiElement) {
-        performPhysicalTap(element.centerX, element.centerY)
+        tapElementSmartly(element, forceAccessibilityClick = false)
     }
 
     private suspend fun performPhysicalTap(x: Int, y: Int) {
         lastAgentTapTimestamp = System.currentTimeMillis()
-        hud.animateHandTap(x.toFloat(), y.toFloat())
-        val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
+        val jitterX = (x + Random.nextInt(-3, 4)).coerceAtLeast(8)
+        val jitterY = (y + Random.nextInt(-3, 4)).coerceAtLeast(8)
+        hud.animateHandTap(jitterX.toFloat(), jitterY.toFloat())
+        val path = Path().apply { moveTo(jitterX.toFloat(), jitterY.toFloat()) }
+        val duration = Random.nextLong(85L, 125L)
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0L, 95L))
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, duration))
             .build()
         dispatchGesture(gesture, null, null)
-        delay(120L)
+        delay(duration + 35L)
     }
 
     private suspend fun performPhysicalLongPress(x: Int, y: Int) {
@@ -1295,57 +1410,140 @@ class AutoTouchService : AccessibilityService() {
         delay(420L)
     }
 
-    private suspend fun typeAndPasteTextReliably(textToType: String) {
-        if (textToType.isBlank()) return
+    /**
+     * Reliably sets text on the target or currently focused EditText first, before falling back to any editable field
+     */
+    private suspend fun typeAndPasteTextReliably(
+        textToType: String,
+        preferredNode: AccessibilityNodeInfo? = null
+    ): Boolean {
+        if (textToType.isBlank()) return false
         withContext(Dispatchers.Main) {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("aura_text", textToType))
         }
 
-        val root = rootInActiveWindow ?: return
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, textToType)
+        }
+
+        fun tryApplyTextToNode(node: AccessibilityNodeInfo?): Boolean {
+            if (node == null) return false
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                }
+                return true
+            }
+            if (node.performAction(AccessibilityNodeInfo.ACTION_PASTE)) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                }
+                return true
+            }
+            return false
+        }
+
+        // Priority 1: Preferred node passed from CLICK_TAG / TYPE target
+        if (preferredNode != null && (preferredNode.isEditable || preferredNode.className?.toString()?.contains("EditText", true) == true)) {
+            if (tryApplyTextToNode(preferredNode)) {
+                delay(350L)
+                return true
+            }
+        }
+
+        val root = rootInActiveWindow ?: return false
         var setSuccess = false
 
-        fun trySetTextOnFocusedOrEditable(node: AccessibilityNodeInfo?) {
+        // Priority 2: Currently focused editable node
+        val focusedInput = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focusedInput != null && tryApplyTextToNode(focusedInput)) {
+            delay(350L)
+            return true
+        }
+
+        // Priority 3: Traverse tree looking strictly for isFocused first, then any EditText
+        fun traverseEditable(node: AccessibilityNodeInfo?, requireFocused: Boolean) {
             if (node == null || setSuccess) return
-            if (node.isFocused || node.isEditable || node.className?.toString()?.contains("EditText", true) == true) {
-                val args = Bundle().apply {
-                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, textToType)
-                }
-                if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
-                    setSuccess = true
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
-                    }
-                    return
-                }
-                if (node.performAction(AccessibilityNodeInfo.ACTION_PASTE)) {
+            val isEdit = node.isEditable || node.className?.toString()?.contains("EditText", true) == true
+            if (isEdit && (!requireFocused || node.isFocused)) {
+                if (tryApplyTextToNode(node)) {
                     setSuccess = true
                     return
                 }
             }
             for (i in 0 until node.childCount) {
-                trySetTextOnFocusedOrEditable(node.getChild(i))
+                traverseEditable(node.getChild(i), requireFocused)
             }
         }
 
-        trySetTextOnFocusedOrEditable(root)
+        traverseEditable(root, requireFocused = true)
+        if (!setSuccess) {
+            traverseEditable(root, requireFocused = false)
+        }
+
         delay(400L)
+        return setSuccess
     }
 
-    private suspend fun clickSearchOrPostIfPresent(typedText: String) {
+    /**
+     * Context-aware handler after typing on Instagram / YouTube:
+     * Distinguishes between Commenting, Share-Sheet Friend Search, and Main Video Search!
+     */
+    private suspend fun handleSmartPostOrSearchAfterType(
+        typedText: String,
+        targetLabel: String,
+        decisionReason: String,
+        typedOk: Boolean
+    ) {
         val specs = getCalibratedDeviceBodySpecs()
         val elements = scanScreenInteractiveElements(specs)
-        val postOrSend = elements.find {
-            it.label.equals("Post", true) ||
-                it.label.equals("Send", true) ||
-                it.label.contains("row_search_for_x", true)
-        }
-        if (postOrSend != null) {
-            tapDeadCenterOfElement(postOrSend)
+
+        val combinedContext = "$targetLabel $decisionReason".lowercase(Locale.ROOT)
+        val isCommentContext = combinedContext.contains("comment") || combinedContext.contains("कमेंट")
+        val isShareSearchContext = combinedContext.contains("share") ||
+            combinedContext.contains("friend") ||
+            elements.any { it.label.contains("Send separately", true) || it.label.contains("Add a message", true) }
+
+        // 1. If in Share Sheet searching for a friend (e.g., Rahul), hide keyboard so friend list & Send button are visible!
+        if (isShareSearchContext) {
+            if (isSoftKeyboardOpen()) {
+                performGlobalAction(GLOBAL_ACTION_BACK)
+                delay(900L)
+            }
             return
         }
-        if (isSoftKeyboardOpen()) {
-            performPhysicalTap((specs.screenWidth * 0.90f).toInt(), (specs.screenHeight * 0.91f).toInt())
+
+        // 2. Look for an explicit Post / Send button on screen (especially for Comments)
+        val postBtn = elements.find {
+            it.label.equals("Post", true) ||
+                it.label.equals("Send", true) ||
+                it.label.contains("post_comment", true) ||
+                it.label.equals("पोस्ट करें", true)
+        }
+        if (postBtn != null) {
+            tapElementSmartly(postBtn, forceAccessibilityClick = false)
+            return
+        }
+
+        // 3. If it's a Search query, look for a matching search suggestion row or press bottom-right Search key
+        if (!isCommentContext) {
+            val searchSuggestion = elements.find {
+                it.label.contains("row_search_for_x", true) ||
+                    (it.centerY in (specs.cutoutSafeTop + 120)..(specs.screenHeight / 2) &&
+                        it.label.equals(typedText.trim(), true) &&
+                        !it.className.contains("EditText", true))
+            }
+            if (searchSuggestion != null) {
+                tapElementSmartly(searchSuggestion, forceAccessibilityClick = false)
+                return
+            }
+
+            if (isSoftKeyboardOpen() && typedOk) {
+                // Tap bottom-right keyboard Search/Enter button
+                performPhysicalTap((specs.screenWidth * 0.90f).toInt(), (specs.screenHeight * 0.91f).toInt())
+            }
         }
     }
 
@@ -1358,15 +1556,25 @@ class AutoTouchService : AccessibilityService() {
                 it.label.contains("भेजें", true)
         }
         if (sendNode != null) {
-            tapDeadCenterOfElement(sendNode)
+            tapElementSmartly(sendNode, forceAccessibilityClick = false)
         }
     }
 
+    /**
+     * Respects Android 11+ minimum interval between screenshots and auto-retries once if throttled
+     */
     private suspend fun takeHdDisplayScreenshotWithTimeout(timeoutMs: Long = 2500L): Bitmap? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
-        return withTimeoutOrNull(timeoutMs) {
+
+        val elapsed = System.currentTimeMillis() - lastScreenshotTimestamp
+        if (elapsed in 1..1050L) {
+            delay(1050L - elapsed)
+        }
+
+        suspend fun attemptCapture(): Bitmap? = withTimeoutOrNull(timeoutMs) {
             suspendCancellableCoroutine { cont ->
                 try {
+                    lastScreenshotTimestamp = System.currentTimeMillis()
                     takeScreenshot(
                         Display.DEFAULT_DISPLAY,
                         mainExecutor,
@@ -1390,12 +1598,19 @@ class AutoTouchService : AccessibilityService() {
                 }
             }
         }
+
+        val firstTry = attemptCapture()
+        if (firstTry != null) return firstTry
+
+        delay(950L)
+        return attemptCapture()
     }
 
     private fun launchAppByNameOrPackage(query: String) {
         val q = query.trim().lowercase(Locale.ROOT)
         val knownMap = mapOf(
             "instagram" to "com.instagram.android",
+            "insta" to "com.instagram.android",
             "youtube" to "com.google.android.youtube",
             "whatsapp" to "com.whatsapp",
             "chrome" to "com.android.chrome",
