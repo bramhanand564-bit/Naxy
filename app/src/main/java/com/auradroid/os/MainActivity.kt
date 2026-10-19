@@ -30,6 +30,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.*
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import kotlinx.coroutines.*
@@ -41,7 +42,6 @@ class MainActivity : AppCompatActivity() {
 
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
-    // Executive Matte Dark Palette (No Neon)
     private val bgMatteDark = Color.parseColor("#121316")
     private val cardSlate = Color.parseColor("#1C1F26")
     private val borderSubtle = Color.parseColor("#2E3440")
@@ -54,25 +54,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tabContainers: Array<View>
     private lateinit var bottomNavButtons: Array<TextView>
 
-    // Chat & Planner state
     private lateinit var chatMessagesLayout: LinearLayout
     private lateinit var chatInputBox: EditText
     private val chatHistoryBuilder = StringBuilder()
 
-    // Folder & Video Picker Input Reference
     private lateinit var folderPathEditText: EditText
 
-    // In-App Full Control Browser
     private var studioWebView: WebView? = null
     private var isDesktopMode = false
     private val downloadedFilesLog = mutableListOf<String>()
 
-    // Memory & Video Trainer
     private lateinit var memoryCategoriesLayout: LinearLayout
-    private var selectedTrainingCategory = "Instagram"
-    private var selectedTrainingNote = "इस वीडियो के हर स्टेप और टैप पॉइंट को समझो और याद रखो"
+    private lateinit var automationRunsListLayout: LinearLayout
+    private lateinit var videoSessionsListLayout: LinearLayout
 
-    // Live Logs Section View
+    private var selectedTrainingCategory = "Instagram"
+    private var selectedTrainingNote = "इस वीडियो के हर फ्रेम को देखो, जहाँ गलती हुई है उसे सुधारो और सही बटन के कोऑर्डिनेट सेव कर लो"
+
     private lateinit var liveLogsTextView: TextView
     private lateinit var engineScrollView: ScrollView
 
@@ -88,8 +86,6 @@ class MainActivity : AppCompatActivity() {
         window.statusBarColor = bgMatteDark
         window.navigationBarColor = Color.parseColor("#181B20")
 
-        // NOTE: Zero startup permission popups! Storage permissions are ONLY requested when user taps the button in Settings/Tasks.
-
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bgMatteDark)
@@ -99,7 +95,6 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        // Top Executive Header with Quick [📜 Logs] Button
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -209,7 +204,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestStoragePermissionsOnDemand(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!Environment.isExternalStorageManager()) {
-                AutoTouchService.log("📁 Requesting All Files Access Permission from Settings...")
+                AutoTouchService.log("📁 Requesting All Files Access Permission...")
                 Toast.makeText(this, "कृपया 'All Files Access' ऑन करें!", Toast.LENGTH_LONG).show()
                 try {
                     startActivity(
@@ -247,7 +242,7 @@ class MainActivity : AppCompatActivity() {
                 btn.background = null
             }
         }
-        if (index == 3) refreshMemoryFoldersList()
+        if (index == 3) refreshMemoryEverything()
         if (index == 4) refreshLiveLogsBox()
     }
 
@@ -271,7 +266,7 @@ class MainActivity : AppCompatActivity() {
 
         addChatBubble(
             "AuraDroid OS",
-            "नमस्ते भाई! मुझे कोई भी काम बताओ (जैसे: 'Instagram खोलो, भोजपुरी गाना सर्च करो और पहला वीडियो चलाओ' या 'YouTube पर फोल्डर से वीडियो अपलोड करो')। मैं पहले पूरा स्टेप-बाय-स्टेप प्लान दिखाऊँगा, फिर आपकी मंजूरी से काम शुरू करूँगा!",
+            "नमस्ते भाई! मुझे कोई भी काम बताओ (जैसे: 'Instagram खोलो, भोजपुरी गाना सर्च करो और पहला वीडियो चलाओ')। मैं पहले पूरा प्लान दिखाऊँगा, फिर आपकी मंजूरी से काम शुरू करूँगा!",
             isUser = false
         )
 
@@ -462,7 +457,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * TAB 2: Universal Automations with Native Folder Picker, Single Video Picker & Quick Folder Chips
+     * TAB 2: Universal Automations
      */
     private fun buildTab2AutomationsAndScheduler(): View {
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -499,7 +494,6 @@ class MainActivity : AppCompatActivity() {
                 setOnClickListener {
                     folderPathEditText.setText(path)
                     prefs.edit().putString("yt_folder_path", path).apply()
-                    AutoTouchService.log("📂 Folder Path Set: $path")
                 }
             }
         }
@@ -530,7 +524,6 @@ class MainActivity : AppCompatActivity() {
                 pickOldest = !pickOldest
                 prefs.edit().putBoolean("yt_pick_oldest", pickOldest).apply()
                 text = if (pickOldest) "🔃 Order: Oldest Video First (पुरानी पहले)" else "🔃 Order: Newest Video First (नई पहले)"
-                AutoTouchService.log("⚙️ Video Selection Order Changed: ${if (pickOldest) "Oldest First" else "Newest First"}")
             }
         }
 
@@ -629,7 +622,6 @@ class MainActivity : AppCompatActivity() {
                 .apply()
             btn.text = if (schedEnabled) "✅ 24/7 Daily Scheduler: ON" else "⚪ 24/7 Daily Scheduler: OFF"
             btn.background = roundedBox(if (schedEnabled) accentEmerald else Color.parseColor("#475569"), dp(12))
-            AutoTouchService.log("⏰ Daily Scheduler Set to ${if (schedEnabled) "ON ($t)" else "OFF"}")
         }
 
         schedCard.addView(timeInput)
@@ -718,7 +710,6 @@ class MainActivity : AppCompatActivity() {
             val cur = studioWebView?.url ?: "https://labs.google/fx/tools/flow"
             prefs.edit().putString("saved_flow_url", cur).apply()
             CookieManager.getInstance().flush()
-            AutoTouchService.log("📌 Saved Browser Target URL: $cur")
             Toast.makeText(this, "Target Page & Login Session Saved!", Toast.LENGTH_SHORT).show()
         })
 
@@ -747,7 +738,6 @@ class MainActivity : AppCompatActivity() {
             webChromeClient = WebChromeClient()
             setDownloadListener(DownloadListener { url, _, _, _, _ ->
                 downloadedFilesLog.add(0, url)
-                AutoTouchService.log("📥 Browser Media Download Started: $url")
                 Toast.makeText(this@MainActivity, "Downloading media from Browser...", Toast.LENGTH_SHORT).show()
             })
 
@@ -761,7 +751,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * TAB 4: Memory Folders & 12-Frame Video Trainer (Powered by Gemini 3.8 Flash)
+     * TAB 4: Memory Folders, Automation Runs History & Video Training Sessions with Gemini 3.8 Flash Chat
      */
     private fun buildTab4MemoryAndVideoTrainer(): View {
         val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
@@ -771,8 +761,9 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(24))
         }
 
+        // 1. Video Trainer Card
         val trainerCard = createSectionCard("📹 Frame-by-Frame Video Trainer (Gemini 3.8 Flash)")
-        val catInput = createCleanInput("Instagram", "App Folder Name (e.g. Instagram, YouTube, WhatsApp)")
+        val catInput = createCleanInput("Instagram", "App Folder Name (e.g. Instagram, YouTube)")
         val noteInput = createCleanInput(
             "इस वीडियो के हर फ्रेम को देखो, जहाँ गलती हुई है उसे सुधारो और सही बटन के कोऑर्डिनेट सेव कर लो",
             "इस वीडियो के बारे में निर्देश लिखें..."
@@ -780,10 +771,8 @@ class MainActivity : AppCompatActivity() {
 
         val pickVideoBtn = createPrimaryButton("📤 Upload Screen Recording Video & Train (12 Frames)", accentRoyalBlue) {
             selectedTrainingCategory = catInput.text.toString().trim().ifEmpty { "General" }
-            selectedTrainingNote = noteInput.text.toString().trim().ifEmpty { "Learn exact step coordinates from video frames" }
-            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                type = "video/*"
-            }
+            selectedTrainingNote = noteInput.text.toString().trim().ifEmpty { "Learn exact step coordinates" }
+            val intent = Intent(Intent.ACTION_GET_CONTENT).apply { type = "video/*" }
             startActivityForResult(intent, REQ_PICK_TRAINING_VIDEO)
         }
 
@@ -793,12 +782,22 @@ class MainActivity : AppCompatActivity() {
         trainerCard.addView(spacer(dp(12)))
         trainerCard.addView(pickVideoBtn)
 
-        val foldersCard = createSectionCard("📁 App-Wise Learned Fixes & Video Rules")
-        memoryCategoriesLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
+        // 2. Uploaded Training Videos Sessions List Card (With [💬 Chat with Gemini 3.8] button)
+        val videoSessionsCard = createSectionCard("🎬 Uploaded Video Training Sessions (Interactive Chat)")
+        videoSessionsListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        videoSessionsCard.addView(videoSessionsListLayout)
+
+        // 3. Automation Runs History Card (With [💬 Chat to Fix Run] button)
+        val runsCard = createSectionCard("🔄 Automation Runs History & Failed Task Chats")
+        automationRunsListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        runsCard.addView(automationRunsListLayout)
+
+        // 4. App-Wise Learned Fixes Card
+        val foldersCard = createSectionCard("📁 App-Wise Learned Fixes & Playbooks")
+        memoryCategoriesLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         foldersCard.addView(memoryCategoriesLayout)
 
+        // 5. Personal Profile Card
         val profileCard = createSectionCard("🔐 Personal Profile & Form Auto-Fill Memory")
         val profileInput = createCleanInput(
             vault.getUserProfileRules(),
@@ -807,7 +806,6 @@ class MainActivity : AppCompatActivity() {
 
         val saveProfileBtn = createPrimaryButton("💾 Save Personal Memory", accentEmerald) {
             vault.saveUserProfileRules(profileInput.text.toString())
-            AutoTouchService.log("💾 Saved Personal Profile Memory")
             Toast.makeText(this, "Personal Memory Saved!", Toast.LENGTH_SHORT).show()
         }
 
@@ -816,10 +814,18 @@ class MainActivity : AppCompatActivity() {
         profileCard.addView(saveProfileBtn)
 
         container.addView(trainerCard)
+        container.addView(videoSessionsCard)
+        container.addView(runsCard)
         container.addView(foldersCard)
         container.addView(profileCard)
         scroll.addView(container)
         return scroll
+    }
+
+    private fun refreshMemoryEverything() {
+        refreshMemoryFoldersList()
+        refreshAutomationRunsList()
+        refreshVideoTrainingSessionsList()
     }
 
     private fun refreshMemoryFoldersList() {
@@ -830,7 +836,7 @@ class MainActivity : AppCompatActivity() {
 
         if (summary.isEmpty()) {
             val emptyTv = TextView(this).apply {
-                text = "अभी कोई Learned Fix या Video Rule नहीं है। जब भी आप टास्क के बीच में टैप करेंगे या ऊपर से वीडियो अपलोड करेंगे, यहाँ ऐप का फोल्डर बन जाएगा!"
+                text = "अभी कोई Learned Fix नहीं है। जब भी आप टास्क के बीच में टैप करेंगे या वीडियो अपलोड करेंगे, फोल्डर बन जाएगा!"
                 setTextColor(textMuted)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             }
@@ -846,7 +852,7 @@ class MainActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(10) }
+                ).apply { bottomMargin = dp(8) }
             }
 
             val topHeader = LinearLayout(this).apply {
@@ -869,7 +875,7 @@ class MainActivity : AppCompatActivity() {
                 setPadding(dp(8), dp(4), dp(8), dp(4))
                 setOnClickListener {
                     vault.clearCategoryMemory(cat)
-                    refreshMemoryFoldersList()
+                    refreshMemoryEverything()
                 }
             }
 
@@ -877,12 +883,10 @@ class MainActivity : AppCompatActivity() {
             topHeader.addView(clearCatBtn)
             row.addView(topHeader)
 
-            val fixes = vault.recallFixesForApp(cat).takeLast(6)
+            val fixes = vault.recallFixesForApp(cat).takeLast(4)
             for (f in fixes) {
-                val xNorm = (f.tapXRatio * 1000).toInt()
-                val yNorm = (f.tapYRatio * 1000).toInt()
                 val item = TextView(this).apply {
-                    text = "  • [${f.sourceType}] ${f.problemDescription} ➔ ${f.solutionRule} (XY: $xNorm, $yNorm)"
+                    text = "  • [${f.sourceType}] ${f.problemDescription} ➔ ${f.solutionRule}"
                     setTextColor(textMuted)
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
                     setPadding(0, dp(4), 0, 0)
@@ -893,8 +897,328 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun refreshAutomationRunsList() {
+        if (!::automationRunsListLayout.isInitialized) return
+        automationRunsListLayout.removeAllViews()
+        val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+        val runs = vault.getAllAutomationRuns()
+
+        if (runs.isEmpty()) {
+            val emptyTv = TextView(this).apply {
+                text = "अभी कोई Automation Run सेव नहीं हुआ है। टास्क रन होने पर यहाँ सेव होगा।"
+                setTextColor(textMuted)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            }
+            automationRunsListLayout.addView(emptyTv)
+            return
+        }
+
+        for (run in runs) {
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                background = roundedBox(Color.parseColor("#1C1F26"), dp(10), borderSubtle)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(8) }
+            }
+
+            val statusColor = when (run.status) {
+                "SUCCESS" -> accentEmerald
+                "FAILED" -> Color.parseColor("#EF4444")
+                else -> Color.parseColor("#F59E0B")
+            }
+
+            val titleTv = TextView(this).apply {
+                text = "📌 ${run.title} [${run.status}] - ${run.timestamp}"
+                setTextColor(statusColor)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                typeface = Typeface.DEFAULT_BOLD
+            }
+
+            val descTv = TextView(this).apply {
+                text = "App: ${run.appCategory} | Steps: ${run.stepsSummary.size} | Screenshots: ${run.screenshotPaths.size}"
+                setTextColor(textMuted)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(0, dp(2), 0, dp(6))
+            }
+
+            val chatWithRunBtn = TextView(this).apply {
+                text = "💬 Gemini 3.8 से चैट करके इस रन को सुधारें"
+                gravity = Gravity.CENTER
+                setTextColor(textPureWhite)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+                background = roundedBox(accentRoyalBlue, dp(8))
+                setOnClickListener {
+                    openAutomationRunChatDialog(run)
+                }
+            }
+
+            card.addView(titleTv)
+            card.addView(descTv)
+            card.addView(chatWithRunBtn)
+            automationRunsListLayout.addView(card)
+        }
+    }
+
+    private fun openAutomationRunChatDialog(runRecord: AutomationRunRecord) {
+        val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+        val brain = AutoTouchService.instance?.geminiBrain ?: GeminiBrain(prefs.getString("gemini_api_key", "") ?: "")
+
+        val dialogView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setBackgroundColor(bgMatteDark)
+        }
+
+        val chatScroll = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(280), 1f)
+        }
+        val msgListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        chatScroll.addView(msgListLayout)
+
+        fun appendMsg(sender: String, text: String) {
+            val tv = TextView(this).apply {
+                text = "$sender: $text"
+                setTextColor(if (sender == "User") Color.parseColor("#60A5FA") else accentEmerald)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setPadding(0, dp(4), 0, dp(4))
+            }
+            msgListLayout.addView(tv)
+        }
+
+        appendMsg("Gemini 3.8", "नमस्ते भाई! मैंने '${runRecord.title}' के ${runRecord.screenshotPaths.size} स्क्रीनशॉट्स और स्टेप्स लोड कर लिए हैं। बताइए इस रन में क्या गलती हुई थी?")
+        for (c in runRecord.chatHistory) {
+            val parts = c.split(":", limit = 2)
+            if (parts.size == 2) appendMsg(parts[0].trim(), parts[1].trim())
+        }
+
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(8), 0, 0)
+        }
+        val input = createCleanInput("", "भाई, यहाँ समझाओ क्या गलती हुई...")
+        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+
+        val send = TextView(this).apply {
+            text = "Send ➔"
+            setTextColor(textPureWhite)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = roundedBox(accentRoyalBlue, dp(8))
+        }
+
+        inputRow.addView(input)
+        inputRow.addView(send)
+
+        dialogView.addView(chatScroll)
+        dialogView.addView(inputRow)
+
+        val dialog = AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+            .setTitle("💬 Fix Run: ${runRecord.title}")
+            .setView(dialogView)
+            .setPositiveButton("बंद करें") { d, _ -> d.dismiss() }
+            .create()
+
+        send.setOnClickListener {
+            val text = input.text.toString().trim()
+            if (text.isEmpty()) return@setOnClickListener
+            input.setText("")
+            appendMsg("User", text)
+            vault.appendChatToAutomationRun(runRecord.runId, "User", text)
+
+            uiScope.launch(Dispatchers.IO) {
+                val b64Imgs = vault.loadSavedImagesAsBase64(runRecord.screenshotPaths, maxImages = 6)
+                val replyObj = brain.chatAboutAutomationRunWith38Flash(
+                    runRecord = runRecord,
+                    userCorrectionMessage = text,
+                    screenshotsBase64 = b64Imgs
+                )
+
+                vault.appendChatToAutomationRun(runRecord.runId, "Gemini 3.8", replyObj.replyText)
+                vault.saveStuckOrHumanFix(
+                    category = runRecord.appCategory,
+                    screenSignature = "run_chat_${runRecord.runId}",
+                    problemDescription = replyObj.extractedProblem,
+                    solutionRule = replyObj.extractedSolutionRule,
+                    tapXRatio = replyObj.tapXRatio,
+                    tapYRatio = replyObj.tapYRatio,
+                    sourceType = "RUN_CHAT_CORRECTION (${replyObj.modelUsed})"
+                )
+
+                withContext(Dispatchers.Main) {
+                    appendMsg("Gemini 3.8", replyObj.replyText)
+                    chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+                    refreshMemoryFoldersList()
+                }
+            }
+        }
+
+        dialog.show()
+    }
+
+    private fun refreshVideoTrainingSessionsList() {
+        if (!::videoSessionsListLayout.isInitialized) return
+        videoSessionsListLayout.removeAllViews()
+        val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+        val sessions = vault.getAllVideoTrainingSessions()
+
+        if (sessions.isEmpty()) {
+            val emptyTv = TextView(this).apply {
+                text = "अभी कोई वीडियो ट्रेनिंग सेशन नहीं है। ऊपर से वीडियो अपलोड करने पर यहाँ दिखेगा।"
+                setTextColor(textMuted)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            }
+            videoSessionsListLayout.addView(emptyTv)
+            return
+        }
+
+        for (session in sessions) {
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                background = roundedBox(Color.parseColor("#1C1F26"), dp(10), borderSubtle)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(8) }
+            }
+
+            val titleTv = TextView(this).apply {
+                text = "📹 Video Session: ${session.appCategory} (${session.timestamp})"
+                setTextColor(accentRoyalBlue)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                typeface = Typeface.DEFAULT_BOLD
+            }
+
+            val noteTv = TextView(this).apply {
+                text = "Note: ${session.userNote} | Frames: ${session.framePaths.size} | Rules: ${session.extractedRulesSummary.size}"
+                setTextColor(textMuted)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(0, dp(2), 0, dp(6))
+            }
+
+            val chatWithVidBtn = TextView(this).apply {
+                text = "💬 इस वीडियो पर Gemini 3.8 से चैट करें"
+                gravity = Gravity.CENTER
+                setTextColor(textPureWhite)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+                background = roundedBox(accentEmerald, dp(8))
+                setOnClickListener {
+                    openVideoSessionChatDialog(session)
+                }
+            }
+
+            card.addView(titleTv)
+            card.addView(noteTv)
+            card.addView(chatWithVidBtn)
+            videoSessionsListLayout.addView(card)
+        }
+    }
+
+    private fun openVideoSessionChatDialog(session: VideoTrainingSession) {
+        val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+        val brain = AutoTouchService.instance?.geminiBrain ?: GeminiBrain(prefs.getString("gemini_api_key", "") ?: "")
+
+        val dialogView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setBackgroundColor(bgMatteDark)
+        }
+
+        val chatScroll = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(280), 1f)
+        }
+        val msgListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        chatScroll.addView(msgListLayout)
+
+        fun appendMsg(sender: String, text: String) {
+            val tv = TextView(this).apply {
+                text = "$sender: $text"
+                setTextColor(if (sender == "User") Color.parseColor("#60A5FA") else accentEmerald)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setPadding(0, dp(4), 0, dp(4))
+            }
+            msgListLayout.addView(tv)
+        }
+
+        appendMsg("Gemini 3.8", "नमस्ते भाई! मैंने इस वीडियो के ${session.framePaths.size} फ्रेम्स और आपके निर्देश (${session.userNote}) देख लिए हैं। बताइए क्या सुधार करना है?")
+        for (c in session.chatHistory) {
+            val parts = c.split(":", limit = 2)
+            if (parts.size == 2) appendMsg(parts[0].trim(), parts[1].trim())
+        }
+
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(8), 0, 0)
+        }
+        val input = createCleanInput("", "वीडियो के बारे में कुछ पूछें या सुधार बताएं...")
+        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+
+        val send = TextView(this).apply {
+            text = "Send ➔"
+            setTextColor(textPureWhite)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = roundedBox(accentRoyalBlue, dp(8))
+        }
+
+        inputRow.addView(input)
+        inputRow.addView(send)
+
+        dialogView.addView(chatScroll)
+        dialogView.addView(inputRow)
+
+        val dialog = AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+            .setTitle("💬 Video Chat: ${session.appCategory}")
+            .setView(dialogView)
+            .setPositiveButton("बंद करें") { d, _ -> d.dismiss() }
+            .create()
+
+        send.setOnClickListener {
+            val text = input.text.toString().trim()
+            if (text.isEmpty()) return@setOnClickListener
+            input.setText("")
+            appendMsg("User", text)
+            vault.appendChatToVideoSession(session.sessionId, "User", text)
+
+            uiScope.launch(Dispatchers.IO) {
+                val b64Frames = vault.loadSavedImagesAsBase64(session.framePaths, maxImages = 10)
+                val replyObj = brain.chatAboutTrainingVideoWith38Flash(
+                    videoSession = session,
+                    userMessage = text,
+                    videoFramesBase64 = b64Frames
+                )
+
+                vault.appendChatToVideoSession(session.sessionId, "Gemini 3.8", replyObj.replyText, replyObj.extractedSolutionRule)
+                vault.saveStuckOrHumanFix(
+                    category = session.appCategory,
+                    screenSignature = "video_chat_${session.sessionId}",
+                    problemDescription = replyObj.extractedProblem,
+                    solutionRule = replyObj.extractedSolutionRule,
+                    tapXRatio = replyObj.tapXRatio,
+                    tapYRatio = replyObj.tapYRatio,
+                    sourceType = "VIDEO_CHAT_CORRECTION (${replyObj.modelUsed})"
+                )
+
+                withContext(Dispatchers.Main) {
+                    appendMsg("Gemini 3.8", replyObj.replyText)
+                    chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+                    refreshMemoryFoldersList()
+                }
+            }
+        }
+
+        dialog.show()
+    }
+
     /**
-     * TAB 5: Engine Settings, Free-Tier Model Ladder, Permissions & Dedicated LIVE LOGS Section
+     * TAB 5: Engine Settings & Dedicated LIVE LOGS Section
      */
     private fun buildTab5EngineAndLogs(): View {
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -904,7 +1228,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(24))
         }
 
-        // Card 1: Dedicated Live System & Action History Logs Section
         val logsCard = createSectionCard("📜 Live System & Action History Logs")
         val logControlsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -952,7 +1275,6 @@ class MainActivity : AppCompatActivity() {
         logsCard.addView(logControlsRow)
         logsCard.addView(liveLogsTextView)
 
-        // Card 2: Gemini API & Fastest Free-Tier Model Ladder
         val apiCard = createSectionCard("🔑 Gemini API & Free-Tier Model Ladder")
         val keyInput = createCleanInput(
             prefs.getString("gemini_api_key", "") ?: "",
@@ -962,14 +1284,13 @@ class MainActivity : AppCompatActivity() {
             val k = keyInput.text.toString().trim()
             prefs.edit().putString("gemini_api_key", k).apply()
             AutoTouchService.instance?.geminiBrain?.updateApiKey(k)
-            AutoTouchService.log("🔑 Gemini API Key Updated & Free-Tier Ladder Reset.")
             Toast.makeText(this, "API Key Updated!", Toast.LENGTH_SHORT).show()
             refreshLiveLogsBox()
         }
 
         val ladderInfo = TextView(this).apply {
             text = AutoTouchService.instance?.geminiBrain?.getActiveModelListStatus()
-                ?: "✅ gemini-3.1-flash-lite (Fastest Free First)\n✅ gemini-3.5-flash-lite (Fast 3.5 Free)\n✅ gemini-flash-lite-latest\n✅ gemini-3.8-flash (Agent & Video/Touch Brain)\n✅ gemini-robotics-er-2-preview (Spatial Coordinates)\n✅ gemma-4-31b-it (Free Open Fallback)"
+                ?: "✅ gemini-3.1-flash-lite (Fastest Free First)\n✅ gemini-3.5-flash-lite\n✅ gemini-3.8-flash (Agent & Video/Touch Brain)\n✅ gemini-robotics-er-2-preview"
             setTextColor(textMuted)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setPadding(0, dp(10), 0, 0)
@@ -980,7 +1301,6 @@ class MainActivity : AppCompatActivity() {
         apiCard.addView(saveKeyBtn)
         apiCard.addView(ladderInfo)
 
-        // Card 3: Execution Mode & Auto-Learning Touch Mode
         val modeCard = createSectionCard("🎛️ Execution Mode & Before/After Touch Learning")
 
         var currentMode = prefs.getString("execution_mode", "LIVE_PHONE") ?: "LIVE_PHONE"
@@ -993,7 +1313,6 @@ class MainActivity : AppCompatActivity() {
             prefs.edit().putString("execution_mode", currentMode).apply()
             btn.text = if (currentMode == "LIVE_PHONE") "📱 Mode: LIVE REAL TOUCH (Direct Phone Control)"
             else "🌐 Mode: BACKGROUND WEB STUDIO (Silent)"
-            AutoTouchService.log("🎛️ Execution Mode Switched to: $currentMode")
             refreshLiveLogsBox()
         }
 
@@ -1005,7 +1324,6 @@ class MainActivity : AppCompatActivity() {
             teachMode = !teachMode
             prefs.edit().putBoolean("passive_teach_mode", teachMode).apply()
             btn.text = if (teachMode) "🎓 Before+After Auto Touch Learning: ON" else "⚪ Before+After Auto Touch Learning: OFF"
-            AutoTouchService.log("🎓 Before+After Touch Learning Switched: ${if (teachMode) "ON" else "OFF"}")
             refreshLiveLogsBox()
         }
 
@@ -1013,7 +1331,6 @@ class MainActivity : AppCompatActivity() {
         modeCard.addView(spacer(dp(10)))
         modeCard.addView(teachSwitchBtn)
 
-        // Card 4: Calibrated Phone Body & On-Demand Permissions
         val bodyCard = createSectionCard("🦾 Calibrated Phone Body & On-Demand Permissions")
         val specs = AutoTouchService.instance?.getCalibratedDeviceBodySpecs()
         val specsTv = TextView(this).apply {
@@ -1032,7 +1349,6 @@ class MainActivity : AppCompatActivity() {
 
         val overlayBtn = createPrimaryButton("🪟 1. Grant Floating Baymax Overlay Permission", Color.parseColor("#334155")) {
             if (!Settings.canDrawOverlays(this)) {
-                AutoTouchService.log("🪟 Opening Overlay Permission Settings...")
                 startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
             } else {
                 AutoTouchService.instance?.hud?.showHud()
@@ -1041,13 +1357,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         val accessBtn = createPrimaryButton("♿ 2. Enable AuraDroid Accessibility Service", accentRoyalBlue) {
-            AutoTouchService.log("♿ Opening Accessibility Settings...")
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
 
         val storageBtn = createPrimaryButton("📁 3. Turn ON File Manager Access (On-Demand Only)", Color.parseColor("#0D9488")) {
             if (requestStoragePermissionsOnDemand()) {
-                AutoTouchService.log("📁 File Manager Access Confirmed Active.")
                 Toast.makeText(this, "File Manager Access Active!", Toast.LENGTH_SHORT).show()
                 refreshLiveLogsBox()
             }
@@ -1056,7 +1370,6 @@ class MainActivity : AppCompatActivity() {
         val batteryBtn = createPrimaryButton("🔋 4. Enable 24/7 Unstoppable Battery Mode", accentEmerald) {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                AutoTouchService.log("🔋 Requesting 24/7 Unstoppable Battery Mode...")
                 startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
             } else {
                 Toast.makeText(this, "24/7 Unstoppable Mode Already Active!", Toast.LENGTH_SHORT).show()
@@ -1091,7 +1404,7 @@ class MainActivity : AppCompatActivity() {
             (AutoTouchService.instance?.memoryVault ?: MemoryVault(this)).getPersistentLogs().take(40)
         }
         liveLogsTextView.text = if (lines.isEmpty()) {
-            "No logs yet. Start any task or change a setting to see live step-by-step history here."
+            "No logs yet. Start any task or change a setting to see live history here."
         } else {
             lines.joinToString("\n")
         }
@@ -1120,7 +1433,6 @@ class MainActivity : AppCompatActivity() {
                 folderPathEditText.setText(resolvedPath)
                 getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
                     .edit().putString("yt_folder_path", resolvedPath).apply()
-                AutoTouchService.log("📂 User Picked Video Folder: $resolvedPath")
                 Toast.makeText(this, "📂 Selected Folder: $resolvedPath", Toast.LENGTH_SHORT).show()
             }
 
@@ -1130,25 +1442,30 @@ class MainActivity : AppCompatActivity() {
                     contentResolver.takePersistableUriPermission(videoUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 } catch (_: Exception) {}
                 val displayName = getFileNameFromUri(videoUri)
-                AutoTouchService.log("🎬 User Picked Single Video for Upload: $displayName")
                 AutoTouchService.instance?.startSinglePickedVideoYouTubeUpload(videoUri, displayName)
             }
 
             REQ_PICK_TRAINING_VIDEO -> {
                 val videoUri = data.data ?: return
-                AutoTouchService.log("📹 Extracting 12 Frames from Training Video for [$selectedTrainingCategory]...")
                 Toast.makeText(this, "12 फ्रेम्स निकालकर Gemini 3.8 Flash से एनालाइज किया जा रहा है...", Toast.LENGTH_LONG).show()
                 val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
                 val brain = AutoTouchService.instance?.geminiBrain ?: GeminiBrain(prefs.getString("gemini_api_key", "") ?: "")
                 val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
 
                 uiScope.launch(Dispatchers.IO) {
-                    val frames = vault.extractKeyFramesBase64FromVideo(videoUri, maxFrames = 12)
+                    val (session, framesB64) = vault.createVideoTrainingSession(
+                        appCategory = selectedTrainingCategory,
+                        userNote = selectedTrainingNote,
+                        videoUri = videoUri,
+                        maxFrames = 12
+                    )
+
                     val learnedRulesList = brain.analyzeTrainingVideoFrames(
                         appCategory = selectedTrainingCategory,
                         userInstruction = selectedTrainingNote,
-                        framesBase64 = frames
+                        framesBase64 = framesB64
                     )
+
                     for (rule in learnedRulesList) {
                         vault.saveStuckOrHumanFix(
                             category = selectedTrainingCategory,
@@ -1159,13 +1476,14 @@ class MainActivity : AppCompatActivity() {
                             tapYRatio = rule.tapYRatio,
                             sourceType = rule.sourceType
                         )
+                        vault.appendChatToVideoSession(session.sessionId, "Gemini 3.8", "Learned Rule: ${rule.solutionRule}", rule.solutionRule)
                     }
-                    AutoTouchService.log("✅ Saved ${learnedRulesList.size} Frame-by-Frame Rules in Memory/$selectedTrainingCategory")
+
                     withContext(Dispatchers.Main) {
-                        refreshMemoryFoldersList()
+                        refreshMemoryEverything()
                         Toast.makeText(
                             this@MainActivity,
-                            "✅ ${learnedRulesList.size} Video Rules Learned & Saved in Memory/$selectedTrainingCategory!",
+                            "✅ Video Trained & Saved in Memory/$selectedTrainingCategory!",
                             Toast.LENGTH_LONG
                         ).show()
                     }
@@ -1195,7 +1513,7 @@ class MainActivity : AppCompatActivity() {
             }
             startActivityForResult(intent, REQ_VOICE_INPUT)
         } catch (_: Exception) {
-            Toast.makeText(this, "Voice input not supported on this device", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Voice input not supported", Toast.LENGTH_SHORT).show()
         }
     }
 
