@@ -20,10 +20,12 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
 import android.os.StrictMode
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
 import android.util.DisplayMetrics
 import android.view.Display
+import android.view.MotionEvent
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -374,7 +376,6 @@ class AutoTouchService : AccessibilityService() {
 
         val execMode = forceMode ?: prefs.getString("execution_mode", "LIVE_PHONE") ?: "LIVE_PHONE"
 
-        // 1. Check if user set Daily Upload Schedule Time directly from Chat!
         if (execMode.startsWith("SCHEDULE_YT_")) {
             val timeHm = execMode.removePrefix("SCHEDULE_YT_").trim().ifEmpty { "19:00" }
             val pipeType = if (goal.contains("flow", true)) "FLOW_YT" else "FOLDER_YT"
@@ -388,7 +389,6 @@ class AutoTouchService : AccessibilityService() {
             return
         }
 
-        // 2. Check if user triggered Folder or Flow YouTube Upload directly from Chat!
         if (execMode == "YOUTUBE_FOLDER_UPLOAD") {
             val folder = prefs.getString(
                 "yt_folder_path",
@@ -478,7 +478,6 @@ class AutoTouchService : AccessibilityService() {
                         lastScreenSignature = currentSig
                     }
 
-                    // Auto-Close Instagram Comment Sheet if comment was ALREADY posted in this run!
                     if (hasAlreadyCommentedInThisRun && activePkg.contains("instagram")) {
                         val commentSheetStillOpen = taggedElements.any {
                             it.label.contains("Join the conversation", true) ||
@@ -919,12 +918,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * 100% Fixed YouTube Shorts & Video Uploader:
-     * - Copies Viral Title to Clipboard BEFORE tapping Caption Box so Gboard Clipboard Pill appears immediately!
-     * - Uses Learned Rules from Memory/YouTube + Gboard Clipboard Pill Tap + Floating 'Paste' Popup Tap + Gemini Vision!
-     * - Closes keyboard completely in a loop so 'Upload Short' never hits the keyboard spacebar!
-     */
     private suspend fun uploadVideoUriToYouTubeShorts(videoUri: Uri, viralTitle: String) {
         val specs = getCalibratedDeviceBodySpecs()
         val recalledYouTubeRules = memoryVault.recallFixesForApp("YouTube")
@@ -932,7 +925,6 @@ class AutoTouchService : AccessibilityService() {
             log("🧠 Loaded ${recalledYouTubeRules.size} Learned Rules from Memory/YouTube!")
         }
 
-        // Pre-copy viralTitle into Clipboard BEFORE opening YouTube so Gboard has the paste chip ready!
         withContext(Dispatchers.Main) {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("aura_yt_title", viralTitle))
@@ -951,7 +943,6 @@ class AutoTouchService : AccessibilityService() {
         log("🚀 Sent video to YouTube Shorts. Waiting for screen...")
         delay(5000L)
 
-        // Step 1 & 2: Advance past Trimmer & Editor ONLY if not already on 'Add details' screen!
         for (attempt in 1..2) {
             if (!isAgentRunning) return
             val screenElements = scanScreenInteractiveElements(specs)
@@ -994,7 +985,6 @@ class AutoTouchService : AccessibilityService() {
 
         dismissDiscardDialogIfPresent(specs)
 
-        // Step 3: Tap 'Caption your Short' / 'Create a title' and GUARANTEE Paste!
         recordRunBitmapSafely(takeHdDisplayScreenshotWithTimeout(2000L))
         hud.updateStatus("Typing Viral Caption...", BotMood.WORKING, taskRunning = true)
 
@@ -1028,11 +1018,9 @@ class AutoTouchService : AccessibilityService() {
         currentRunSteps.add("Pasted Viral Title ($pastedSuccess): $viralTitle")
         delay(1200L)
 
-        // Close any floating [Paste | Clipboard] popup AND the soft keyboard completely!
         closeKeyboardCompletely()
         dismissDiscardDialogIfPresent(specs)
 
-        // Step 4: Tap White 'Upload Short' / 'Upload' Button
         for (retry in 1..3) {
             if (!isAgentRunning) return
             closeKeyboardCompletely()
@@ -1053,7 +1041,6 @@ class AutoTouchService : AccessibilityService() {
                 tapX = uploadNode.centerX
                 tapY = uploadNode.centerY
             } else if (retry == 2 && snap != null) {
-                // Ask Gemini Vision if Upload button wasn't found in Accessibility tree!
                 hud.updateStatus("🧠 Gemini Finding Upload Button...", BotMood.THINKING, taskRunning = true)
                 val aiDec = geminiBrain.decideNextStep(
                     goal = "Tap the bottom 'Upload Short' or 'Upload' button to finish uploading",
@@ -1099,13 +1086,6 @@ class AutoTouchService : AccessibilityService() {
         log("🎉 YouTube Short Uploaded Successfully: $viralTitle")
     }
 
-    /**
-     * 4-Layer Foolproof Title Paster for YouTube Shorts (Fixes the Video 1 & Video 2 empty title bug!):
-     * Layer 1: Accessibility ACTION_SET_TEXT / ACTION_PASTE on all editable/focused nodes
-     * Layer 2: Tap Android's floating [Paste] popup if visible on screen
-     * Layer 3: Tap Gboard's center Clipboard Suggestion Pill [📋 Title...] at (X=50%, Y=60.6%)!
-     * Layer 4: Long-press Caption Box -> Wait for [Paste] popup -> Tap [Paste]!
-     */
     private suspend fun pasteTitleIntoYouTubeCaptionBoxGuaranteed(
         viralTitle: String,
         capX: Int,
@@ -1122,7 +1102,6 @@ class AutoTouchService : AccessibilityService() {
             }
         }
 
-        // Layer 1: Try Accessibility ACTION_SET_TEXT / ACTION_PASTE
         typeAndPasteTextReliably(viralTitle, null)
         delay(700L)
         if (isTitleVisibleOnScreen()) {
@@ -1130,7 +1109,6 @@ class AutoTouchService : AccessibilityService() {
             return true
         }
 
-        // Layer 2: Check if Android's floating [Paste] popup is already on screen (like in Video 1 at 01:17!)
         val elsAfterTap = scanScreenInteractiveElements(specs)
         val pastePopupNode = elsAfterTap.find {
             it.label.equals("Paste", true) || it.label.equals("पेस्ट करें", true)
@@ -1142,7 +1120,6 @@ class AutoTouchService : AccessibilityService() {
             if (isTitleVisibleOnScreen()) return true
         }
 
-        // Layer 3: Tap Gboard's center Clipboard Suggestion Pill [📋 Mind-Blowing...] seen in Video 1 & Video 2!
         if (isSoftKeyboardOpen()) {
             val gboardChipNode = findInputMethodClipboardNode(titlePrefix)
             if (gboardChipNode != null) {
@@ -1153,7 +1130,6 @@ class AutoTouchService : AccessibilityService() {
                     performPhysicalTap(r.centerX(), r.centerY())
                 }
             } else {
-                // Exact Gboard top suggestion strip center coordinates from Video 1 & Video 2 (X=50%, Y=60.6%)
                 val pillX = (specs.screenWidth * 0.50f).toInt()
                 val pillY = (specs.screenHeight * 0.606f).toInt()
                 log("👆 Layer 3B: Tapping Gboard Center Clipboard Pill at ($pillX, $pillY)")
@@ -1166,7 +1142,6 @@ class AutoTouchService : AccessibilityService() {
             }
         }
 
-        // Layer 4: Long-Press Caption Box -> Trigger Android [Paste] context menu -> Tap [Paste]
         log("👆 Layer 4: Long-pressing Caption Box ($capX, $capY) to open Paste menu...")
         performPhysicalLongPress(capX, capY)
         delay(950L)
@@ -1181,7 +1156,6 @@ class AutoTouchService : AccessibilityService() {
             delay(1000L)
             if (isTitleVisibleOnScreen()) return true
         } else {
-            // In Video 1 at 01:17, the top-left [Paste] button is at X=11%, Y=8%
             val topPasteX = (specs.screenWidth * 0.11f).toInt()
             val topPasteY = (specs.screenHeight * 0.08f).toInt()
             log("👆 Layer 4B: Tapping top-left [Paste] toolbar at ($topPasteX, $topPasteY)")
@@ -1193,9 +1167,6 @@ class AutoTouchService : AccessibilityService() {
         return isTitleVisibleOnScreen()
     }
 
-    /**
-     * Searches inside the Soft Keyboard window (TYPE_INPUT_METHOD) for Gboard's Clipboard suggestion pill
-     */
     private fun findInputMethodClipboardNode(titlePrefix: String): AccessibilityNodeInfo? {
         return try {
             for (win in windows) {
@@ -1222,9 +1193,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Loops up to 3 times pressing BACK until the soft keyboard & floating paste popups are 100% closed!
-     */
     private suspend fun closeKeyboardCompletely() {
         var attempts = 0
         while (isSoftKeyboardOpen() && attempts < 3) {
@@ -1260,6 +1228,32 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
+    /**
+     * Dispatches a real internal touch event strictly inside the background WebView
+     * without touching or disturbing the user's main phone screen!
+     */
+    private suspend fun dispatchInternalWebViewTouch(webView: WebView, cssX: Float, cssY: Float) {
+        withContext(Dispatchers.Main) {
+            try {
+                val density = resources.displayMetrics.density
+                val viewX = (cssX * density).coerceIn(5f, (webView.width - 5).coerceAtLeast(10).toFloat())
+                val viewY = (cssY * density).coerceIn(5f, (webView.height - 5).coerceAtLeast(10).toFloat())
+                val downTime = SystemClock.uptimeMillis()
+                val downEv = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, viewX, viewY, 0)
+                val upEv = MotionEvent.obtain(downTime, downTime + 70L, MotionEvent.ACTION_UP, viewX, viewY, 0)
+                webView.dispatchTouchEvent(downEv)
+                webView.dispatchTouchEvent(upEv)
+                downEv.recycle()
+                upEv.recycle()
+            } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Upgraded Multi-Stage Background Google Flow -> YouTube Pipeline!
+     * Fixes the '+ New project' & 'What do you want to create?' bug seen in the video!
+     * Runs 100% silently in the background WebView until the MP4 is downloaded!
+     */
     fun startGoogleFlowToYouTubePipeline(topic: String, maxVideosToCreate: Int = 1) {
         currentTaskJob?.cancel()
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -1269,8 +1263,8 @@ class AutoTouchService : AccessibilityService() {
             try {
                 isAgentRunning = true
                 acquireWakeLock()
-                val targetUrl = prefs.getString("saved_flow_url", "https://labs.google/fx/tools/flow")
-                    ?: "https://labs.google/fx/tools/flow"
+                val targetUrl = prefs.getString("saved_flow_url", "https://flow.google.com")
+                    ?: "https://flow.google.com"
 
                 for (vidIndex in 1..maxVideosToCreate.coerceIn(1, 3)) {
                     if (!isAgentRunning) break
@@ -1285,41 +1279,56 @@ class AutoTouchService : AccessibilityService() {
                     }
 
                     withContext(Dispatchers.Main) {
-                        if (webView.url == null || !webView.url!!.contains("labs.google")) {
+                        val curUrl = webView.url ?: ""
+                        if (!curUrl.contains("flow.google") && !curUrl.contains("labs.google")) {
                             webView.loadUrl(targetUrl)
                         }
                     }
-                    delay(5000L)
+                    delay(4500L)
 
-                    hud.updateStatus("Flow: Submitting 8s Prompt...", BotMood.WORKING, taskRunning = true)
-                    val jsSubmit = """
-                        (function() {
-                            const boxes = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"]'));
-                            const target = boxes.find(el => {
-                                const ph = (el.getAttribute('placeholder') || el.innerText || '').toLowerCase();
-                                return !ph.includes('search');
-                            }) || boxes[boxes.length - 1];
-                            if (!target) return 'NO_BOX';
-                            target.focus();
-                            document.execCommand('selectAll', false, null);
-                            document.execCommand('insertText', false, ${JSONObject.quote(safePrompt)});
-                            target.dispatchEvent(new Event('input', { bubbles: true }));
-                            setTimeout(() => {
-                                const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
-                                const genBtn = btns.find(b => {
-                                    const t = (b.innerText || b.getAttribute('aria-label') || '').toLowerCase();
-                                    return t.includes('arrow_forward') || t.includes('generate') || t.includes('create');
-                                });
-                                if (genBtn) genBtn.click();
-                            }, 600);
-                            return 'SUBMITTED';
-                        })();
-                    """.trimIndent()
+                    // STAGE 1 & 2: Smart Loop to click '+ New project' (if on dashboard) and submit prompt into 'What do you want to create?'
+                    var promptSubmitted = false
+                    for (prepTick in 1..14) {
+                        if (!isAgentRunning) break
+                        val stepResult = runFlowComposerStateMachineStep(webView, safePrompt)
+                        log("🌐 Flow Background Step #$prepTick -> $stepResult")
 
-                    withContext(Dispatchers.Main) {
-                        webView.evaluateJavascript(jsSubmit, null)
+                        when {
+                            stepResult.startsWith("CLICKED_NEW_PROJECT:") -> {
+                                hud.updateStatus("Flow: Opening + New Project...", BotMood.WORKING, taskRunning = true)
+                                val coords = stepResult.substringAfter(":").split(",")
+                                if (coords.size == 2) {
+                                    val cx = coords[0].toFloatOrNull() ?: 170f
+                                    val cy = coords[1].toFloatOrNull() ?: 480f
+                                    dispatchInternalWebViewTouch(webView, cx, cy)
+                                }
+                                delay(3500L)
+                            }
+                            stepResult.startsWith("SUBMITTED:") -> {
+                                hud.updateStatus("Flow: Submitting 8s Prompt...", BotMood.WORKING, taskRunning = true)
+                                val coords = stepResult.substringAfter(":").split(",")
+                                if (coords.size == 2) {
+                                    val bx = coords[0].toFloatOrNull() ?: 295f
+                                    val by = coords[1].toFloatOrNull() ?: 540f
+                                    delay(500L)
+                                    dispatchInternalWebViewTouch(webView, bx, by)
+                                }
+                                promptSubmitted = true
+                                log("✅ Flow Prompt Injected & Submit Arrow Clicked!")
+                                break
+                            }
+                            else -> {
+                                hud.updateStatus("Flow: Waiting for Editor ($prepTick)...", BotMood.THINKING, taskRunning = true)
+                                delay(2500L)
+                            }
+                        }
                     }
 
+                    if (!promptSubmitted) {
+                        log("⚠️ Could not find Flow prompt box yet; trying one more time...")
+                    }
+
+                    // STAGE 3: Poll background WebView for generated 8s MP4 video stream
                     var downloadedVideoFile: File? = null
                     for (waitTick in 1..48) {
                         if (!isAgentRunning) break
@@ -1329,6 +1338,7 @@ class AutoTouchService : AccessibilityService() {
                         val videoUrl = extractReadyVideoUrlFromWebView(webView)
                         if (videoUrl.isNotBlank() && videoUrl.startsWith("http")) {
                             hud.updateStatus("📥 Downloading 8s MP4...", BotMood.WORKING, taskRunning = true)
+                            log("📥 Found Generated MP4 Stream: ${videoUrl.take(70)}...")
                             downloadedVideoFile = downloadVideoFromUrlToStorage(videoUrl, "flow_${System.currentTimeMillis()}.mp4")
                             if (downloadedVideoFile != null) break
                         }
@@ -1338,8 +1348,8 @@ class AutoTouchService : AccessibilityService() {
                         log("✅ Downloaded 8s Video: ${downloadedVideoFile.absolutePath}")
                         uploadVideoUriToYouTubeShorts(Uri.fromFile(downloadedVideoFile), viralTitle)
                     } else {
-                        log("⚠️ Could not auto-catch MP4 stream; check Google Flow login or credits.")
-                        hud.updateStatus("Check Flow Login/Credits", BotMood.ERROR, taskRunning = false)
+                        log("⚠️ Could not auto-catch MP4 stream; check Google Flow login or Video mode.")
+                        hud.updateStatus("Check Flow Login/Video Mode", BotMood.ERROR, taskRunning = false)
                     }
                 }
             } catch (_: CancellationException) {
@@ -1347,6 +1357,103 @@ class AutoTouchService : AccessibilityService() {
             } finally {
                 isAgentRunning = false
                 releaseWakeLock()
+            }
+        }
+    }
+
+    /**
+     * Inspects the live Google Flow DOM inside backgroundWebView:
+     * 1. If '+ New project' button is on screen (and no prompt box yet), clicks it and returns its coordinates!
+     * 2. If 'What do you want to create?' prompt box is on screen, types safePrompt using React-compatible setter + InputEvent and clicks the Submit Arrow button!
+     */
+    private suspend fun runFlowComposerStateMachineStep(webView: WebView, safePrompt: String): String =
+        suspendCancellableCoroutine { cont ->
+            val js = """
+                (function() {
+                    function isVisible(el) {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 12 && r.height > 12 && r.top >= 0;
+                    }
+
+                    // 1. Look for the 'What do you want to create?' prompt input box (excluding top search bar)
+                    const allInputs = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"]')).filter(isVisible);
+                    const promptBox = allInputs.find(el => {
+                        const ph = (el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.innerText || '').toLowerCase();
+                        const r = el.getBoundingClientRect();
+                        return ph.includes('create') || ph.includes('prompt') || ph.includes('describe') || (r.top > window.innerHeight * 0.45 && !ph.includes('search'));
+                    });
+
+                    if (promptBox) {
+                        promptBox.focus();
+                        promptBox.click();
+
+                        const promptText = ${JSONObject.quote(safePrompt)};
+                        if (promptBox.tagName === 'TEXTAREA' || promptBox.tagName === 'INPUT') {
+                            const proto = promptBox.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+                            const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                            if (nativeSetter) {
+                                nativeSetter.call(promptBox, promptText);
+                            } else {
+                                promptBox.value = promptText;
+                            }
+                        } else {
+                            promptBox.innerText = promptText;
+                        }
+
+                        document.execCommand('selectAll', false, null);
+                        document.execCommand('insertText', false, promptText);
+                        promptBox.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: promptText }));
+                        promptBox.dispatchEvent(new Event('change', { bubbles: true }));
+
+                        // Find the submit arrow button at the bottom-right of the composer
+                        const boxRect = promptBox.getBoundingClientRect();
+                        const allBtns = Array.from(document.querySelectorAll('button, [role="button"]')).filter(isVisible);
+                        const submitBtn = allBtns.find(b => {
+                            const txt = (b.innerText || b.getAttribute('aria-label') || b.innerHTML || '').toLowerCase();
+                            const r = b.getBoundingClientRect();
+                            const isNearBottomRight = r.top >= boxRect.top - 20 && r.left > window.innerWidth * 0.65;
+                            return (txt.includes('arrow_forward') || txt.includes('send') || txt.includes('generate') || txt.includes('create') || txt.includes('submit') || isNearBottomRight) && !txt.includes('banana') && !txt.includes('new project');
+                        });
+
+                        if (submitBtn) {
+                            const sr = submitBtn.getBoundingClientRect();
+                            setTimeout(() => { submitBtn.click(); }, 350);
+                            return 'SUBMITTED:' + Math.round(sr.left + sr.width / 2) + ',' + Math.round(sr.top + sr.height / 2);
+                        }
+                        return 'SUBMITTED:' + Math.round(window.innerWidth * 0.88) + ',' + Math.round(boxRect.bottom + 28);
+                    }
+
+                    // 2. If promptBox is NOT on screen yet, look for '+ New project' button on the Flow Dashboard!
+                    const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], div, span')).filter(isVisible);
+                    const newProjBtn = candidates.find(el => {
+                        const t = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                        return t === 'new project' || t === '+ new project' || (t.includes('new project') && t.length < 25);
+                    });
+
+                    if (newProjBtn) {
+                        const nr = newProjBtn.getBoundingClientRect();
+                        newProjBtn.click();
+                        return 'CLICKED_NEW_PROJECT:' + Math.round(nr.left + nr.width / 2) + ',' + Math.round(nr.top + nr.height / 2);
+                    }
+
+                    return 'WAITING_FOR_FLOW_UI';
+                })();
+            """.trimIndent()
+
+            withContextOrMain(webView, js) { res ->
+                cont.resume(res)
+            }
+        }
+
+    private fun withContextOrMain(webView: WebView, js: String, onResult: (String) -> Unit) {
+        mainExecutor.execute {
+            try {
+                webView.evaluateJavascript(js) { raw: String? ->
+                    onResult(raw?.trim('"') ?: "")
+                }
+            } catch (_: Exception) {
+                onResult("")
             }
         }
     }
