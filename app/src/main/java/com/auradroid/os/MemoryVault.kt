@@ -13,6 +13,8 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.hypot
 
 data class LearnedFixRecord(
     val id: String,
@@ -49,6 +51,9 @@ data class VideoTrainingSession(
 
 class MemoryVault(private val context: Context) {
 
+    private val vaultLock = Any()
+    private val logLock = Any()
+
     private val rootDir: File = File(context.filesDir, "Memory").apply {
         if (!exists()) mkdirs()
     }
@@ -64,26 +69,45 @@ class MemoryVault(private val context: Context) {
     private val profileFile: File = File(rootDir, "user_profile_rules.json")
     private val persistentLogsFile: File = File(rootDir, "system_action_logs.txt")
 
+    // Fast In-Memory Cache for Logs to prevent Main-Thread Disk I/O lag
+    private val cachedLogs = ArrayDeque<String>()
+    private var logsInitialized = false
+
+    /**
+     * Maps any package name, app name, or Hindi/Hinglish goal into a single canonical Category folder
+     */
     fun resolveCategoryFolder(packageName: String, taskGoal: String): String {
         val combined = "$packageName $taskGoal".lowercase(Locale.ROOT)
         return when {
-            combined.contains("instagram") || combined.contains("इंस्टाग्राम") -> "Instagram"
-            combined.contains("youtube") || combined.contains("यूट्यूब") -> "YouTube"
+            combined.contains("instagram") || combined.contains("इंस्टाग्राम") || combined.contains("insta") -> "Instagram"
+            combined.contains("youtube") || combined.contains("यूट्यूब") || combined.contains("shorts") -> "YouTube"
             combined.contains("whatsapp") || combined.contains("व्हाट्सएप") -> "WhatsApp"
-            combined.contains("chrome") || combined.contains("web") || combined.contains("flow") -> "WebStudio"
+            combined.contains("chrome") || combined.contains("web") || combined.contains("flow") || combined.contains("browser") -> "WebStudio"
             combined.contains("setting") || combined.contains("सेटिंग") -> "PhoneSettings"
+            combined.contains("telegram") || combined.contains("टेलीग्राम") -> "Telegram"
+            combined.contains("facebook") || combined.contains("फेसबुक") -> "Facebook"
+            combined.contains("snapchat") -> "Snapchat"
+            combined.contains("twitter") || combined.contains("com.twitter") -> "X_Twitter"
+            combined.contains("vending") || combined.contains("play store") -> "PlayStore"
             combined.contains("github") -> "GitHub"
-            else -> packageName.substringAfterLast('.').replaceFirstChar { it.uppercase() }.ifEmpty { "General" }
+            else -> {
+                val raw = packageName.substringAfterLast('.')
+                    .replace(Regex("[^a-zA-Z0-9_]"), "")
+                    .replaceFirstChar { it.uppercase() }
+                if (raw.isEmpty() || raw.equals("Android", true)) "General" else raw
+            }
         }
     }
 
     private fun getCategoryDir(category: String): File {
-        val clean = category.trim().replaceFirstChar { it.uppercase() }.ifEmpty { "General" }
-        return File(rootDir, clean).apply { if (!exists()) mkdirs() }
+        val canonical = resolveCategoryFolder(category, category)
+        val safeName = canonical.replace(Regex("[^a-zA-Z0-9_]"), "").ifEmpty { "General" }
+        return File(rootDir, safeName).apply { if (!exists()) mkdirs() }
     }
 
     /**
      * Saves any Learned Rule (Auto Post-Run Reflection, Human Touch, Video Frame Training, or Chat Correction)
+     * Includes Smart Upsert/Deduplication so duplicate rules for the same screen/button update cleanly!
      */
     @Suppress("DEPRECATION")
     fun saveStuckOrHumanFix(
@@ -96,13 +120,53 @@ class MemoryVault(private val context: Context) {
         beforeScreenshot: Bitmap? = null,
         afterScreenshot: Bitmap? = null,
         sourceType: String = "HUMAN_TOUCH_FIX"
-    ) {
-        val catDir = getCategoryDir(category)
+    ) = synchronized(vaultLock) {
+        val canonicalCat = resolveCategoryFolder(category, category)
+        val catDir = getCategoryDir(canonicalCat)
         val fixesFile = File(catDir, "fixes.json")
-        val arr = if (fixesFile.exists()) {
-            try { JSONArray(fixesFile.readText()) } catch (_: Exception) { JSONArray() }
-        } else {
-            JSONArray()
+
+        val existingList = mutableListOf<JSONObject>()
+        if (fixesFile.exists()) {
+            try {
+                val rawArr = JSONArray(fixesFile.readText())
+                for (i in 0 until rawArr.length()) {
+                    rawArr.optJSONObject(i)?.let { existingList.add(it) }
+                }
+            } catch (_: Exception) {}
+        }
+
+        val cleanProblem = problemDescription.trim()
+        val cleanRule = solutionRule.trim()
+        if (cleanProblem.isEmpty() && cleanRule.isEmpty()) return
+
+        val safeX = tapXRatio.coerceIn(0.01f, 0.99f)
+        val safeY = tapYRatio.coerceIn(0.01f, 0.99f)
+
+        // Check if a very similar rule already exists for this category -> Remove old duplicate to replace with fresh one
+        val duplicateIndex = existingList.indexOfFirst { old ->
+            val oldProb = old.optString("problemDescription", "").trim()
+            val oldRule = old.optString("solutionRule", "").trim()
+            val oldSig = old.optString("screenSignature", "")
+            val oldX = old.optDouble("tapXRatio", -1.0).toFloat()
+            val oldY = old.optDouble("tapYRatio", -1.0).toFloat()
+
+            val sameProblemText = oldProb.equals(cleanProblem, ignoreCase = true) ||
+                (oldProb.length > 10 && cleanProblem.contains(oldProb, ignoreCase = true))
+            val sameCoordAndSig = oldSig.isNotEmpty() && oldSig == screenSignature.take(250) &&
+                hypot((oldX - safeX).toDouble(), (oldY - safeY).toDouble()) < 0.035
+
+            sameProblemText || (sameCoordAndSig && oldRule.equals(cleanRule, ignoreCase = true))
+        }
+
+        if (duplicateIndex >= 0) {
+            val removed = existingList.removeAt(duplicateIndex)
+            val oldId = removed.optString("id", "")
+            if (oldId.isNotEmpty()) {
+                try {
+                    File(catDir, "${oldId}_before.webp").delete()
+                    File(catDir, "${oldId}_after.webp").delete()
+                } catch (_: Exception) {}
+            }
         }
 
         val id = "fix_${System.currentTimeMillis()}"
@@ -121,59 +185,99 @@ class MemoryVault(private val context: Context) {
             } catch (_: Exception) {}
         }
 
-        val obj = JSONObject().apply {
+        val newObj = JSONObject().apply {
             put("id", id)
-            put("appCategory", category)
+            put("appCategory", canonicalCat)
             put("sourceType", sourceType)
             put("screenSignature", screenSignature.take(250))
-            put("problemDescription", problemDescription)
-            put("solutionRule", solutionRule)
-            put("tapXRatio", tapXRatio.toDouble())
-            put("tapYRatio", tapYRatio.toDouble())
+            put("problemDescription", cleanProblem)
+            put("solutionRule", cleanRule)
+            put("tapXRatio", safeX.toDouble())
+            put("tapYRatio", safeY.toDouble())
             put("timestamp", SimpleDateFormat("dd MMM HH:mm:ss", Locale.getDefault()).format(Date()))
         }
-        arr.put(obj)
-        fixesFile.writeText(arr.toString(2))
+        existingList.add(newObj)
+
+        // Cap per-category rules to 60 best entries and delete orphaned screenshots
+        while (existingList.size > 60) {
+            // Prefer removing oldest auto-reflection rather than human/video training
+            val dropIdx = existingList.indexOfFirst {
+                it.optString("sourceType").contains("REFLECTION", true)
+            }.takeIf { it >= 0 } ?: 0
+
+            val dropped = existingList.removeAt(dropIdx)
+            val droppedId = dropped.optString("id", "")
+            if (droppedId.isNotEmpty()) {
+                try {
+                    File(catDir, "${droppedId}_before.webp").delete()
+                    File(catDir, "${droppedId}_after.webp").delete()
+                } catch (_: Exception) {}
+            }
+        }
+
+        val outArr = JSONArray()
+        existingList.forEach { outArr.put(it) }
+        writeTextSafely(fixesFile, outArr.toString(2))
     }
 
-    fun recallFixesForApp(category: String): List<LearnedFixRecord> {
-        val catDir = getCategoryDir(category)
+    /**
+     * Recalls learned rules for an App Category, prioritizing explicit User Corrections,
+     * Human Touch fixes, and Video Training alongside the freshest Gemini 3.8 Auto-Reflections!
+     */
+    fun recallFixesForApp(category: String): List<LearnedFixRecord> = synchronized(vaultLock) {
+        val canonicalCat = resolveCategoryFolder(category, category)
+        val catDir = getCategoryDir(canonicalCat)
         val fixesFile = File(catDir, "fixes.json")
         if (!fixesFile.exists()) return emptyList()
 
-        val result = mutableListOf<LearnedFixRecord>()
+        val allRecords = mutableListOf<LearnedFixRecord>()
         try {
             val arr = JSONArray(fixesFile.readText())
             for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                result.add(
+                val o = arr.optJSONObject(i) ?: continue
+                allRecords.add(
                     LearnedFixRecord(
                         id = o.optString("id"),
-                        appCategory = o.optString("appCategory", category),
+                        appCategory = o.optString("appCategory", canonicalCat),
                         sourceType = o.optString("sourceType", "HUMAN_TOUCH_FIX"),
                         screenSignature = o.optString("screenSignature"),
                         problemDescription = o.optString("problemDescription"),
                         solutionRule = o.optString("solutionRule"),
-                        tapXRatio = o.optDouble("tapXRatio", -1.0).toFloat(),
-                        tapYRatio = o.optDouble("tapYRatio", -1.0).toFloat(),
+                        tapXRatio = o.optDouble("tapXRatio", 0.5).toFloat(),
+                        tapYRatio = o.optDouble("tapYRatio", 0.5).toFloat(),
                         timestamp = o.optString("timestamp")
                     )
                 )
             }
         } catch (_: Exception) {}
-        return result.takeLast(24)
+
+        if (allRecords.size <= 24) return allRecords.reversed()
+
+        // Prioritize Human/Chat/Video rules + latest Auto-Reflections
+        val highPriorityUserRules = allRecords.filter {
+            !it.sourceType.contains("REFLECTION", true)
+        }.takeLast(14)
+
+        val recentAutoReflections = allRecords.filter {
+            it.sourceType.contains("REFLECTION", true)
+        }.takeLast(10)
+
+        return (highPriorityUserRules + recentAutoReflections).distinctBy { it.id }.reversed()
     }
 
-    fun getAllCategoriesSummary(): List<Pair<String, Int>> {
+    fun getAllCategoriesSummary(): List<Pair<String, Int>> = synchronized(vaultLock) {
         val folders = rootDir.listFiles()?.filter {
             it.isDirectory && it.name != "AutomationRuns" && it.name != "VideoSessions"
         } ?: return emptyList()
-        return folders.map { folder ->
+
+        return folders.mapNotNull { folder ->
             val fixesFile = File(folder, "fixes.json")
             val count = if (fixesFile.exists()) {
                 try { JSONArray(fixesFile.readText()).length() } catch (_: Exception) { 0 }
             } else 0
-            Pair(folder.name, count)
+            if (count > 0 || folder.name in listOf("Instagram", "YouTube", "WhatsApp", "WebStudio")) {
+                Pair(folder.name, count)
+            } else null
         }.sortedByDescending { it.second }
     }
 
@@ -190,17 +294,20 @@ class MemoryVault(private val context: Context) {
         stepsSummary: List<String>,
         capturedBitmaps: List<Bitmap>,
         existingChat: List<String> = emptyList()
-    ): AutomationRunRecord {
+    ): AutomationRunRecord = synchronized(vaultLock) {
+        val canonicalCat = resolveCategoryFolder(appCategory, title)
         val runFolder = File(runsDir, runId).apply { if (!exists()) mkdirs() }
         val savedPaths = mutableListOf<String>()
 
         capturedBitmaps.takeLast(10).forEachIndexed { idx, bmp ->
             try {
-                val imgFile = File(runFolder, "step_${idx + 1}.webp")
-                imgFile.outputStream().use { out ->
-                    bmp.compress(Bitmap.CompressFormat.WEBP, 80, out)
+                if (!bmp.isRecycled) {
+                    val imgFile = File(runFolder, "step_${idx + 1}.webp")
+                    imgFile.outputStream().use { out ->
+                        bmp.compress(Bitmap.CompressFormat.WEBP, 80, out)
+                    }
+                    savedPaths.add(imgFile.absolutePath)
                 }
-                savedPaths.add(imgFile.absolutePath)
             } catch (_: Exception) {}
         }
 
@@ -209,19 +316,22 @@ class MemoryVault(private val context: Context) {
         val json = JSONObject().apply {
             put("runId", runId)
             put("title", title)
-            put("appCategory", appCategory)
+            put("appCategory", canonicalCat)
             put("status", status)
             put("timestamp", timestamp)
             put("stepsSummary", JSONArray(stepsSummary))
             put("screenshotPaths", JSONArray(savedPaths))
             put("chatHistory", JSONArray(existingChat))
         }
-        metaFile.writeText(json.toString(2))
+        writeTextSafely(metaFile, json.toString(2))
+
+        // Auto-prune old run folders beyond latest 25 so device storage stays clean
+        pruneOldFolders(runsDir, maxKeep = 25)
 
         return AutomationRunRecord(
             runId = runId,
             title = title,
-            appCategory = appCategory,
+            appCategory = canonicalCat,
             status = status,
             timestamp = timestamp,
             stepsSummary = stepsSummary,
@@ -230,7 +340,7 @@ class MemoryVault(private val context: Context) {
         )
     }
 
-    fun appendChatToAutomationRun(runId: String, sender: String, message: String) {
+    fun appendChatToAutomationRun(runId: String, sender: String, message: String) = synchronized(vaultLock) {
         val runFolder = File(runsDir, runId)
         val metaFile = File(runFolder, "run_meta.json")
         if (!metaFile.exists()) return
@@ -239,15 +349,15 @@ class MemoryVault(private val context: Context) {
             val chatArr = j.optJSONArray("chatHistory") ?: JSONArray()
             chatArr.put("$sender: $message")
             j.put("chatHistory", chatArr)
-            metaFile.writeText(j.toString(2))
+            writeTextSafely(metaFile, j.toString(2))
         } catch (_: Exception) {}
     }
 
-    fun getAllAutomationRuns(): List<AutomationRunRecord> {
+    fun getAllAutomationRuns(): List<AutomationRunRecord> = synchronized(vaultLock) {
         val folders = runsDir.listFiles()?.filter { it.isDirectory }?.sortedByDescending { it.lastModified() }
             ?: return emptyList()
         val list = mutableListOf<AutomationRunRecord>()
-        for (folder in folders.take(20)) {
+        for (folder in folders.take(25)) {
             val metaFile = File(folder, "run_meta.json")
             if (!metaFile.exists()) continue
             try {
@@ -258,7 +368,10 @@ class MemoryVault(private val context: Context) {
 
                 val paths = mutableListOf<String>()
                 val pArr = j.optJSONArray("screenshotPaths") ?: JSONArray()
-                for (i in 0 until pArr.length()) paths.add(pArr.optString(i))
+                for (i in 0 until pArr.length()) {
+                    val p = pArr.optString(i)
+                    if (p.isNotEmpty() && File(p).exists()) paths.add(p)
+                }
 
                 val chats = mutableListOf<String>()
                 val cArr = j.optJSONArray("chatHistory") ?: JSONArray()
@@ -282,7 +395,7 @@ class MemoryVault(private val context: Context) {
     }
 
     // =========================================================================
-    // 2. VIDEO TRAINING SESSIONS (Save extracted frames + Interactive Video Chat)
+    // 2. VIDEO TRAINING SESSIONS (Exact Frame Extraction + Visual Deduplication)
     // =========================================================================
 
     @Suppress("DEPRECATION")
@@ -292,6 +405,7 @@ class MemoryVault(private val context: Context) {
         videoUri: Uri,
         maxFrames: Int = 12
     ): Pair<VideoTrainingSession, List<String>> {
+        val canonicalCat = resolveCategoryFolder(appCategory, userNote)
         val sessionId = "vid_${System.currentTimeMillis()}"
         val sessionFolder = File(videosDir, sessionId).apply { if (!exists()) mkdirs() }
         val framePaths = mutableListOf<String>()
@@ -302,17 +416,45 @@ class MemoryVault(private val context: Context) {
             retriever.setDataSource(context, videoUri)
             val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
             if (durationMs > 0L) {
-                val safeCount = maxFrames.coerceIn(4, 12)
-                val stepMs = (durationMs / (safeCount + 1)).coerceAtLeast(400L)
+                val safeCount = maxFrames.coerceIn(4, 14)
+                val stepMs = (durationMs / (safeCount + 1)).coerceAtLeast(250L)
+                var lastFrameHash = -1L
+                var savedIdx = 0
+
                 for (i in 1..safeCount) {
-                    val timeUs = (stepMs * i) * 1000L
-                    val bmp = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: continue
-                    val ratio = bmp.width.toFloat() / bmp.height.toFloat()
+                    val timeUs = ((stepMs * i).coerceAtMost(durationMs - 100L)).coerceAtLeast(0L) * 1000L
+                    // Use OPTION_CLOSEST first so exact button tap moments are captured, fallback to OPTION_CLOSEST_SYNC
+                    val rawBmp = try {
+                        retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                            ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    } catch (_: Exception) {
+                        retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    } ?: continue
+
+                    val ratio = rawBmp.width.toFloat() / rawBmp.height.toFloat().coerceAtLeast(1f)
                     val targetH = 960
                     val targetW = (targetH * ratio).toInt().coerceAtLeast(360)
-                    val scaled = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
+                    val scaled = if (rawBmp.height != targetH) {
+                        Bitmap.createScaledBitmap(rawBmp, targetW, targetH, true)
+                    } else {
+                        rawBmp
+                    }
 
-                    val frameFile = File(sessionFolder, "frame_$i.webp")
+                    if (scaled !== rawBmp) {
+                        try { rawBmp.recycle() } catch (_: Exception) {}
+                    }
+
+                    // Check quick visual hash so we don't save 10 identical static frames if nothing moved
+                    val currentHash = computeQuickVisualSignature(scaled)
+                    val isNearIdentical = lastFrameHash != -1L && abs(currentHash - lastFrameHash) < 18L && i < safeCount
+                    if (isNearIdentical && savedIdx >= 2) {
+                        try { scaled.recycle() } catch (_: Exception) {}
+                        continue
+                    }
+                    lastFrameHash = currentHash
+                    savedIdx++
+
+                    val frameFile = File(sessionFolder, "frame_$savedIdx.webp")
                     frameFile.outputStream().use { out ->
                         scaled.compress(Bitmap.CompressFormat.WEBP, 82, out)
                     }
@@ -321,6 +463,8 @@ class MemoryVault(private val context: Context) {
                     val bos = ByteArrayOutputStream()
                     scaled.compress(Bitmap.CompressFormat.WEBP, 82, bos)
                     framesBase64.add(Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP))
+
+                    try { scaled.recycle() } catch (_: Exception) {}
                 }
             }
         } catch (_: Exception) {
@@ -331,7 +475,7 @@ class MemoryVault(private val context: Context) {
         val timestamp = SimpleDateFormat("dd MMM HH:mm", Locale.getDefault()).format(Date())
         val session = VideoTrainingSession(
             sessionId = sessionId,
-            appCategory = appCategory,
+            appCategory = canonicalCat,
             userNote = userNote,
             timestamp = timestamp,
             framePaths = framePaths,
@@ -339,25 +483,60 @@ class MemoryVault(private val context: Context) {
             chatHistory = listOf("User Note: $userNote")
         )
         saveVideoTrainingSessionMeta(session)
+        pruneOldFolders(videosDir, maxKeep = 20)
         return Pair(session, framesBase64)
     }
 
-    fun saveVideoTrainingSessionMeta(session: VideoTrainingSession) {
+    /**
+     * Computes a fast 8x8 luminance average signature to detect duplicate consecutive video frames
+     */
+    private fun computeQuickVisualSignature(bmp: Bitmap): Long {
+        return try {
+            var sum = 0L
+            val stepX = (bmp.width / 8).coerceAtLeast(1)
+            val stepY = (bmp.height / 8).coerceAtLeast(1)
+            var samples = 0
+            var x = stepX / 2
+            while (x < bmp.width) {
+                var y = stepY / 2
+                while (y < bmp.height) {
+                    val px = bmp.getPixel(x, y)
+                    val r = (px shr 16) and 0xFF
+                    val g = (px shr 8) and 0xFF
+                    val b = px and 0xFF
+                    sum += (r + g + b) / 3
+                    samples++
+                    y += stepY
+                }
+                x += stepX
+            }
+            if (samples > 0) sum / samples else 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
+    fun saveVideoTrainingSessionMeta(session: VideoTrainingSession) = synchronized(vaultLock) {
         val sessionFolder = File(videosDir, session.sessionId).apply { if (!exists()) mkdirs() }
         val metaFile = File(sessionFolder, "video_meta.json")
         val json = JSONObject().apply {
             put("sessionId", session.sessionId)
-            put("appCategory", session.appCategory)
+            put("appCategory", resolveCategoryFolder(session.appCategory, session.userNote))
             put("userNote", session.userNote)
             put("timestamp", session.timestamp)
             put("framePaths", JSONArray(session.framePaths))
             put("extractedRulesSummary", JSONArray(session.extractedRulesSummary))
             put("chatHistory", JSONArray(session.chatHistory))
         }
-        metaFile.writeText(json.toString(2))
+        writeTextSafely(metaFile, json.toString(2))
     }
 
-    fun appendChatToVideoSession(sessionId: String, sender: String, message: String, newRuleAdded: String? = null) {
+    fun appendChatToVideoSession(
+        sessionId: String,
+        sender: String,
+        message: String,
+        newRuleAdded: String? = null
+    ) = synchronized(vaultLock) {
         val sessionFolder = File(videosDir, sessionId)
         val metaFile = File(sessionFolder, "video_meta.json")
         if (!metaFile.exists()) return
@@ -372,22 +551,25 @@ class MemoryVault(private val context: Context) {
                 rulesArr.put(newRuleAdded)
                 j.put("extractedRulesSummary", rulesArr)
             }
-            metaFile.writeText(j.toString(2))
+            writeTextSafely(metaFile, j.toString(2))
         } catch (_: Exception) {}
     }
 
-    fun getAllVideoTrainingSessions(): List<VideoTrainingSession> {
+    fun getAllVideoTrainingSessions(): List<VideoTrainingSession> = synchronized(vaultLock) {
         val folders = videosDir.listFiles()?.filter { it.isDirectory }?.sortedByDescending { it.lastModified() }
             ?: return emptyList()
         val list = mutableListOf<VideoTrainingSession>()
-        for (folder in folders.take(15)) {
+        for (folder in folders.take(20)) {
             val metaFile = File(folder, "video_meta.json")
             if (!metaFile.exists()) continue
             try {
                 val j = JSONObject(metaFile.readText())
                 val fPaths = mutableListOf<String>()
                 val fArr = j.optJSONArray("framePaths") ?: JSONArray()
-                for (i in 0 until fArr.length()) fPaths.add(fArr.optString(i))
+                for (i in 0 until fArr.length()) {
+                    val p = fArr.optString(i)
+                    if (p.isNotEmpty() && File(p).exists()) fPaths.add(p)
+                }
 
                 val rules = mutableListOf<String>()
                 val rArr = j.optJSONArray("extractedRulesSummary") ?: JSONArray()
@@ -418,7 +600,7 @@ class MemoryVault(private val context: Context) {
         for (path in paths.takeLast(maxImages)) {
             try {
                 val f = File(path)
-                if (f.exists()) {
+                if (f.exists() && f.length() > 0L) {
                     val bytes = f.readBytes()
                     result.add(Base64.encodeToString(bytes, Base64.NO_WRAP))
                 }
@@ -430,44 +612,105 @@ class MemoryVault(private val context: Context) {
     fun loadBitmapFromPath(path: String): Bitmap? {
         return try {
             val f = File(path)
-            if (f.exists()) BitmapFactory.decodeFile(f.absolutePath) else null
+            if (!f.exists() || f.length() == 0L) return null
+            val opts = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            BitmapFactory.decodeFile(f.absolutePath, opts)
         } catch (_: Exception) {
             null
         }
     }
 
-    fun appendPersistentLog(logLine: String) {
+    // =========================================================================
+    // 3. FAST IN-MEMORY + PERSISTENT LOGS & USER PROFILE RULES
+    // =========================================================================
+
+    private fun ensureLogsLoadedLocked() {
+        if (logsInitialized) return
+        logsInitialized = true
         try {
-            val existing = if (persistentLogsFile.exists()) persistentLogsFile.readLines() else emptyList()
-            val updated = (listOf(logLine) + existing).take(250)
-            persistentLogsFile.writeText(updated.joinToString("\n"))
+            if (persistentLogsFile.exists()) {
+                persistentLogsFile.readLines().take(250).forEach { line ->
+                    if (line.isNotBlank()) cachedLogs.addLast(line)
+                }
+            }
         } catch (_: Exception) {}
     }
 
-    fun getPersistentLogs(): List<String> {
+    fun appendPersistentLog(logLine: String) = synchronized(logLock) {
+        try {
+            ensureLogsLoadedLocked()
+            cachedLogs.addFirst(logLine)
+            while (cachedLogs.size > 250) {
+                cachedLogs.removeLast()
+            }
+            persistentLogsFile.writeText(cachedLogs.joinToString("\n"))
+        } catch (_: Exception) {}
+    }
+
+    fun getPersistentLogs(): List<String> = synchronized(logLock) {
         return try {
-            if (persistentLogsFile.exists()) persistentLogsFile.readLines() else emptyList()
+            ensureLogsLoadedLocked()
+            cachedLogs.toList()
         } catch (_: Exception) {
             emptyList()
         }
     }
 
-    fun clearPersistentLogs() {
+    fun clearPersistentLogs() = synchronized(logLock) {
         try {
+            cachedLogs.clear()
+            logsInitialized = true
             if (persistentLogsFile.exists()) persistentLogsFile.delete()
         } catch (_: Exception) {}
     }
 
-    fun saveUserProfileRules(rulesText: String) {
-        profileFile.writeText(rulesText)
+    fun saveUserProfileRules(rulesText: String) = synchronized(vaultLock) {
+        writeTextSafely(profileFile, rulesText.trim())
     }
 
-    fun getUserProfileRules(): String {
-        return if (profileFile.exists()) profileFile.readText() else ""
+    fun getUserProfileRules(): String = synchronized(vaultLock) {
+        return try {
+            if (profileFile.exists()) profileFile.readText() else ""
+        } catch (_: Exception) {
+            ""
+        }
     }
 
-    fun clearCategoryMemory(category: String) {
-        val dir = getCategoryDir(category)
-        dir.deleteRecursively()
+    fun clearCategoryMemory(category: String) = synchronized(vaultLock) {
+        try {
+            val dir = getCategoryDir(category)
+            dir.deleteRecursively()
+        } catch (_: Exception) {}
+    }
+
+    // =========================================================================
+    // 4. ATOMIC WRITE & AUTO-PRUNE STORAGE HELPERS
+    // =========================================================================
+
+    private fun writeTextSafely(targetFile: File, content: String) {
+        try {
+            val tempFile = File(targetFile.parentFile, "${targetFile.name}.tmp")
+            tempFile.writeText(content)
+            if (!tempFile.renameTo(targetFile)) {
+                targetFile.writeText(content)
+                tempFile.delete()
+            }
+        } catch (_: Exception) {
+            try { targetFile.writeText(content) } catch (_: Exception) {}
+        }
+    }
+
+    private fun pruneOldFolders(parentDir: File, maxKeep: Int) {
+        try {
+            val folders = parentDir.listFiles()?.filter { it.isDirectory }
+                ?.sortedByDescending { it.lastModified() } ?: return
+            if (folders.size > maxKeep) {
+                for (oldFolder in folders.drop(maxKeep)) {
+                    oldFolder.deleteRecursively()
+                }
+            }
+        } catch (_: Exception) {}
     }
 }
