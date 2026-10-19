@@ -17,7 +17,7 @@ import java.util.Locale
 data class LearnedFixRecord(
     val id: String,
     val appCategory: String,
-    val sourceType: String,         // "HUMAN_TOUCH_FIX", "VIDEO_FRAME_TRAINING", "RUN_CHAT_CORRECTION", "VIDEO_CHAT_CORRECTION"
+    val sourceType: String,         // "AUTO_3.8_REFLECTION", "HUMAN_TOUCH_FIX", "VIDEO_FRAME_TRAINING", "RUN_CHAT_CORRECTION"
     val screenSignature: String,
     val problemDescription: String,
     val solutionRule: String,
@@ -30,7 +30,7 @@ data class AutomationRunRecord(
     val runId: String,
     val title: String,
     val appCategory: String,
-    val status: String,             // "SUCCESS", "FAILED", "STOPPED", "RUNNING"
+    val status: String,             // "SUCCESS", "FAILED", "STOPPED"
     val timestamp: String,
     val stepsSummary: List<String>,
     val screenshotPaths: List<String>,
@@ -83,7 +83,7 @@ class MemoryVault(private val context: Context) {
     }
 
     /**
-     * Saves any Learned Rule (from Human Touch, Video Frame Training, Run Review Chat, or Video Chat)
+     * Saves any Learned Rule (Auto Post-Run Reflection, Human Touch, Video Frame Training, or Chat Correction)
      */
     @Suppress("DEPRECATION")
     fun saveStuckOrHumanFix(
@@ -161,7 +161,7 @@ class MemoryVault(private val context: Context) {
                 )
             }
         } catch (_: Exception) {}
-        return result.takeLast(20)
+        return result.takeLast(24)
     }
 
     fun getAllCategoriesSummary(): List<Pair<String, Int>> {
@@ -178,7 +178,7 @@ class MemoryVault(private val context: Context) {
     }
 
     // =========================================================================
-    // 1. AUTOMATION RUN SESSIONS (Save every run + Screenshots + Interactive Chat)
+    // 1. AUTOMATION RUN SESSIONS (Save every run + Screenshots + Auto Reflection)
     // =========================================================================
 
     @Suppress("DEPRECATION")
@@ -194,7 +194,7 @@ class MemoryVault(private val context: Context) {
         val runFolder = File(runsDir, runId).apply { if (!exists()) mkdirs() }
         val savedPaths = mutableListOf<String>()
 
-        capturedBitmaps.takeLast(8).forEachIndexed { idx, bmp ->
+        capturedBitmaps.takeLast(10).forEachIndexed { idx, bmp ->
             try {
                 val imgFile = File(runFolder, "step_${idx + 1}.webp")
                 imgFile.outputStream().use { out ->
@@ -413,10 +413,7 @@ class MemoryVault(private val context: Context) {
         return list
     }
 
-    /**
-     * Loads saved WebP files from disk as Base64 so Gemini 3.8 Flash can see them during Run Chat or Video Chat!
-     */
-    fun loadSavedImagesAsBase64(paths: List<String>, maxImages: Int = 6): List<String> {
+    fun loadSavedImagesAsBase64(paths: List<String>, maxImages: Int = 8): List<String> {
         val result = mutableListOf<String>()
         for (path in paths.takeLast(maxImages)) {
             try {
