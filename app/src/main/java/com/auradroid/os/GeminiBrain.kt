@@ -51,39 +51,30 @@ data class PostRunReflectionResult(
 
 class GeminiBrain(private var apiKey: String) {
 
-    // LOW TASK LADDER: Fastest Free-Tier Models (3.5 Flash-Lite -> 3.8 Flash fallback)
-    // Used for fast UI tapping, normal steps, quick planning & simple prompts
-    private val freeTierFastLadder = mutableListOf(
-        "gemini-3.5-flash-lite",
-        "gemini-3.5-flash",
-        "gemini-3.6-flash",
-        "gemini-3.7-flash",
+    private val rateLock = Any()
+
+    // SMART VISION & HIGH-ACCURACY LADDER (Starts with 3.8 Flash up to 9 RPM, then rotates to 3.5 Lite -> 3.1 Lite -> 3.1 Pro)
+    private val smartVisionLadder = listOf(
         "gemini-3.8-flash",
-        "gemini-flash-lite-latest"
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-robotics-er-2-preview",
+        "gemma-4-31b-it",
+        "gemma-4-26b-a4b-it"
     )
 
-    // HIGH TASK LADDER: Smartest Free-Tier Models (3.8 Flash -> 3.5 Flash-Lite fallback)
-    // Used for Stuck Recovery, Pure Vision Coordinates, Post-Run Reflection, Video & Touch Learning
-    private val deep38FlashLadder = listOf(
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
+    // TEXT-ONLY / LIGHT TASK LADDER (Saves 3.8 Flash's 9 RPM exclusively for live screen vision!)
+    private val lightTextTaskLadder = listOf(
         "gemini-3.5-flash-lite",
-        "gemini-flash-latest"
+        "gemini-3.1-flash-lite",
+        "gemini-3.8-flash",
+        "gemma-4-31b-it",
+        "gemini-3.1-pro-preview"
     )
 
-    // Strictly allowed 3.5 - 3.8 Free-Tier Flash family
-    private val allowedFreeModels = listOf(
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-flash-latest",
-        "gemini-flash-lite-latest"
-    )
-
+    // Sliding-window 60-second request timestamp tracker per model bucket
+    private val modelRequestTimestamps = mutableMapOf<String, MutableList<Long>>()
     private val blockedModels = mutableSetOf<String>()
     private val quotaCooldownModels = mutableMapOf<String, Long>()
 
@@ -93,22 +84,55 @@ class GeminiBrain(private var apiKey: String) {
         apiKey = newKey.trim()
     }
 
+    /**
+     * Hard limit per 60 seconds (9 RPM Jugad so we NEVER hit Google's 10-15 RPM wall!)
+     */
+    private fun getMaxSafeRpmForModel(model: String): Int {
+        return when {
+            model.contains("pro") -> 4
+            else -> 9 // Strictly max 9 requests per 60 seconds for 3.8-flash, 3.5-flash-lite, 3.1-flash-lite
+        }
+    }
+
+    private fun getUsedRpmInLastMinute(model: String, nowMs: Long = System.currentTimeMillis()): Int = synchronized(rateLock) {
+        val list = modelRequestTimestamps.getOrPut(model) { mutableListOf() }
+        list.removeAll { nowMs - it > 60_000L }
+        return list.size
+    }
+
+    private fun hasSafeRpmSlot(model: String, nowMs: Long = System.currentTimeMillis()): Boolean = synchronized(rateLock) {
+        val used = getUsedRpmInLastMinute(model, nowMs)
+        return used < getMaxSafeRpmForModel(model)
+    }
+
+    private fun recordModelRequestTimestamp(model: String) = synchronized(rateLock) {
+        val nowMs = System.currentTimeMillis()
+        val list = modelRequestTimestamps.getOrPut(model) { mutableListOf() }
+        list.removeAll { nowMs - it > 60_000L }
+        list.add(nowMs)
+    }
+
     fun getActiveModelListStatus(): String {
         val now = System.currentTimeMillis()
-        return allowedFreeModels.joinToString("\n") { m ->
+        return smartVisionLadder.joinToString("\n") { m ->
+            val used = getUsedRpmInLastMinute(m, now)
+            val maxRpm = getMaxSafeRpmForModel(m)
             val cooldownUntil = quotaCooldownModels[m] ?: 0L
-            val roleTag = if (m == "gemini-3.8-flash" || m == "gemini-3.7-flash") "High-Task" else "Low-Task/Fast"
             when {
-                blockedModels.contains(m) -> "🚫 $m ($roleTag - Blocked/Unavailable)"
-                cooldownUntil > now -> "⏳ $m ($roleTag - Quota Cooldown)"
-                else -> "✅ $m ($roleTag - Active Free-Tier)"
+                blockedModels.contains(m) -> "🚫 $m (Unavailable)"
+                cooldownUntil > now -> {
+                    val remSec = ((cooldownUntil - now) / 1000L).coerceAtLeast(1L)
+                    "⏳ $m (Cooldown ${remSec}s | $used/$maxRpm RPM)"
+                }
+                used >= maxRpm -> "🔄 $m (9-RPM Limit Reached: $used/$maxRpm -> Auto-Rotated)"
+                else -> "✅ $m (Active Free | Used: $used/$maxRpm RPM)"
             }
         }
     }
 
     @Suppress("DEPRECATION")
     fun bitmapToHdWebpBase64(bitmap: Bitmap, maxHeight: Int = 1280): String {
-        val ratio = bitmap.width.toFloat() / bitmap.height.toFloat()
+        val ratio = bitmap.width.toFloat() / bitmap.height.toFloat().coerceAtLeast(1f)
         val targetH = bitmap.height.coerceAtMost(maxHeight)
         val targetW = (targetH * ratio).toInt().coerceAtLeast(360)
         val scaled = if (bitmap.height > targetH) {
@@ -118,7 +142,7 @@ class GeminiBrain(private var apiKey: String) {
         }
 
         val bos = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.WEBP, 85, bos)
+        scaled.compress(Bitmap.CompressFormat.WEBP, 84, bos)
         return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
     }
 
@@ -127,27 +151,44 @@ class GeminiBrain(private var apiKey: String) {
         return JSONObject("{$body}")
     }
 
+    /**
+     * Smart 9-RPM Load-Balanced Caller:
+     * Uses 3.8 Flash up to 9 requests/min for maximum accuracy, then seamlessly rotates to
+     * 3.5-flash-lite (9 RPM) -> 3.1-flash-lite (9 RPM) -> 3.1-pro-preview (4 RPM) -> robotics/gemma!
+     */
     private suspend fun callWithLadder(
         prompt: String,
         imagesBase64: List<String> = emptyList(),
-        useDeep38Flash: Boolean = false
+        useDeep38Flash: Boolean = true
     ): Pair<String, String> = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) return@withContext Pair("", "No API Key")
 
         val now = System.currentTimeMillis()
-        val baseLadder = if (useDeep38Flash) deep38FlashLadder else freeTierFastLadder
+        val baseLadder = if (useDeep38Flash) smartVisionLadder else lightTextTaskLadder
 
-        val candidates = baseLadder.filter { m ->
-            !blockedModels.contains(m) && (quotaCooldownModels[m] ?: 0L) <= now
-        }.ifEmpty {
-            quotaCooldownModels.clear()
-            baseLadder.filter { !blockedModels.contains(it) }.ifEmpty {
-                blockedModels.clear()
-                baseLadder
+        // 1. Pick models that are NOT blocked, NOT in 429 cooldown, AND under our 9-RPM guard
+        val availableUnder9Rpm = baseLadder.filter { m ->
+            !blockedModels.contains(m) &&
+                (quotaCooldownModels[m] ?: 0L) <= now &&
+                hasSafeRpmSlot(m, now)
+        }
+
+        if (useDeep38Flash && !hasSafeRpmSlot("gemini-3.8-flash", now) && availableUnder9Rpm.isNotEmpty()) {
+            onBrainLog?.invoke("🛡️ 9-RPM Guard: [gemini-3.8-flash] at 9/9 RPM -> Auto-using [${availableUnder9Rpm.first()}]")
+        }
+
+        val candidates = availableUnder9Rpm.ifEmpty {
+            baseLadder.filter { !blockedModels.contains(it) && (quotaCooldownModels[it] ?: 0L) <= now }.ifEmpty {
+                quotaCooldownModels.clear()
+                baseLadder.filter { !blockedModels.contains(it) }.ifEmpty {
+                    blockedModels.clear()
+                    baseLadder
+                }
             }
         }
 
         for (model in candidates) {
+            recordModelRequestTimestamp(model)
             val result = executeSingleModelCall(model, prompt, imagesBase64)
             when (result.first) {
                 200 -> {
@@ -156,9 +197,8 @@ class GeminiBrain(private var apiKey: String) {
                     }
                 }
                 429 -> {
-                    // Quota exhausted on this model -> Cooldown for 3 minutes & switch to next model in ladder
-                    quotaCooldownModels[model] = System.currentTimeMillis() + 180_000L
-                    onBrainLog?.invoke("⚠️ Quota full on [$model] (429) -> Switching to next 3.5/3.8 free model...")
+                    quotaCooldownModels[model] = System.currentTimeMillis() + 35_000L
+                    onBrainLog?.invoke("⚠️ Quota 429 on [$model] -> Instant switch to next free model...")
                 }
                 404, 403, 400 -> {
                     blockedModels.add(model)
@@ -168,12 +208,6 @@ class GeminiBrain(private var apiKey: String) {
                     onBrainLog?.invoke("🔄 Model [$model] busy (${result.first}) -> Trying next free model...")
                 }
             }
-        }
-
-        val discovered = discoverAvailableFlashModel()
-        if (discovered != null) {
-            val res = executeSingleModelCall(discovered, prompt, imagesBase64)
-            if (res.first == 200) return@withContext Pair(res.second, discovered)
         }
 
         Pair("", "All models busy")
@@ -189,8 +223,8 @@ class GeminiBrain(private var apiKey: String) {
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 setRequestProperty("Content-Type", "application/json")
-                connectTimeout = 18000
-                readTimeout = 30000
+                connectTimeout = 10000
+                readTimeout = 20000
                 doOutput = true
             }
 
@@ -209,7 +243,9 @@ class GeminiBrain(private var apiKey: String) {
                 put("contents", JSONArray().put(JSONObject().put("parts", partsArray)))
                 put("generationConfig", JSONObject().apply {
                     put("temperature", 0.15)
-                    put("responseMimeType", "application/json")
+                    if (!model.startsWith("gemma")) {
+                        put("responseMimeType", "application/json")
+                    }
                 })
             }
 
@@ -233,39 +269,8 @@ class GeminiBrain(private var apiKey: String) {
         }
     }
 
-    private fun discoverAvailableFlashModel(): String? {
-        return try {
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey")
-            val conn = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 10000
-                readTimeout = 10000
-            }
-            if (conn.responseCode != 200) return null
-            val arr = JSONObject(conn.inputStream.bufferedReader().readText()).optJSONArray("models") ?: return null
-            for (i in 0 until arr.length()) {
-                val name = arr.getJSONObject(i).optString("name").removePrefix("models/")
-                val is35to38Flash = (name.startsWith("gemini-3.5-flash") ||
-                        name.startsWith("gemini-3.6-flash") ||
-                        name.startsWith("gemini-3.7-flash") ||
-                        name.startsWith("gemini-3.8-flash")) &&
-                        !name.contains("tts") &&
-                        !name.contains("image")
-                if (is35to38Flash && !blockedModels.contains(name)) {
-                    if (!freeTierFastLadder.contains(name)) {
-                        freeTierFastLadder.add(0, name)
-                    }
-                    return name
-                }
-            }
-            null
-        } catch (_: Exception) {
-            null
-        }
-    }
-
     /**
-     * 1. Interactive Chat & Detailed Task Planner (LOW TASK -> Uses 3.5 Flash-Lite first for instant reply)
+     * 1. Interactive Chat, Detailed Task Planner & Chat-Based Upload Time Scheduler
      */
     suspend fun chatAndBuildDetailedPlan(
         userMessage: String,
@@ -273,7 +278,7 @@ class GeminiBrain(private var apiKey: String) {
         userProfileRules: String
     ): JSONObject {
         val sysPrompt = """
-            You are AuraDroid OS, an intelligent friendly AI Assistant & Phone Automation Planner.
+            You are AuraDroid OS, an intelligent friendly AI Assistant, Phone Automation Planner & Upload Scheduler.
             Speak in natural Hinglish/Hindi.
             User's saved profile/rules: $userProfileRules
             Recent conversation:
@@ -281,9 +286,16 @@ class GeminiBrain(private var apiKey: String) {
             
             User just said: "$userMessage"
             
-            If critical info is missing, set "readyToExecute": false and ask briefly in "reply".
-            If the task is clear, break it down into small sequential steps in "steps" array and set "readyToExecute": true.
-            Also decide "executionMode": "LIVE_PHONE" or "BACKGROUND_WEB".
+            SPECIAL MODES YOU CAN SET IN "executionMode":
+            1. If the user wants to set/change daily YouTube upload time (e.g., "upload time 8:30 PM set kar do", "roz 7 baje video upload karo"):
+               - Set "executionMode": "SCHEDULE_YT_HH:mm" (replace HH:mm with 24-hour time like "SCHEDULE_YT_20:30" or "SCHEDULE_YT_19:00").
+               - Set "readyToExecute": true, and add 1 step in "steps": ["Activate 24/7 Daily YouTube Scheduler at HH:mm"].
+            2. If the user wants to upload a video from Folder to YouTube Shorts right now:
+               - Set "executionMode": "YOUTUBE_FOLDER_UPLOAD", "readyToExecute": true.
+            3. If the user wants to generate an 8s Google Flow video and upload to YouTube right now:
+               - Set "executionMode": "GOOGLE_FLOW_UPLOAD", "readyToExecute": true.
+            4. For normal phone automation (Instagram, WhatsApp, YouTube, Settings):
+               - Set "executionMode": "LIVE_PHONE" (or "BACKGROUND_WEB"), break into clear steps in "steps", and set "readyToExecute": true.
             
             Return ONLY valid JSON:
             {
@@ -313,8 +325,6 @@ class GeminiBrain(private var apiKey: String) {
 
     /**
      * 2. Real-Time Vision + Learned Playbook Step Engine
-     * - Normal steps with UI tags (LOW TASK) -> Uses 3.5 Flash-Lite for high speed
-     * - Stuck state OR Pure Vision without UI tags (HIGH TASK) -> Automatically upgrades to 3.8 Flash!
      */
     suspend fun decideNextStep(
         goal: String,
@@ -349,7 +359,7 @@ class GeminiBrain(private var apiKey: String) {
         }
 
         val plannedJoined = planSteps.joinToString(" -> ")
-        val recentJoined = currentStepHistory.takeLast(8).joinToString(" | ")
+        val recentJoined = currentStepHistory.takeLast(10).joinToString(" | ")
         val navTop = bodySpecs.screenHeight - bodySpecs.navBarHeight
 
         val prompt = """
@@ -371,15 +381,15 @@ class GeminiBrain(private var apiKey: String) {
             INTERACTIVE ELEMENTS ON SCREEN (with [TAG_ID] and exact Center X,Y):
             $numberedNodesList
             
-            CRITICAL EXECUTION RULES:
+            CRITICAL EXECUTION RULES (ZERO MISTAKE POLICY):
             1. Check RECENT ACTIONS ALREADY COMPLETED:
+               - If RECENT ACTIONS shows that you ALREADY typed or posted a comment (or if your comment is already visible in the comments list on screen), NEVER tap the comment box or keyboard send button again!
+               - If the Instagram Comment Sheet or Keyboard is still open after commenting and you need to Share or Like, return action "BACK" immediately to close the comment sheet/keyboard so the main Reel buttons (Like, Comment, Share/Send paper plane) become visible!
                - If you already tapped "Like", DO NOT tap Like again.
-               - If you already posted a comment and closed the comment sheet, DO NOT open comments again—move to Share!
-               - On the Instagram Share sheet: Once you have tapped a friend's avatar (e.g., Rahul) ONCE and a blue "Send" button appears at the bottom (around Y=910 in 0..1000 scale), DO NOT tap the friend's avatar again! Immediately tap the bottom blue "Send" button! And once "Sent" appears or the share sheet closes, return "DONE" immediately!
+               - On the Instagram Share sheet: Tap the Search bar on the share sheet and TYPE the friend's name (e.g., "rahul"). Once the friend's name appears, tap the friend's row/avatar ONCE. When the bottom blue "Send" button appears (around Y=910 in 0..1000 scale), immediately tap the bottom blue "Send" button! Once sent, return "DONE"!
             2. If you see "Comments on this post have been limited", press "BACK" and then "SWIPE" up to the next Reel.
-            3. Check LEARNED APP MEMORY above: If a post-run reflection, user correction, or video rule matches this screen, follow its exact instruction and coordinates!
-            4. Prefer "CLICK_TAG" with the exact "tagId" whenever the target button/box is in the list.
-            5. Otherwise use "CLICK_XY" with 0..1000 normalized coordinates.
+            3. Prefer "CLICK_TAG" with the exact "tagId" whenever the target button/box is in the list.
+            4. Otherwise use "CLICK_XY" with 0..1000 normalized coordinates.
             
             Return ONLY valid JSON:
             {
@@ -395,9 +405,7 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        // High Task if agent is stuck OR screen has no accessibility tags (requires pure 3.8 Flash vision)
-        val isHighTaskStep = isStuck || numberedNodesList.isBlank()
-        val (raw, modelUsed) = callWithLadder(prompt, imgList, useDeep38Flash = isHighTaskStep)
+        val (raw, modelUsed) = callWithLadder(prompt, imgList, useDeep38Flash = true)
 
         return try {
             val j = parseCleanJson(raw)
@@ -419,7 +427,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 3. Post-Run Automatic Self-Reflection & Optimization (HIGH TASK -> Uses Gemini 3.8 Flash)
+     * 3. Post-Run Automatic Self-Reflection & Optimization
      */
     suspend fun autoReflectAndImproveAfterRun(
         appCategory: String,
@@ -433,24 +441,24 @@ class GeminiBrain(private var apiKey: String) {
 
         val prompt = """
             You are Gemini 3.8 Flash Autonomous Self-Reflection & Optimization Architect for AuraDroid OS.
-            An automation run just ended. You already know what the user's Goal was, what should have happened (Planned Steps), what actually happened (Actual Steps Taken), and you have the sequential Screenshots from the run!
+            An automation run just ended.
             
             RUN CONTEXT:
             - App Category: $appCategory
             - User Goal: $goal
-            - Planned Steps (What should have happened): ${plannedSteps.joinToString(" -> ")}
+            - Planned Steps: ${plannedSteps.joinToString(" -> ")}
             - Actual Steps Taken: ${actualStepsTaken.joinToString(" | ")}
             - Final Run Status: $finalStatus
             
             YOUR TASK:
             1. Examine all ${imgsBase64.size} sequential screenshots from this run carefully.
-            2. Identify where the agent succeeded, where it hesitated/repeated steps, or why it failed/stopped short of the goal.
-            3. Formulate 1 to 3 concrete, high-precision optimization rules ("rules") with exact 0.0 to 1.0 screen tap coordinates ("tapXRatio", "tapYRatio") so that the VERY NEXT TIME the user runs this task in "$appCategory", it executes 100% smoothly without any mistake!
-            4. Write a short Hinglish summary ("reflectionSummary") of what you learned from reviewing these screenshots.
+            2. Identify where the agent succeeded, where it hesitated/repeated steps, or why it stopped short of the goal.
+            3. Formulate 1 to 3 concrete, high-precision optimization rules ("rules") with exact 0.0 to 1.0 screen tap coordinates ("tapXRatio", "tapYRatio").
+            4. Write a short Hinglish summary ("reflectionSummary") of what you learned.
             
             Return ONLY valid JSON:
             {
-              "reflectionSummary": "Short Hinglish summary of what went right/wrong and how you optimized it for the next run",
+              "reflectionSummary": "Short Hinglish summary of what went right/wrong and how you optimized it",
               "rules": [
                 {
                   "screenWhen": "Specific screen state seen in the screenshots",
@@ -498,7 +506,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 4. Interactive Chat Inside Any Past Automation Run (HIGH TASK -> Uses Gemini 3.8 Flash)
+     * 4. Interactive Chat Inside Any Past Automation Run
      */
     suspend fun chatAboutAutomationRunWith38Flash(
         runRecord: AutomationRunRecord,
@@ -554,7 +562,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 5. Interactive Chat Inside Any Uploaded Training Video (HIGH TASK -> Uses Gemini 3.8 Flash)
+     * 5. Interactive Chat Inside Any Uploaded Training Video
      */
     suspend fun chatAboutTrainingVideoWith38Flash(
         videoSession: VideoTrainingSession,
@@ -609,7 +617,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 6. Before + After Screenshot Human Touch Analyzer (HIGH TASK -> Uses Gemini 3.8 Flash)
+     * 6. Before + After Screenshot Human Touch Analyzer
      */
     suspend fun analyzeBeforeAfterHumanTouchWith38Flash(
         appCategory: String,
@@ -655,7 +663,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 7. Frame-by-Frame Uploaded Video Analyzer (HIGH TASK -> Uses Gemini 3.8 Flash)
+     * 7. Frame-by-Frame Uploaded Video Analyzer
      */
     suspend fun analyzeTrainingVideoFrames(
         appCategory: String,
@@ -727,7 +735,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 8. Safe Video Prompt + Viral YouTube Shorts Title Generator (LOW TASK -> Uses 3.5 Flash-Lite)
+     * 8. Safe Video Prompt + Viral YouTube Shorts Title Generator
      */
     suspend fun generateFlowSafePromptAndTitle(topic: String): Pair<String, String> {
         val safeRegex = Regex("(?i)\\b(boy|girl|child|kid|minor|baby|skin)\\b")
