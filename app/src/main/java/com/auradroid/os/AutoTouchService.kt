@@ -27,6 +27,7 @@ import android.view.Display
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import android.webkit.WebView
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CancellationException
@@ -73,10 +74,11 @@ class AutoTouchService : AccessibilityService() {
             val line = "[$time] $msg"
             synchronized(liveLogs) {
                 liveLogs.add(0, line)
-                if (liveLogs.size > 120) {
+                if (liveLogs.size > 200) {
                     liveLogs.removeAt(liveLogs.lastIndex)
                 }
             }
+            instance?.memoryVault?.appendPersistentLog(line)
         }
     }
 
@@ -89,11 +91,13 @@ class AutoTouchService : AccessibilityService() {
     lateinit var memoryVault: MemoryVault
     lateinit var geminiBrain: GeminiBrain
 
+    // Real-Time Before + After Screenshot & Human-Touch Learning State
     @Volatile
     private var isAgentRunning = false
     private var currentTaskGoal = ""
     private var currentAppCategory = "General"
-    private var lastStuckScreenshot: Bitmap? = null
+    private var lastStepScreenshot: Bitmap? = null
+    private var lastAgentTapTimestamp = 0L
     private var consecutiveSameScreenCount = 0
     private var lastScreenSignature = ""
 
@@ -104,7 +108,9 @@ class AutoTouchService : AccessibilityService() {
         val savedKey = prefs.getString("gemini_api_key", "") ?: ""
 
         memoryVault = MemoryVault(this)
-        geminiBrain = GeminiBrain(savedKey)
+        geminiBrain = GeminiBrain(savedKey).apply {
+            onBrainLog = { brainMsg -> log(brainMsg) }
+        }
         hud = AiOverlayHud(this) { stopCurrentTask("Stopped by User") }
 
         start24x7ForegroundProtection()
@@ -112,7 +118,7 @@ class AutoTouchService : AccessibilityService() {
             hud.showHud()
         }
         startDailySchedulerLoop()
-        log("AuraDroid OS 24/7 Body Service Connected.")
+        log("✅ AuraDroid OS 24/7 Body Service Connected & Calibrated.")
     }
 
     override fun onDestroy() {
@@ -204,14 +210,28 @@ class AutoTouchService : AccessibilityService() {
         )
     }
 
+    /**
+     * Trigger: Before + After Screenshot Human-Touch Learning!
+     * Whenever a task is running and the human manually taps any button on the screen (because the AI was stuck or wrong),
+     * we capture:
+     * 1. BEFORE Screenshot (lastStepScreenshot)
+     * 2. Human Tap Exact Point (tapXRatio, tapYRatio)
+     * 3. AFTER Screenshot (captured 1.2s after the tap)
+     * And send both to Gemini 3.8 Flash to permanently learn the fix!
+     */
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
         val teachEnabled = prefs.getBoolean("passive_teach_mode", true)
 
-        if (teachEnabled && isAgentRunning && consecutiveSameScreenCount >= 1 &&
+        // Ignore clicks performed by the agent itself within the last 900ms
+        val timeSinceAgentTap = System.currentTimeMillis() - lastAgentTapTimestamp
+        if (teachEnabled && isAgentRunning && timeSinceAgentTap > 900L &&
             event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED
         ) {
+            val pkg = event.packageName?.toString() ?: ""
+            if (pkg == packageName) return // Ignore clicks inside AuraDroid UI itself
+
             val src = event.source ?: return
             val rect = Rect()
             src.getBoundsInScreen(rect)
@@ -220,31 +240,43 @@ class AutoTouchService : AccessibilityService() {
             val specs = getCalibratedDeviceBodySpecs()
             val tapXRatio = rect.exactCenterX() / specs.screenWidth.toFloat()
             val tapYRatio = rect.exactCenterY() / specs.screenHeight.toFloat()
-            val nodeDesc = (src.text?.toString() ?: src.contentDescription?.toString() ?: src.viewIdResourceName ?: "Button").take(60)
-            val snap = lastStuckScreenshot
+            val nodeDesc = (src.text?.toString() ?: src.contentDescription?.toString() ?: src.viewIdResourceName ?: "Element").take(60)
+
+            val beforeBitmap = lastStepScreenshot
             val cat = currentAppCategory
             val goal = currentTaskGoal
+            val sig = lastScreenSignature
 
-            log("🎓 Human Fix Detected on [$nodeDesc]! Saving to Memory...")
-            serviceScope.launch(Dispatchers.IO) {
-                val (prob, rule) = geminiBrain.analyzeHumanFixWithProModel(
-                    appCategory = cat,
-                    goal = goal,
-                    stuckScreenshot = snap,
-                    humanTapXRatio = tapXRatio,
-                    humanTapYRatio = tapYRatio,
-                    clickedNodeDesc = nodeDesc
-                )
-                memoryVault.saveStuckOrHumanFix(
-                    category = cat,
-                    screenSignature = lastScreenSignature,
-                    problemDescription = prob,
-                    solutionRule = rule,
-                    tapXRatio = tapXRatio,
-                    tapYRatio = tapYRatio,
-                    stuckScreenshot = snap
-                )
-                log("🧠 Saved Human Fix in Memory/$cat: $rule")
+            log("👆 Human Touch Intervention Detected on [$nodeDesc] at (${rect.centerX()}, ${rect.centerY()})! Capturing AFTER screenshot...")
+
+            serviceScope.launch {
+                delay(1200L) // Wait for the new screen after human tap to settle
+                val afterBitmap = takeHdDisplayScreenshotWithTimeout(2000L)
+                log("📸 Captured Before + After Screenshots for Human Touch. Sending to Gemini 3.8 Flash...")
+
+                withContext(Dispatchers.IO) {
+                    val (prob, rule) = geminiBrain.analyzeBeforeAfterHumanTouchWith38Flash(
+                        appCategory = cat,
+                        goal = goal,
+                        beforeScreenshot = beforeBitmap,
+                        afterScreenshot = afterBitmap,
+                        humanTapXRatio = tapXRatio,
+                        humanTapYRatio = tapYRatio,
+                        clickedNodeDesc = nodeDesc
+                    )
+                    memoryVault.saveStuckOrHumanFix(
+                        category = cat,
+                        screenSignature = sig,
+                        problemDescription = prob,
+                        solutionRule = rule,
+                        tapXRatio = tapXRatio,
+                        tapYRatio = tapYRatio,
+                        beforeScreenshot = beforeBitmap,
+                        afterScreenshot = afterBitmap,
+                        sourceType = "HUMAN_TOUCH_FIX"
+                    )
+                    log("🧠 Learned & Saved in Memory/$cat: $rule")
+                }
             }
         }
     }
@@ -261,7 +293,6 @@ class AutoTouchService : AccessibilityService() {
 
     /**
      * Universal Autonomous Goal-Based Executor
-     * Includes Instant Target App Pre-Launch & Non-Hanging 2.5s Screenshot Timeout!
      */
     fun startUniversalTask(
         goal: String,
@@ -288,14 +319,14 @@ class AutoTouchService : AccessibilityService() {
                 var stepNumber = 0
 
                 hud.updateStatus("Starting: ${goal.take(22)}...", BotMood.THINKING, taskRunning = true)
-                log("🚀 Starting Universal Task [$execMode]: $goal")
+                log("🚀 Starting Task [$execMode]: $goal")
 
                 if (execMode == "BACKGROUND_WEB") {
                     runBackgroundWebAgentLoop(goal, plannedSteps)
                     return@launch
                 }
 
-                // Instant Pre-Launch: If user mentioned Instagram, YouTube, WhatsApp, or Chrome, open it immediately!
+                // Instant Target App Pre-Launch
                 val lowerGoal = goal.lowercase(Locale.ROOT)
                 val autoTargetApp = when {
                     lowerGoal.contains("instagram") || lowerGoal.contains("इंस्टाग्राम") -> "instagram"
@@ -309,7 +340,7 @@ class AutoTouchService : AccessibilityService() {
                 if (autoTargetApp != null) {
                     hud.updateStatus("🚀 Opening $autoTargetApp...", BotMood.WORKING, taskRunning = true)
                     launchAppByNameOrPackage(autoTargetApp)
-                    stepHistory.add("Directly launched $autoTargetApp app")
+                    stepHistory.add("Opened $autoTargetApp app")
                     delay(3200L)
                 }
 
@@ -320,7 +351,6 @@ class AutoTouchService : AccessibilityService() {
                     val activePkg = rootInActiveWindow?.packageName?.toString() ?: "android"
                     currentAppCategory = memoryVault.resolveCategoryFolder(activePkg, goal)
 
-                    // If we are still inside AuraDroid OS on Step 1 without a target app, go to Home Screen first
                     if (stepNumber == 1 && activePkg == packageName && autoTargetApp == null) {
                         performGlobalAction(GLOBAL_ACTION_HOME)
                         delay(1500L)
@@ -336,26 +366,45 @@ class AutoTouchService : AccessibilityService() {
                         lastScreenSignature = currentSig
                     }
 
-                    val isStuck = consecutiveSameScreenCount >= 2
-
-                    hud.updateStatus(
-                        if (isStuck) "🧠 Stuck Recall ($currentAppCategory)..." else "👁️ Step $stepNumber Reading...",
-                        if (isStuck) BotMood.THINKING else BotMood.WORKING,
-                        taskRunning = true
-                    )
-
-                    // Non-Hanging 2.5s Timeout Screenshot! Never gets stuck on "Step 1 Scanning..."
-                    val screenshot = takeHdDisplayScreenshotWithTimeout(2500L)
-                    if (isStuck && screenshot != null) {
-                        lastStuckScreenshot = screenshot
+                    // Auto-Detection for Instagram "Comments on this post have been limited"
+                    val hasLimitedComments = taggedElements.any {
+                        it.label.contains("Comments on this post have been limited", true) ||
+                            it.label.contains("comments are limited", true)
+                    }
+                    if (hasLimitedComments) {
+                        log("⚠️ Detected 'Comments on this post have been limited'! Closing sheet & swiping to next Reel...")
+                        hud.updateStatus("Comments limited -> Next Reel", BotMood.WORKING, taskRunning = true)
+                        performGlobalAction(GLOBAL_ACTION_BACK)
+                        delay(1200L)
+                        performPhysicalSwipe(
+                            specs.screenWidth / 2,
+                            (specs.screenHeight * 0.78f).toInt(),
+                            specs.screenWidth / 2,
+                            (specs.screenHeight * 0.22f).toInt()
+                        )
+                        stepHistory.add("Closed limited comment sheet and swiped to next Reel")
+                        delay(2200L)
+                        continue
                     }
 
-                    val recalledFixes = if (isStuck) {
-                        log("🚨 Stuck detected on $currentAppCategory! Loading Memory/$currentAppCategory fixes...")
-                        memoryVault.recallFixesForApp(currentAppCategory)
-                    } else emptyList()
+                    val isStuck = consecutiveSameScreenCount >= 2
 
-                    val nodesPromptList = taggedElements.take(45).joinToString("\n") {
+                    hud.updateStatus("📸 Step $stepNumber Capturing...", BotMood.WORKING, taskRunning = true)
+                    val screenshot = takeHdDisplayScreenshotWithTimeout(2500L)
+                    if (screenshot != null) {
+                        lastStepScreenshot = screenshot
+                        log("📸 Step $stepNumber Screenshot Captured (${specs.screenWidth}x${specs.screenHeight})")
+                    } else {
+                        log("ℹ️ Step $stepNumber Using UI Tree Nodes (${taggedElements.size} elements)")
+                    }
+
+                    // Always load Learned App Memory & Video-Trained Rules right from Step 1!
+                    val recalledFixes = memoryVault.recallFixesForApp(currentAppCategory)
+                    if (recalledFixes.isNotEmpty() && stepNumber == 1) {
+                        log("🧠 Loaded ${recalledFixes.size} Learned Memory/Video Rules for [$currentAppCategory]")
+                    }
+
+                    val nodesPromptList = taggedElements.take(48).joinToString("\n") {
                         "[${it.tagId}] ${it.label} (${it.className}) -> Center(${it.centerX}, ${it.centerY})"
                     }
 
@@ -375,7 +424,7 @@ class AutoTouchService : AccessibilityService() {
                         )
                     } ?: AgentStepDecision(action = "WAIT", reason = "Retrying AI connection...")
 
-                    log("Step $stepNumber [${decision.modelUsed}] -> ${decision.action}: ${decision.reason}")
+                    log("⚡ Step $stepNumber [${decision.modelUsed}] -> ${decision.action}: ${decision.reason}")
                     hud.updateStatus("Step $stepNumber • ${decision.reason}", BotMood.WORKING, taskRunning = true)
 
                     when (decision.action) {
@@ -385,10 +434,17 @@ class AutoTouchService : AccessibilityService() {
                                 delay(4500L)
                             } else {
                                 hud.updateStatus("🎉 Task Complete!", BotMood.HAPPY, taskRunning = false)
-                                log("✅ Task Completed: ${decision.reason}")
+                                log("✅ Task Completed Successfully: ${decision.reason}")
                                 isAgentRunning = false
                                 break
                             }
+                        }
+
+                        "BACK" -> {
+                            log("🔙 Performing System BACK Action")
+                            performGlobalAction(GLOBAL_ACTION_BACK)
+                            stepHistory.add("Pressed BACK")
+                            delay(1800L)
                         }
 
                         "LAUNCH_APP" -> {
@@ -406,11 +462,13 @@ class AutoTouchService : AccessibilityService() {
                         "CLICK_TAG" -> {
                             val target = taggedElements.find { it.tagId == decision.tagId }
                             if (target != null) {
+                                log("👆 Tap Dead-Center [${target.tagId}] '${target.label}' at (${target.centerX}, ${target.centerY})")
                                 tapDeadCenterOfElement(target)
                                 stepHistory.add("Tapped [${target.tagId}] ${target.label}")
                             } else {
                                 val px = convertNormalizedX(decision.x, specs)
                                 val py = convertNormalizedY(decision.y, specs)
+                                log("👆 Tap Fallback XY ($px, $py)")
                                 performPhysicalTap(px, py)
                                 stepHistory.add("Tapped XY($px,$py)")
                             }
@@ -422,9 +480,11 @@ class AutoTouchService : AccessibilityService() {
                             val py = convertNormalizedY(decision.y, specs)
                             val snapped = findNearestElementToSnap(px, py, taggedElements)
                             if (snapped != null) {
+                                log("🧲 Snapped & Tapped '${snapped.label}' Center (${snapped.centerX}, ${snapped.centerY})")
                                 tapDeadCenterOfElement(snapped)
-                                stepHistory.add("Snapped & Tapped ${snapped.label}")
+                                stepHistory.add("Tapped ${snapped.label}")
                             } else {
+                                log("👆 Tap Exact XY ($px, $py)")
                                 performPhysicalTap(px, py)
                                 stepHistory.add("Tapped XY($px,$py)")
                             }
@@ -434,6 +494,7 @@ class AutoTouchService : AccessibilityService() {
                         "LONG_PRESS_XY" -> {
                             val px = convertNormalizedX(decision.x, specs)
                             val py = convertNormalizedY(decision.y, specs)
+                            log("👇 Long-Press ($px, $py)")
                             performPhysicalLongPress(px, py)
                             stepHistory.add("Long-Pressed ($px,$py)")
                             delay(2000L)
@@ -443,23 +504,23 @@ class AutoTouchService : AccessibilityService() {
                             val target = taggedElements.find { it.tagId == decision.tagId }
                             if (target != null) {
                                 tapDeadCenterOfElement(target)
-                                delay(700L)
+                                delay(750L)
                             } else if (decision.x > 0 && decision.y > 0) {
                                 performPhysicalTap(
                                     convertNormalizedX(decision.x, specs),
                                     convertNormalizedY(decision.y, specs)
                                 )
-                                delay(700L)
+                                delay(750L)
                             }
+                            log("⌨️ Typing Text: '${decision.text}'")
                             typeAndPasteTextReliably(decision.text)
-                            stepHistory.add("Typed '${decision.text.take(20)}'")
+                            stepHistory.add("Typed '${decision.text}'")
                             delay(1200L)
 
                             if (activePkg.contains("whatsapp") || isContinuousMonitor) {
                                 clickWhatsAppSendIfPresent()
                             } else if (activePkg.contains("instagram") || activePkg.contains("youtube")) {
-                                // Press Enter/Search key or tap search suggestion
-                                clickSearchOrEnterIfPresent()
+                                clickSearchOrPostIfPresent(decision.text)
                             }
                             delay(1800L)
                         }
@@ -469,6 +530,7 @@ class AutoTouchService : AccessibilityService() {
                             val sy = convertNormalizedY(decision.y, specs)
                             val ex = convertNormalizedX(decision.endX, specs)
                             val ey = convertNormalizedY(decision.endY, specs)
+                            log("👋 Swiping ($sx, $sy) -> ($ex, $ey)")
                             performPhysicalSwipe(sx, sy, ex, ey)
                             stepHistory.add("Swiped ($sx,$sy)->($ex,$ey)")
                             delay(2200L)
@@ -476,16 +538,16 @@ class AutoTouchService : AccessibilityService() {
 
                         "WAIT" -> {
                             hud.updateStatus("⏳ ${decision.reason}", BotMood.THINKING, taskRunning = true)
-                            delay(3500L)
+                            delay(3200L)
                         }
 
-                        else -> delay(2500L)
+                        else -> delay(2200L)
                     }
                 }
             } catch (_: CancellationException) {
                 hud.updateStatus("Stopped", BotMood.IDLE, taskRunning = false)
             } catch (e: Exception) {
-                log("⚠️ Task Warning: ${e.message}")
+                log("⚠️ Task Exception: ${e.message}")
                 hud.updateStatus("Paused", BotMood.ERROR, taskRunning = false)
             } finally {
                 isAgentRunning = false
@@ -509,7 +571,7 @@ class AutoTouchService : AccessibilityService() {
                 hud.updateStatus("Generating Viral Title...", BotMood.THINKING, taskRunning = true)
                 val cleanTopic = rawDisplayName.substringBeforeLast(".").replace("_", " ").ifBlank { "Amazing Viral Short Video" }
                 val (_, viralTitle) = geminiBrain.generateFlowSafePromptAndTitle(cleanTopic)
-                log("✨ Selected Video Title: $viralTitle")
+                log("✨ Generated Viral Title: $viralTitle")
                 uploadVideoUriToYouTubeShorts(videoUri, viralTitle)
             } catch (_: CancellationException) {
                 hud.updateStatus("Stopped", BotMood.IDLE, taskRunning = false)
@@ -524,7 +586,7 @@ class AutoTouchService : AccessibilityService() {
     }
 
     /**
-     * Smart Folder Video Resolver (Supports shorthand names like 'download', 'storage', sub-folders & MediaStore fallback!)
+     * Folder Video -> YouTube Shorts Auto-Uploader
      */
     fun startYouTubeFolderAutoUpload(folderInputRaw: String, pickOldestFirst: Boolean) {
         currentTaskJob?.cancel()
@@ -538,16 +600,15 @@ class AutoTouchService : AccessibilityService() {
 
                 val resolvedDir = resolveSmartFolderPath(folderInputRaw)
                 val uploadedSet = prefs.getStringSet("uploaded_videos_set", emptySet())?.toMutableSet() ?: mutableSetOf()
+                log("📂 Scanning Folder: ${resolvedDir.absolutePath}")
 
-                // Search both top-level and 1-level sub-folders for .mp4/.mov/.mkv/.webm
                 val videos = findVideoFilesInDirectory(resolvedDir, uploadedSet)
 
                 if (videos.isEmpty()) {
-                    // Fallback: Query Android MediaStore for videos matching folder name
                     val mediaUriPair = queryMediaStoreVideoByFolderName(folderInputRaw, pickOldestFirst, uploadedSet)
                     if (mediaUriPair != null) {
                         val (uri, name) = mediaUriPair
-                        log("🎬 Found via MediaStore: $name")
+                        log("🎬 Found Video via MediaStore: $name")
                         hud.updateStatus("Generating Viral Title...", BotMood.THINKING, taskRunning = true)
                         val (_, viralTitle) = geminiBrain.generateFlowSafePromptAndTitle(name.substringBeforeLast("."))
                         uploadVideoUriToYouTubeShorts(uri, viralTitle)
@@ -556,8 +617,8 @@ class AutoTouchService : AccessibilityService() {
                         return@launch
                     }
 
-                    hud.updateStatus("No videos found! Grant Storage or Pick Video", BotMood.ERROR, taskRunning = false)
-                    log("📁 No un-uploaded videos found in [${resolvedDir.absolutePath}].")
+                    hud.updateStatus("No new videos found!", BotMood.ERROR, taskRunning = false)
+                    log("⚠️ No un-uploaded videos found in [${resolvedDir.absolutePath}].")
                     return@launch
                 }
 
@@ -591,12 +652,8 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Converts user shorthand like "download", "/storage/download/", "camera", "movies", or "storage"
-     * into real Android paths (/storage/emulated/0/Download, etc.)
-     */
     private fun resolveSmartFolderPath(rawInput: String): File {
-        val rootStorage = Environment.getExternalStorageDirectory() // /storage/emulated/0
+        val rootStorage = Environment.getExternalStorageDirectory()
         val cleaned = rawInput.trim()
         val lower = cleaned.lowercase(Locale.ROOT)
 
@@ -616,7 +673,6 @@ class AutoTouchService : AccessibilityService() {
         val directFile = File(cleaned)
         if (directFile.exists() && directFile.isDirectory) return directFile
 
-        // Try relative to /storage/emulated/0/
         val relative = File(rootStorage, cleaned.removePrefix("/").removePrefix("storage/"))
         if (relative.exists() && relative.isDirectory) return relative
 
@@ -666,7 +722,7 @@ class AutoTouchService : AccessibilityService() {
                 sortOrder
             ) ?: return null
 
-            val kw = folderKeyword.trim().lowercase(Locale.ROOT).removePrefix("/storage/").removeSuffix("/")
+            val kw = folderKeyword.trim().lowercase(Locale.ROOT).substringAfterLast("/")
             cursor.use { c ->
                 val idCol = c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
                 val nameCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
@@ -678,7 +734,7 @@ class AutoTouchService : AccessibilityService() {
                     val bucket = (c.getString(bucketCol) ?: "").lowercase(Locale.ROOT)
                     val contentUri = Uri.withAppendedPath(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id.toString())
 
-                    val matchesBucket = kw.isEmpty() || kw == "storage" || kw == "video" || bucket.contains(kw) || kw.contains(bucket)
+                    val matchesBucket = kw.isEmpty() || kw == "storage" || kw == "download" || bucket.contains(kw) || kw.contains(bucket)
                     if (matchesBucket && !uploadedSet.contains(contentUri.toString())) {
                         return Pair(contentUri, name)
                     }
@@ -690,6 +746,11 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
+    /**
+     * Upgraded YouTube Shorts Uploader:
+     * - Accurately taps bottom-right 'Next' (908, 2265 on 1080x2408) on Trimmer & Editor screens
+     * - NEVER presses BACK if keyboard isn't open (prevents accidentally leaving Add details screen!)
+     */
     private suspend fun uploadVideoUriToYouTubeShorts(videoUri: Uri, viralTitle: String) {
         val specs = getCalibratedDeviceBodySpecs()
 
@@ -705,51 +766,77 @@ class AutoTouchService : AccessibilityService() {
         }
 
         hud.updateStatus("Opening YouTube Shorts...", BotMood.WORKING, taskRunning = true)
-        delay(4500L)
+        log("🚀 Sent video to YouTube Shorts activity. Waiting for Trimmer...")
+        delay(5000L)
 
+        // Step 1 & 2: Advance past Trimmer & Editor screens to 'Add details'
         for (attempt in 1..8) {
             if (!isAgentRunning) return
             val elements = scanScreenInteractiveElements(specs)
-            val hasCaptionBox = elements.any {
+            val onAddDetails = elements.any {
                 it.label.contains("Caption your Short", true) ||
                     it.label.contains("Add details", true) ||
-                    it.label.contains("Create title", true)
+                    it.label.contains("Upload Short", true)
             }
-            if (hasCaptionBox) break
+            if (onAddDetails) {
+                log("✅ Reached 'Add details' screen!")
+                break
+            }
 
-            val nextBtn = elements.find {
+            // Prefer the 'Next' button located in the bottom area of the screen
+            val nextBtn = elements.filter {
                 it.label.equals("Next", true) || it.label.contains("Next", true) || it.label.contains("आगे", true)
-            }
+            }.maxByOrNull { it.centerY }
+
             if (nextBtn != null) {
                 hud.updateStatus("Tap: Next (#$attempt)", BotMood.WORKING, taskRunning = true)
+                log("👆 Tapping Next button Center (${nextBtn.centerX}, ${nextBtn.centerY})")
                 tapDeadCenterOfElement(nextBtn)
-                delay(3800L)
+                delay(4000L)
             } else {
-                performPhysicalTap((specs.screenWidth * 0.88f).toInt(), (specs.screenHeight * 0.93f).toInt())
-                delay(3500L)
+                // Exact bottom-right Next button coordinate ratio (84% width, 94% height)
+                val fallbackX = (specs.screenWidth * 0.84f).toInt()
+                val fallbackY = (specs.screenHeight * 0.94f).toInt()
+                hud.updateStatus("Tap: Next (#$attempt)", BotMood.WORKING, taskRunning = true)
+                log("👆 Tapping Next Bottom-Right Fallback ($fallbackX, $fallbackY)")
+                performPhysicalTap(fallbackX, fallbackY)
+                delay(3800L)
             }
         }
 
+        // Step 3: Tap 'Caption your Short' & Paste Viral Title
         hud.updateStatus("Typing Viral Caption...", BotMood.WORKING, taskRunning = true)
         val detailsElements = scanScreenInteractiveElements(specs)
         val captionNode = detailsElements.find {
             it.label.contains("Caption your Short", true) ||
+                it.label.contains("caption", true) ||
                 it.label.contains("title", true) ||
                 it.className.contains("EditText", true)
         }
+
         if (captionNode != null) {
+            log("👆 Tapping Caption Box '${captionNode.label}' at (${captionNode.centerX}, ${captionNode.centerY})")
             tapDeadCenterOfElement(captionNode)
         } else {
-            performPhysicalTap((specs.screenWidth * 0.45f).toInt(), (specs.screenHeight * 0.28f).toInt())
+            val capX = (specs.screenWidth * 0.52f).toInt()
+            val capY = (specs.screenHeight * 0.16f).toInt()
+            log("👆 Tapping Caption Box Fallback ($capX, $capY)")
+            performPhysicalTap(capX, capY)
         }
-        delay(1500L)
-
-        typeAndPasteTextReliably(viralTitle)
-        delay(1400L)
-
-        performGlobalAction(GLOBAL_ACTION_BACK)
         delay(1600L)
 
+        typeAndPasteTextReliably(viralTitle)
+        delay(1200L)
+
+        // CRITICAL FIX: Only press BACK if the soft keyboard (IME window) is actually open!
+        // Never press BACK if the keyboard isn't open, otherwise YouTube navigates back to the video editor!
+        if (isSoftKeyboardOpen()) {
+            log("⌨️ Keyboard is open -> Closing keyboard with BACK")
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            delay(1400L)
+        }
+
+        // Step 4: Tap White 'Upload Short' Button at Bottom Center (96.4% height)
         for (retry in 1..3) {
             if (!isAgentRunning) return
             val postElements = scanScreenInteractiveElements(specs)
@@ -776,6 +863,14 @@ class AutoTouchService : AccessibilityService() {
 
         hud.updateStatus("🎉 UPLOAD SUCCESS!", BotMood.HAPPY, taskRunning = false)
         log("🎉 YouTube Short Uploaded Successfully: $viralTitle")
+    }
+
+    private fun isSoftKeyboardOpen(): Boolean {
+        return try {
+            windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+        } catch (_: Exception) {
+            false
+        }
     }
 
     fun startGoogleFlowToYouTubePipeline(topic: String, maxVideosToCreate: Int = 1) {
@@ -890,7 +985,7 @@ class AutoTouchService : AccessibilityService() {
                 numberedNodesList = domTagList,
                 screenshotBitmap = webBitmap,
                 isStuck = false,
-                recalledFixes = emptyList(),
+                recalledFixes = memoryVault.recallFixesForApp("WebStudio"),
                 isContinuousMonitor = false
             )
 
@@ -1057,7 +1152,7 @@ class AutoTouchService : AccessibilityService() {
                     TaggedUiElement(
                         tagId = idCounter++,
                         node = node,
-                        label = label.ifEmpty { "Element" }.take(50),
+                        label = label.ifEmpty { "Element" }.take(55),
                         className = node.className?.toString()?.substringAfterLast('.') ?: "View",
                         bounds = rect,
                         centerX = rect.centerX(),
@@ -1105,6 +1200,7 @@ class AutoTouchService : AccessibilityService() {
     }
 
     private suspend fun performPhysicalTap(x: Int, y: Int) {
+        lastAgentTapTimestamp = System.currentTimeMillis()
         hud.animateHandTap(x.toFloat(), y.toFloat())
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
         val gesture = GestureDescription.Builder()
@@ -1115,6 +1211,7 @@ class AutoTouchService : AccessibilityService() {
     }
 
     private suspend fun performPhysicalLongPress(x: Int, y: Int) {
+        lastAgentTapTimestamp = System.currentTimeMillis()
         hud.animateHandTap(x.toFloat(), y.toFloat())
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
         val gesture = GestureDescription.Builder()
@@ -1125,6 +1222,7 @@ class AutoTouchService : AccessibilityService() {
     }
 
     private suspend fun performPhysicalSwipe(sx: Int, sy: Int, ex: Int, ey: Int) {
+        lastAgentTapTimestamp = System.currentTimeMillis()
         hud.animateHandSwipe(sx.toFloat(), sy.toFloat(), ex.toFloat(), ey.toFloat())
         val path = Path().apply {
             moveTo(sx.toFloat(), sy.toFloat())
@@ -1174,10 +1272,21 @@ class AutoTouchService : AccessibilityService() {
         delay(400L)
     }
 
-    private suspend fun clickSearchOrEnterIfPresent() {
+    private suspend fun clickSearchOrPostIfPresent(typedText: String) {
         val specs = getCalibratedDeviceBodySpecs()
-        // Tap bottom-right keyboard Search / Enter key area
-        performPhysicalTap((specs.screenWidth * 0.90f).toInt(), (specs.screenHeight * 0.91f).toInt())
+        val elements = scanScreenInteractiveElements(specs)
+        val postOrSend = elements.find {
+            it.label.equals("Post", true) ||
+                it.label.equals("Send", true) ||
+                it.label.contains("row_search_for_x", true)
+        }
+        if (postOrSend != null) {
+            tapDeadCenterOfElement(postOrSend)
+            return
+        }
+        if (isSoftKeyboardOpen()) {
+            performPhysicalTap((specs.screenWidth * 0.90f).toInt(), (specs.screenHeight * 0.91f).toInt())
+        }
     }
 
     private suspend fun clickWhatsAppSendIfPresent() {
@@ -1193,9 +1302,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Non-hanging screenshot with strict timeout so "Step 1 Scanning..." never freezes!
-     */
     private suspend fun takeHdDisplayScreenshotWithTimeout(timeoutMs: Long = 2500L): Bitmap? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
         return withTimeoutOrNull(timeoutMs) {
@@ -1271,6 +1377,7 @@ class AutoTouchService : AccessibilityService() {
         }
         try {
             startActivity(Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            log("⚙️ Opened System Settings: $section")
         } catch (_: Exception) {
             startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }
