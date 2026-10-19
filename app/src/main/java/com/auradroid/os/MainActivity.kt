@@ -21,6 +21,7 @@ import android.provider.Settings
 import android.speech.RecognizerIntent
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -29,15 +30,27 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.*
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.io.File
 
-@SuppressLint("SetJavaScriptEnabled")
+@SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
 class MainActivity : AppCompatActivity() {
 
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -266,7 +279,7 @@ class MainActivity : AppCompatActivity() {
 
         addChatBubble(
             "AuraDroid OS",
-            "नमस्ते भाई! मुझे कोई भी काम बताओ (जैसे: 'Instagram खोलो, भोजपुरी गाना सर्च करो और पहला वीडियो चलाओ')। मैं पहले पूरा प्लान दिखाऊँगा, फिर आपकी मंजूरी से काम शुरू करूँगा!",
+            "नमस्ते भाई! मुझे कोई भी काम बताओ (जैसे: 'Instagram खोलो, भोजपुरी गाना सर्च करो और पहला वीडियो चलाओ')। हर रन खत्म होने पर Gemini 3.8 खुद सारे स्क्रीनशॉट्स देखकर अगले रन के लिए अपनी मेमोरी और बेहतर कर लेगा!",
             isUser = false
         )
 
@@ -761,7 +774,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(24))
         }
 
-        // 1. Video Trainer Card
         val trainerCard = createSectionCard("📹 Frame-by-Frame Video Trainer (Gemini 3.8 Flash)")
         val catInput = createCleanInput("Instagram", "App Folder Name (e.g. Instagram, YouTube)")
         val noteInput = createCleanInput(
@@ -782,22 +794,18 @@ class MainActivity : AppCompatActivity() {
         trainerCard.addView(spacer(dp(12)))
         trainerCard.addView(pickVideoBtn)
 
-        // 2. Uploaded Training Videos Sessions List Card (With [💬 Chat with Gemini 3.8] button)
         val videoSessionsCard = createSectionCard("🎬 Uploaded Video Training Sessions (Interactive Chat)")
         videoSessionsListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         videoSessionsCard.addView(videoSessionsListLayout)
 
-        // 3. Automation Runs History Card (With [💬 Chat to Fix Run] button)
-        val runsCard = createSectionCard("🔄 Automation Runs History & Failed Task Chats")
+        val runsCard = createSectionCard("🔄 Automation Runs History (Auto-Reflected by 3.8)")
         automationRunsListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         runsCard.addView(automationRunsListLayout)
 
-        // 4. App-Wise Learned Fixes Card
         val foldersCard = createSectionCard("📁 App-Wise Learned Fixes & Playbooks")
         memoryCategoriesLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         foldersCard.addView(memoryCategoriesLayout)
 
-        // 5. Personal Profile Card
         val profileCard = createSectionCard("🔐 Personal Profile & Form Auto-Fill Memory")
         val profileInput = createCleanInput(
             vault.getUserProfileRules(),
@@ -836,7 +844,7 @@ class MainActivity : AppCompatActivity() {
 
         if (summary.isEmpty()) {
             val emptyTv = TextView(this).apply {
-                text = "अभी कोई Learned Fix नहीं है। जब भी आप टास्क के बीच में टैप करेंगे या वीडियो अपलोड करेंगे, फोल्डर बन जाएगा!"
+                text = "अभी कोई Learned Fix नहीं है। जैसे ही कोई टास्क चलेगा, Gemini 3.8 खुद स्क्रीनशॉट्स देखकर यहाँ नियम सेव कर लेगा!"
                 setTextColor(textMuted)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             }
@@ -883,10 +891,12 @@ class MainActivity : AppCompatActivity() {
             topHeader.addView(clearCatBtn)
             row.addView(topHeader)
 
-            val fixes = vault.recallFixesForApp(cat).takeLast(4)
+            val fixes = vault.recallFixesForApp(cat).takeLast(6)
             for (f in fixes) {
+                val xNorm = (f.tapXRatio * 1000).toInt()
+                val yNorm = (f.tapYRatio * 1000).toInt()
                 val item = TextView(this).apply {
-                    text = "  • [${f.sourceType}] ${f.problemDescription} ➔ ${f.solutionRule}"
+                    text = "  • [${f.sourceType}] ${f.problemDescription} ➔ ${f.solutionRule} (XY: $xNorm, $yNorm)"
                     setTextColor(textMuted)
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
                     setPadding(0, dp(4), 0, 0)
@@ -905,7 +915,7 @@ class MainActivity : AppCompatActivity() {
 
         if (runs.isEmpty()) {
             val emptyTv = TextView(this).apply {
-                text = "अभी कोई Automation Run सेव नहीं हुआ है। टास्क रन होने पर यहाँ सेव होगा।"
+                text = "अभी कोई Automation Run सेव नहीं हुआ है। टास्क रन होने पर यहाँ दिखेगा।"
                 setTextColor(textMuted)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             }
@@ -944,22 +954,46 @@ class MainActivity : AppCompatActivity() {
                 setPadding(0, dp(2), 0, dp(6))
             }
 
+            val btnRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+
             val chatWithRunBtn = TextView(this).apply {
-                text = "💬 Gemini 3.8 से चैट करके इस रन को सुधारें"
+                text = "💬 Gemini 3.8 चैट & स्क्रीनशॉट्स"
                 gravity = Gravity.CENTER
                 setTextColor(textPureWhite)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
                 typeface = Typeface.DEFAULT_BOLD
                 setPadding(dp(10), dp(8), dp(10), dp(8))
                 background = roundedBox(accentRoyalBlue, dp(8))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginEnd = dp(6)
+                }
                 setOnClickListener {
                     openAutomationRunChatDialog(run)
                 }
             }
 
+            val reRunBtn = TextView(this).apply {
+                text = "🔄 Re-Run"
+                gravity = Gravity.CENTER
+                setTextColor(textPureWhite)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                background = roundedBox(accentEmerald, dp(8))
+                setOnClickListener {
+                    AutoTouchService.instance?.startUniversalTask(run.title, emptyList())
+                        ?: Toast.makeText(this@MainActivity, "Accessibility ऑन करें!", Toast.LENGTH_SHORT).show()
+                }
+            }
+
+            btnRow.addView(chatWithRunBtn)
+            btnRow.addView(reRunBtn)
+
             card.addView(titleTv)
             card.addView(descTv)
-            card.addView(chatWithRunBtn)
+            card.addView(btnRow)
             automationRunsListLayout.addView(card)
         }
     }
@@ -971,12 +1005,58 @@ class MainActivity : AppCompatActivity() {
 
         val dialogView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setPadding(dp(14), dp(14), dp(14), dp(14))
             setBackgroundColor(bgMatteDark)
         }
 
+        val input = createCleanInput("", "भाई, यहाँ समझाओ क्या गलती हुई...").apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(6)
+            }
+        }
+
+        // Horizontal Tap-to-Pin Screenshot Strip
+        if (runRecord.screenshotPaths.isNotEmpty()) {
+            val tipTv = TextView(this).apply {
+                text = "👆 किसी भी स्क्रीनशॉट पर उंगली से टैप करके सटीक बटन पिन करें:"
+                setTextColor(textMuted)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(0, 0, 0, dp(4))
+            }
+            dialogView.addView(tipTv)
+
+            val hScroll = HorizontalScrollView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(130))
+            }
+            val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+
+            runRecord.screenshotPaths.forEachIndexed { idx, path ->
+                val bmp = vault.loadBitmapFromPath(path) ?: return@forEachIndexed
+                val imgView = ImageView(this).apply {
+                    setImageBitmap(bmp)
+                    scaleType = ImageView.ScaleType.FIT_XY
+                    layoutParams = LinearLayout.LayoutParams(dp(72), dp(124)).apply {
+                        marginEnd = dp(8)
+                    }
+                    setOnTouchListener { v, ev ->
+                        if (ev.action == MotionEvent.ACTION_UP) {
+                            val normX = ((ev.x / v.width.coerceAtLeast(1)) * 1000).toInt().coerceIn(0, 1000)
+                            val normY = ((ev.y / v.height.coerceAtLeast(1)) * 1000).toInt().coerceIn(0, 1000)
+                            val curText = input.text.toString()
+                            input.setText("$curText [Screenshot #${idx + 1} Pin XY: ($normX, $normY)] ")
+                            input.setSelection(input.text.length)
+                        }
+                        true
+                    }
+                }
+                strip.addView(imgView)
+            }
+            hScroll.addView(strip)
+            dialogView.addView(hScroll)
+        }
+
         val chatScroll = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(280), 1f)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(220), 1f)
         }
         val msgListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         chatScroll.addView(msgListLayout)
@@ -991,7 +1071,7 @@ class MainActivity : AppCompatActivity() {
             msgListLayout.addView(tv)
         }
 
-        appendMsg("Gemini 3.8", "नमस्ते भाई! मैंने '${runRecord.title}' के ${runRecord.screenshotPaths.size} स्क्रीनशॉट्स और स्टेप्स लोड कर लिए हैं। बताइए इस रन में क्या गलती हुई थी?")
+        appendMsg("Gemini 3.8", "नमस्ते भाई! मैंने '${runRecord.title}' के ${runRecord.screenshotPaths.size} स्क्रीनशॉट्स और स्टेप्स लोड कर लिए हैं।")
         for (c in runRecord.chatHistory) {
             val parts = c.split(":", limit = 2)
             if (parts.size == 2) appendMsg(parts[0].trim(), parts[1].trim())
@@ -999,14 +1079,14 @@ class MainActivity : AppCompatActivity() {
 
         val inputRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(8), 0, 0)
         }
-        val input = createCleanInput("", "भाई, यहाँ समझाओ क्या गलती हुई...")
-        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
 
         val send = TextView(this).apply {
             text = "Send ➔"
             setTextColor(textPureWhite)
+            typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(12), dp(10), dp(12), dp(10))
             background = roundedBox(accentRoyalBlue, dp(8))
         }
@@ -1052,7 +1132,7 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     appendMsg("Gemini 3.8", replyObj.replyText)
                     chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
-                    refreshMemoryFoldersList()
+                    refreshMemoryEverything()
                 }
             }
         }
@@ -1128,12 +1208,57 @@ class MainActivity : AppCompatActivity() {
 
         val dialogView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setPadding(dp(14), dp(14), dp(14), dp(14))
             setBackgroundColor(bgMatteDark)
         }
 
+        val input = createCleanInput("", "वीडियो के बारे में कुछ पूछें या सुधार बताएं...").apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(6)
+            }
+        }
+
+        if (session.framePaths.isNotEmpty()) {
+            val tipTv = TextView(this).apply {
+                text = "👆 किसी भी वीडियो फ्रेम पर टैप करके सही बटन पिन करें:"
+                setTextColor(textMuted)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(0, 0, 0, dp(4))
+            }
+            dialogView.addView(tipTv)
+
+            val hScroll = HorizontalScrollView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(130))
+            }
+            val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+
+            session.framePaths.forEachIndexed { idx, path ->
+                val bmp = vault.loadBitmapFromPath(path) ?: return@forEachIndexed
+                val imgView = ImageView(this).apply {
+                    setImageBitmap(bmp)
+                    scaleType = ImageView.ScaleType.FIT_XY
+                    layoutParams = LinearLayout.LayoutParams(dp(72), dp(124)).apply {
+                        marginEnd = dp(8)
+                    }
+                    setOnTouchListener { v, ev ->
+                        if (ev.action == MotionEvent.ACTION_UP) {
+                            val normX = ((ev.x / v.width.coerceAtLeast(1)) * 1000).toInt().coerceIn(0, 1000)
+                            val normY = ((ev.y / v.height.coerceAtLeast(1)) * 1000).toInt().coerceIn(0, 1000)
+                            val curText = input.text.toString()
+                            input.setText("$curText [Frame #${idx + 1} Pin XY: ($normX, $normY)] ")
+                            input.setSelection(input.text.length)
+                        }
+                        true
+                    }
+                }
+                strip.addView(imgView)
+            }
+            hScroll.addView(strip)
+            dialogView.addView(hScroll)
+        }
+
         val chatScroll = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(280), 1f)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(220), 1f)
         }
         val msgListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         chatScroll.addView(msgListLayout)
@@ -1148,7 +1273,7 @@ class MainActivity : AppCompatActivity() {
             msgListLayout.addView(tv)
         }
 
-        appendMsg("Gemini 3.8", "नमस्ते भाई! मैंने इस वीडियो के ${session.framePaths.size} फ्रेम्स और आपके निर्देश (${session.userNote}) देख लिए हैं। बताइए क्या सुधार करना है?")
+        appendMsg("Gemini 3.8", "नमस्ते भाई! मैंने इस वीडियो के ${session.framePaths.size} फ्रेम्स देख लिए हैं। बताइए क्या सुधार करना है?")
         for (c in session.chatHistory) {
             val parts = c.split(":", limit = 2)
             if (parts.size == 2) appendMsg(parts[0].trim(), parts[1].trim())
@@ -1156,14 +1281,14 @@ class MainActivity : AppCompatActivity() {
 
         val inputRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(8), 0, 0)
         }
-        val input = createCleanInput("", "वीडियो के बारे में कुछ पूछें या सुधार बताएं...")
-        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
 
         val send = TextView(this).apply {
             text = "Send ➔"
             setTextColor(textPureWhite)
+            typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(12), dp(10), dp(12), dp(10))
             background = roundedBox(accentRoyalBlue, dp(8))
         }
@@ -1209,7 +1334,7 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     appendMsg("Gemini 3.8", replyObj.replyText)
                     chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
-                    refreshMemoryFoldersList()
+                    refreshMemoryEverything()
                 }
             }
         }
@@ -1290,7 +1415,7 @@ class MainActivity : AppCompatActivity() {
 
         val ladderInfo = TextView(this).apply {
             text = AutoTouchService.instance?.geminiBrain?.getActiveModelListStatus()
-                ?: "✅ gemini-3.1-flash-lite (Fastest Free First)\n✅ gemini-3.5-flash-lite\n✅ gemini-3.8-flash (Agent & Video/Touch Brain)\n✅ gemini-robotics-er-2-preview"
+                ?: "✅ gemini-3.1-flash-lite (Fastest Free First)\n✅ gemini-3.5-flash-lite\n✅ gemini-3.8-flash (Post-Run Auto-Reflection & Video Brain)\n✅ gemini-robotics-er-2-preview"
             setTextColor(textMuted)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setPadding(0, dp(10), 0, 0)
@@ -1339,7 +1464,7 @@ class MainActivity : AppCompatActivity() {
                     "• Real Full-Screen Pixels: ${specs.screenWidth} × ${specs.screenHeight} px\n" +
                     "• Top Punch-Hole / Cutout Safe Zone: 0 to ${specs.cutoutSafeTop} px\n" +
                     "• Bottom Nav Bar Height: ${specs.navBarHeight} px\n" +
-                    "• Screenshot Engine: HD WebP + Before/After Touch Capture"
+                    "• Post-Run Auto-Reflection: Gemini 3.8 Flash Active"
             } else {
                 "Enable Accessibility Service below to calibrate your screen, notch & punch-hole cutout."
             }
@@ -1399,9 +1524,9 @@ class MainActivity : AppCompatActivity() {
         if (!::liveLogsTextView.isInitialized) return
         val inMemory = synchronized(AutoTouchService.liveLogs) { AutoTouchService.liveLogs.toList() }
         val lines = if (inMemory.isNotEmpty()) {
-            inMemory.take(40)
+            inMemory.take(45)
         } else {
-            (AutoTouchService.instance?.memoryVault ?: MemoryVault(this)).getPersistentLogs().take(40)
+            (AutoTouchService.instance?.memoryVault ?: MemoryVault(this)).getPersistentLogs().take(45)
         }
         liveLogsTextView.text = if (lines.isEmpty()) {
             "No logs yet. Start any task or change a setting to see live history here."
