@@ -1,4 +1,3 @@
-```kotlin
 package com.auradroid.os
 
 import android.accessibilityservice.AccessibilityService
@@ -975,9 +974,10 @@ class AutoTouchService : AccessibilityService() {
                 it.solutionRule.contains("Next", true) && it.tapYRatio > 0.85f
             }
 
+            val fallbackNextX = if (attempt == 1) (specs.screenWidth * 0.89f).toInt() else (specs.screenWidth * 0.74f).toInt()
             val tapX = nextNode?.centerX
                 ?: learnedNext?.let { (it.tapXRatio * specs.screenWidth).toInt() }
-                ?: if (attempt == 1) (specs.screenWidth * 0.89f).toInt() else (specs.screenWidth * 0.74f).toInt()
+                ?: fallbackNextX
             val tapY = nextNode?.centerY
                 ?: learnedNext?.let { (it.tapYRatio * specs.screenHeight).toInt() }
                 ?: (specs.screenHeight * 0.96f).toInt()
@@ -1566,8 +1566,11 @@ class AutoTouchService : AccessibilityService() {
                 for (const el of allEls) {
                     if (el.children.length === 0) {
                         const txt = (el.innerText || '').trim();
-                        if (/^\d{1,3}%$/.test(txt)) {
-                            return 'PROGRESS:' + txt;
+                        if (txt.endsWith('%') && txt.length >= 2 && txt.length <= 4) {
+                            const num = parseInt(txt.slice(0, -1), 10);
+                            if (!isNaN(num) && num >= 0 && num <= 100) {
+                                return 'PROGRESS:' + txt;
+                            }
                         }
                     }
                 }
