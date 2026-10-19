@@ -1015,7 +1015,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Horizontal Tap-to-Pin Screenshot Strip
         if (runRecord.screenshotPaths.isNotEmpty()) {
             val tipTv = TextView(this).apply {
                 text = "👆 किसी भी स्क्रीनशॉट पर उंगली से टैप करके सटीक बटन पिन करें:"
@@ -1061,9 +1060,9 @@ class MainActivity : AppCompatActivity() {
         val msgListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         chatScroll.addView(msgListLayout)
 
-        fun appendMsg(sender: String, text: String) {
+        fun appendMsg(sender: String, msgText: String) {
             val tv = TextView(this).apply {
-                text = "$sender: $text"
+                setText("$sender: $msgText")
                 setTextColor(if (sender == "User") Color.parseColor("#60A5FA") else accentEmerald)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                 setPadding(0, dp(4), 0, dp(4))
@@ -1104,17 +1103,17 @@ class MainActivity : AppCompatActivity() {
             .create()
 
         send.setOnClickListener {
-            val text = input.text.toString().trim()
-            if (text.isEmpty()) return@setOnClickListener
+            val userText = input.text.toString().trim()
+            if (userText.isEmpty()) return@setOnClickListener
             input.setText("")
-            appendMsg("User", text)
-            vault.appendChatToAutomationRun(runRecord.runId, "User", text)
+            appendMsg("User", userText)
+            vault.appendChatToAutomationRun(runRecord.runId, "User", userText)
 
             uiScope.launch(Dispatchers.IO) {
                 val b64Imgs = vault.loadSavedImagesAsBase64(runRecord.screenshotPaths, maxImages = 6)
                 val replyObj = brain.chatAboutAutomationRunWith38Flash(
                     runRecord = runRecord,
-                    userCorrectionMessage = text,
+                    userCorrectionMessage = userText,
                     screenshotsBase64 = b64Imgs
                 )
 
@@ -1263,9 +1262,9 @@ class MainActivity : AppCompatActivity() {
         val msgListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         chatScroll.addView(msgListLayout)
 
-        fun appendMsg(sender: String, text: String) {
+        fun appendMsg(sender: String, msgText: String) {
             val tv = TextView(this).apply {
-                text = "$sender: $text"
+                setText("$sender: $msgText")
                 setTextColor(if (sender == "User") Color.parseColor("#60A5FA") else accentEmerald)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                 setPadding(0, dp(4), 0, dp(4))
@@ -1306,17 +1305,17 @@ class MainActivity : AppCompatActivity() {
             .create()
 
         send.setOnClickListener {
-            val text = input.text.toString().trim()
-            if (text.isEmpty()) return@setOnClickListener
+            val userText = input.text.toString().trim()
+            if (userText.isEmpty()) return@setOnClickListener
             input.setText("")
-            appendMsg("User", text)
-            vault.appendChatToVideoSession(session.sessionId, "User", text)
+            appendMsg("User", userText)
+            vault.appendChatToVideoSession(session.sessionId, "User", userText)
 
             uiScope.launch(Dispatchers.IO) {
                 val b64Frames = vault.loadSavedImagesAsBase64(session.framePaths, maxImages = 10)
                 val replyObj = brain.chatAboutTrainingVideoWith38Flash(
                     videoSession = session,
-                    userMessage = text,
+                    userMessage = userText,
                     videoFramesBase64 = b64Frames
                 )
 
