@@ -2,6 +2,7 @@ package com.auradroid.os
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.util.Base64
@@ -16,7 +17,7 @@ import java.util.Locale
 data class LearnedFixRecord(
     val id: String,
     val appCategory: String,
-    val sourceType: String,         // "HUMAN_TOUCH_FIX" or "VIDEO_FRAME_TRAINING"
+    val sourceType: String,         // "HUMAN_TOUCH_FIX", "VIDEO_FRAME_TRAINING", "RUN_CHAT_CORRECTION", "VIDEO_CHAT_CORRECTION"
     val screenSignature: String,
     val problemDescription: String,
     val solutionRule: String,
@@ -25,18 +26,44 @@ data class LearnedFixRecord(
     val timestamp: String
 )
 
+data class AutomationRunRecord(
+    val runId: String,
+    val title: String,
+    val appCategory: String,
+    val status: String,             // "SUCCESS", "FAILED", "STOPPED", "RUNNING"
+    val timestamp: String,
+    val stepsSummary: List<String>,
+    val screenshotPaths: List<String>,
+    val chatHistory: List<String>
+)
+
+data class VideoTrainingSession(
+    val sessionId: String,
+    val appCategory: String,
+    val userNote: String,
+    val timestamp: String,
+    val framePaths: List<String>,
+    val extractedRulesSummary: List<String>,
+    val chatHistory: List<String>
+)
+
 class MemoryVault(private val context: Context) {
 
     private val rootDir: File = File(context.filesDir, "Memory").apply {
         if (!exists()) mkdirs()
     }
 
+    private val runsDir: File = File(rootDir, "AutomationRuns").apply {
+        if (!exists()) mkdirs()
+    }
+
+    private val videosDir: File = File(rootDir, "VideoSessions").apply {
+        if (!exists()) mkdirs()
+    }
+
     private val profileFile: File = File(rootDir, "user_profile_rules.json")
     private val persistentLogsFile: File = File(rootDir, "system_action_logs.txt")
 
-    /**
-     * App-Specific Folder Name Resolver (Memory/Instagram, Memory/YouTube, Memory/WhatsApp, etc.)
-     */
     fun resolveCategoryFolder(packageName: String, taskGoal: String): String {
         val combined = "$packageName $taskGoal".lowercase(Locale.ROOT)
         return when {
@@ -51,12 +78,12 @@ class MemoryVault(private val context: Context) {
     }
 
     private fun getCategoryDir(category: String): File {
-        return File(rootDir, category).apply { if (!exists()) mkdirs() }
+        val clean = category.trim().replaceFirstChar { it.uppercase() }.ifEmpty { "General" }
+        return File(rootDir, clean).apply { if (!exists()) mkdirs() }
     }
 
     /**
-     * Saves Before + After Human Touch Fix or Frame-by-Frame Video Training Rule
-     * into Memory/<AppCategory>/fixes.json along with WebP screenshots.
+     * Saves any Learned Rule (from Human Touch, Video Frame Training, Run Review Chat, or Video Chat)
      */
     @Suppress("DEPRECATION")
     fun saveStuckOrHumanFix(
@@ -109,10 +136,6 @@ class MemoryVault(private val context: Context) {
         fixesFile.writeText(arr.toString(2))
     }
 
-    /**
-     * Loads all Learned Human Touch Fixes & Video-Trained Rules for an App Category
-     * so the AI applies them right from Step 1 on future runs!
-     */
     fun recallFixesForApp(category: String): List<LearnedFixRecord> {
         val catDir = getCategoryDir(category)
         val fixesFile = File(catDir, "fixes.json")
@@ -138,11 +161,13 @@ class MemoryVault(private val context: Context) {
                 )
             }
         } catch (_: Exception) {}
-        return result.takeLast(18)
+        return result.takeLast(20)
     }
 
     fun getAllCategoriesSummary(): List<Pair<String, Int>> {
-        val folders = rootDir.listFiles()?.filter { it.isDirectory } ?: return emptyList()
+        val folders = rootDir.listFiles()?.filter {
+            it.isDirectory && it.name != "AutomationRuns" && it.name != "VideoSessions"
+        } ?: return emptyList()
         return folders.map { folder ->
             val fixesFile = File(folder, "fixes.json")
             val count = if (fixesFile.exists()) {
@@ -152,42 +177,268 @@ class MemoryVault(private val context: Context) {
         }.sortedByDescending { it.second }
     }
 
-    /**
-     * Extracts up to 12 sequential high-clarity frames across an uploaded screen-recording video
-     * so Gemini 3.8 Flash can inspect every single tap, mistake, and screen transition!
-     */
+    // =========================================================================
+    // 1. AUTOMATION RUN SESSIONS (Save every run + Screenshots + Interactive Chat)
+    // =========================================================================
+
     @Suppress("DEPRECATION")
-    fun extractKeyFramesBase64FromVideo(videoUri: Uri, maxFrames: Int = 12): List<String> {
-        val frames = mutableListOf<String>()
+    fun saveAutomationRunSession(
+        runId: String,
+        title: String,
+        appCategory: String,
+        status: String,
+        stepsSummary: List<String>,
+        capturedBitmaps: List<Bitmap>,
+        existingChat: List<String> = emptyList()
+    ): AutomationRunRecord {
+        val runFolder = File(runsDir, runId).apply { if (!exists()) mkdirs() }
+        val savedPaths = mutableListOf<String>()
+
+        capturedBitmaps.takeLast(8).forEachIndexed { idx, bmp ->
+            try {
+                val imgFile = File(runFolder, "step_${idx + 1}.webp")
+                imgFile.outputStream().use { out ->
+                    bmp.compress(Bitmap.CompressFormat.WEBP, 80, out)
+                }
+                savedPaths.add(imgFile.absolutePath)
+            } catch (_: Exception) {}
+        }
+
+        val timestamp = SimpleDateFormat("dd MMM HH:mm:ss", Locale.getDefault()).format(Date())
+        val metaFile = File(runFolder, "run_meta.json")
+        val json = JSONObject().apply {
+            put("runId", runId)
+            put("title", title)
+            put("appCategory", appCategory)
+            put("status", status)
+            put("timestamp", timestamp)
+            put("stepsSummary", JSONArray(stepsSummary))
+            put("screenshotPaths", JSONArray(savedPaths))
+            put("chatHistory", JSONArray(existingChat))
+        }
+        metaFile.writeText(json.toString(2))
+
+        return AutomationRunRecord(
+            runId = runId,
+            title = title,
+            appCategory = appCategory,
+            status = status,
+            timestamp = timestamp,
+            stepsSummary = stepsSummary,
+            screenshotPaths = savedPaths,
+            chatHistory = existingChat
+        )
+    }
+
+    fun appendChatToAutomationRun(runId: String, sender: String, message: String) {
+        val runFolder = File(runsDir, runId)
+        val metaFile = File(runFolder, "run_meta.json")
+        if (!metaFile.exists()) return
+        try {
+            val j = JSONObject(metaFile.readText())
+            val chatArr = j.optJSONArray("chatHistory") ?: JSONArray()
+            chatArr.put("$sender: $message")
+            j.put("chatHistory", chatArr)
+            metaFile.writeText(j.toString(2))
+        } catch (_: Exception) {}
+    }
+
+    fun getAllAutomationRuns(): List<AutomationRunRecord> {
+        val folders = runsDir.listFiles()?.filter { it.isDirectory }?.sortedByDescending { it.lastModified() }
+            ?: return emptyList()
+        val list = mutableListOf<AutomationRunRecord>()
+        for (folder in folders.take(20)) {
+            val metaFile = File(folder, "run_meta.json")
+            if (!metaFile.exists()) continue
+            try {
+                val j = JSONObject(metaFile.readText())
+                val steps = mutableListOf<String>()
+                val sArr = j.optJSONArray("stepsSummary") ?: JSONArray()
+                for (i in 0 until sArr.length()) steps.add(sArr.optString(i))
+
+                val paths = mutableListOf<String>()
+                val pArr = j.optJSONArray("screenshotPaths") ?: JSONArray()
+                for (i in 0 until pArr.length()) paths.add(pArr.optString(i))
+
+                val chats = mutableListOf<String>()
+                val cArr = j.optJSONArray("chatHistory") ?: JSONArray()
+                for (i in 0 until cArr.length()) chats.add(cArr.optString(i))
+
+                list.add(
+                    AutomationRunRecord(
+                        runId = j.optString("runId", folder.name),
+                        title = j.optString("title", "Task Run"),
+                        appCategory = j.optString("appCategory", "General"),
+                        status = j.optString("status", "STOPPED"),
+                        timestamp = j.optString("timestamp", ""),
+                        stepsSummary = steps,
+                        screenshotPaths = paths,
+                        chatHistory = chats
+                    )
+                )
+            } catch (_: Exception) {}
+        }
+        return list
+    }
+
+    // =========================================================================
+    // 2. VIDEO TRAINING SESSIONS (Save extracted frames + Interactive Video Chat)
+    // =========================================================================
+
+    @Suppress("DEPRECATION")
+    fun createVideoTrainingSession(
+        appCategory: String,
+        userNote: String,
+        videoUri: Uri,
+        maxFrames: Int = 12
+    ): Pair<VideoTrainingSession, List<String>> {
+        val sessionId = "vid_${System.currentTimeMillis()}"
+        val sessionFolder = File(videosDir, sessionId).apply { if (!exists()) mkdirs() }
+        val framePaths = mutableListOf<String>()
+        val framesBase64 = mutableListOf<String>()
+
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(context, videoUri)
             val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-            if (durationMs <= 0L) return emptyList()
+            if (durationMs > 0L) {
+                val safeCount = maxFrames.coerceIn(4, 12)
+                val stepMs = (durationMs / (safeCount + 1)).coerceAtLeast(400L)
+                for (i in 1..safeCount) {
+                    val timeUs = (stepMs * i) * 1000L
+                    val bmp = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: continue
+                    val ratio = bmp.width.toFloat() / bmp.height.toFloat()
+                    val targetH = 960
+                    val targetW = (targetH * ratio).toInt().coerceAtLeast(360)
+                    val scaled = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
 
-            val safeCount = maxFrames.coerceIn(4, 14)
-            val stepMs = (durationMs / (safeCount + 1)).coerceAtLeast(400L)
-            for (i in 1..safeCount) {
-                val timeUs = (stepMs * i) * 1000L
-                val bmp = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: continue
-                val ratio = bmp.width.toFloat() / bmp.height.toFloat()
-                val targetH = 960
-                val targetW = (targetH * ratio).toInt().coerceAtLeast(360)
-                val scaled = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
-                val bos = ByteArrayOutputStream()
-                scaled.compress(Bitmap.CompressFormat.WEBP, 82, bos)
-                frames.add(Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP))
+                    val frameFile = File(sessionFolder, "frame_$i.webp")
+                    frameFile.outputStream().use { out ->
+                        scaled.compress(Bitmap.CompressFormat.WEBP, 82, out)
+                    }
+                    framePaths.add(frameFile.absolutePath)
+
+                    val bos = ByteArrayOutputStream()
+                    scaled.compress(Bitmap.CompressFormat.WEBP, 82, bos)
+                    framesBase64.add(Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP))
+                }
             }
         } catch (_: Exception) {
         } finally {
             try { retriever.release() } catch (_: Exception) {}
         }
-        return frames
+
+        val timestamp = SimpleDateFormat("dd MMM HH:mm", Locale.getDefault()).format(Date())
+        val session = VideoTrainingSession(
+            sessionId = sessionId,
+            appCategory = appCategory,
+            userNote = userNote,
+            timestamp = timestamp,
+            framePaths = framePaths,
+            extractedRulesSummary = emptyList(),
+            chatHistory = listOf("User Note: $userNote")
+        )
+        saveVideoTrainingSessionMeta(session)
+        return Pair(session, framesBase64)
+    }
+
+    fun saveVideoTrainingSessionMeta(session: VideoTrainingSession) {
+        val sessionFolder = File(videosDir, session.sessionId).apply { if (!exists()) mkdirs() }
+        val metaFile = File(sessionFolder, "video_meta.json")
+        val json = JSONObject().apply {
+            put("sessionId", session.sessionId)
+            put("appCategory", session.appCategory)
+            put("userNote", session.userNote)
+            put("timestamp", session.timestamp)
+            put("framePaths", JSONArray(session.framePaths))
+            put("extractedRulesSummary", JSONArray(session.extractedRulesSummary))
+            put("chatHistory", JSONArray(session.chatHistory))
+        }
+        metaFile.writeText(json.toString(2))
+    }
+
+    fun appendChatToVideoSession(sessionId: String, sender: String, message: String, newRuleAdded: String? = null) {
+        val sessionFolder = File(videosDir, sessionId)
+        val metaFile = File(sessionFolder, "video_meta.json")
+        if (!metaFile.exists()) return
+        try {
+            val j = JSONObject(metaFile.readText())
+            val chatArr = j.optJSONArray("chatHistory") ?: JSONArray()
+            chatArr.put("$sender: $message")
+            j.put("chatHistory", chatArr)
+
+            if (!newRuleAdded.isNullOrBlank()) {
+                val rulesArr = j.optJSONArray("extractedRulesSummary") ?: JSONArray()
+                rulesArr.put(newRuleAdded)
+                j.put("extractedRulesSummary", rulesArr)
+            }
+            metaFile.writeText(j.toString(2))
+        } catch (_: Exception) {}
+    }
+
+    fun getAllVideoTrainingSessions(): List<VideoTrainingSession> {
+        val folders = videosDir.listFiles()?.filter { it.isDirectory }?.sortedByDescending { it.lastModified() }
+            ?: return emptyList()
+        val list = mutableListOf<VideoTrainingSession>()
+        for (folder in folders.take(15)) {
+            val metaFile = File(folder, "video_meta.json")
+            if (!metaFile.exists()) continue
+            try {
+                val j = JSONObject(metaFile.readText())
+                val fPaths = mutableListOf<String>()
+                val fArr = j.optJSONArray("framePaths") ?: JSONArray()
+                for (i in 0 until fArr.length()) fPaths.add(fArr.optString(i))
+
+                val rules = mutableListOf<String>()
+                val rArr = j.optJSONArray("extractedRulesSummary") ?: JSONArray()
+                for (i in 0 until rArr.length()) rules.add(rArr.optString(i))
+
+                val chats = mutableListOf<String>()
+                val cArr = j.optJSONArray("chatHistory") ?: JSONArray()
+                for (i in 0 until cArr.length()) chats.add(cArr.optString(i))
+
+                list.add(
+                    VideoTrainingSession(
+                        sessionId = j.optString("sessionId", folder.name),
+                        appCategory = j.optString("appCategory", "General"),
+                        userNote = j.optString("userNote", ""),
+                        timestamp = j.optString("timestamp", ""),
+                        framePaths = fPaths,
+                        extractedRulesSummary = rules,
+                        chatHistory = chats
+                    )
+                )
+            } catch (_: Exception) {}
+        }
+        return list
     }
 
     /**
-     * Persistent System & Action Log History (For the new Logs Section)
+     * Loads saved WebP files from disk as Base64 so Gemini 3.8 Flash can see them during Run Chat or Video Chat!
      */
+    fun loadSavedImagesAsBase64(paths: List<String>, maxImages: Int = 6): List<String> {
+        val result = mutableListOf<String>()
+        for (path in paths.takeLast(maxImages)) {
+            try {
+                val f = File(path)
+                if (f.exists()) {
+                    val bytes = f.readBytes()
+                    result.add(Base64.encodeToString(bytes, Base64.NO_WRAP))
+                }
+            } catch (_: Exception) {}
+        }
+        return result
+    }
+
+    fun loadBitmapFromPath(path: String): Bitmap? {
+        return try {
+            val f = File(path)
+            if (f.exists()) BitmapFactory.decodeFile(f.absolutePath) else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun appendPersistentLog(logLine: String) {
         try {
             val existing = if (persistentLogsFile.exists()) persistentLogsFile.readLines() else emptyList()
