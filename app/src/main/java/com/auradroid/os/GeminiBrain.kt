@@ -51,27 +51,37 @@ data class PostRunReflectionResult(
 
 class GeminiBrain(private var apiKey: String) {
 
-    // 100% Free-Tier Fastest -> Smartest Model Ladder
+    // LOW TASK LADDER: Fastest Free-Tier Models (3.5 Flash-Lite -> 3.8 Flash fallback)
+    // Used for fast UI tapping, normal steps, quick planning & simple prompts
     private val freeTierFastLadder = mutableListOf(
-        "gemini-3.1-flash-lite",
         "gemini-3.5-flash-lite",
-        "gemini-flash-lite-latest",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "gemini-3.7-flash",
         "gemini-3.8-flash",
-        "gemini-flash-latest",
-        "gemini-robotics-er-2-preview",
-        "gemma-4-31b-it",
-        "gemma-4-26b-a4b-it",
-        "gemini-3.1-pro-preview"
+        "gemini-flash-lite-latest"
     )
 
-    // Dedicated Gemini 3.8 Flash Brain for Post-Run Auto-Reflection, Run Review Chat, Video Chat & Touch Learning
+    // HIGH TASK LADDER: Smartest Free-Tier Models (3.8 Flash -> 3.5 Flash-Lite fallback)
+    // Used for Stuck Recovery, Pure Vision Coordinates, Post-Run Reflection, Video & Touch Learning
     private val deep38FlashLadder = listOf(
         "gemini-3.8-flash",
-        "gemini-flash-latest",
-        "gemini-robotics-er-2-preview",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-        "gemini-3.1-pro-preview"
+        "gemini-flash-latest"
+    )
+
+    // Strictly allowed 3.5 - 3.8 Free-Tier Flash family
+    private val allowedFreeModels = listOf(
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest"
     )
 
     private val blockedModels = mutableSetOf<String>()
@@ -85,12 +95,13 @@ class GeminiBrain(private var apiKey: String) {
 
     fun getActiveModelListStatus(): String {
         val now = System.currentTimeMillis()
-        return freeTierFastLadder.joinToString("\n") { m ->
+        return allowedFreeModels.joinToString("\n") { m ->
             val cooldownUntil = quotaCooldownModels[m] ?: 0L
+            val roleTag = if (m == "gemini-3.8-flash" || m == "gemini-3.7-flash") "High-Task" else "Low-Task/Fast"
             when {
-                blockedModels.contains(m) -> "🚫 $m (Blocked - Not Available)"
-                cooldownUntil > now -> "⏳ $m (Quota Cooldown - Skipped)"
-                else -> "✅ $m (Active Free-Tier)"
+                blockedModels.contains(m) -> "🚫 $m ($roleTag - Blocked/Unavailable)"
+                cooldownUntil > now -> "⏳ $m ($roleTag - Quota Cooldown)"
+                else -> "✅ $m ($roleTag - Active Free-Tier)"
             }
         }
     }
@@ -132,7 +143,7 @@ class GeminiBrain(private var apiKey: String) {
             quotaCooldownModels.clear()
             baseLadder.filter { !blockedModels.contains(it) }.ifEmpty {
                 blockedModels.clear()
-                freeTierFastLadder
+                baseLadder
             }
         }
 
@@ -145,15 +156,16 @@ class GeminiBrain(private var apiKey: String) {
                     }
                 }
                 429 -> {
+                    // Quota exhausted on this model -> Cooldown for 3 minutes & switch to next model in ladder
                     quotaCooldownModels[model] = System.currentTimeMillis() + 180_000L
-                    onBrainLog?.invoke("⚠️ Quota full on [$model] (429) -> Switching to next free model...")
+                    onBrainLog?.invoke("⚠️ Quota full on [$model] (429) -> Switching to next 3.5/3.8 free model...")
                 }
                 404, 403, 400 -> {
                     blockedModels.add(model)
-                    onBrainLog?.invoke("🚫 Model [$model] unavailable (${result.first}) -> Blocked & skipping...")
+                    onBrainLog?.invoke("🚫 Model [$model] unavailable (${result.first}) -> Skipping...")
                 }
                 else -> {
-                    onBrainLog?.invoke("🔄 Model [$model] busy (${result.first}) -> Trying next model...")
+                    onBrainLog?.invoke("🔄 Model [$model] busy (${result.first}) -> Trying next free model...")
                 }
             }
         }
@@ -197,6 +209,7 @@ class GeminiBrain(private var apiKey: String) {
                 put("contents", JSONArray().put(JSONObject().put("parts", partsArray)))
                 put("generationConfig", JSONObject().apply {
                     put("temperature", 0.15)
+                    put("responseMimeType", "application/json")
                 })
             }
 
@@ -232,7 +245,13 @@ class GeminiBrain(private var apiKey: String) {
             val arr = JSONObject(conn.inputStream.bufferedReader().readText()).optJSONArray("models") ?: return null
             for (i in 0 until arr.length()) {
                 val name = arr.getJSONObject(i).optString("name").removePrefix("models/")
-                if (name.contains("flash") && !name.contains("tts") && !name.contains("image") && !blockedModels.contains(name)) {
+                val is35to38Flash = (name.startsWith("gemini-3.5-flash") ||
+                        name.startsWith("gemini-3.6-flash") ||
+                        name.startsWith("gemini-3.7-flash") ||
+                        name.startsWith("gemini-3.8-flash")) &&
+                        !name.contains("tts") &&
+                        !name.contains("image")
+                if (is35to38Flash && !blockedModels.contains(name)) {
                     if (!freeTierFastLadder.contains(name)) {
                         freeTierFastLadder.add(0, name)
                     }
@@ -246,7 +265,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 1. Interactive Chat & Detailed Task Planner
+     * 1. Interactive Chat & Detailed Task Planner (LOW TASK -> Uses 3.5 Flash-Lite first for instant reply)
      */
     suspend fun chatAndBuildDetailedPlan(
         userMessage: String,
@@ -294,6 +313,8 @@ class GeminiBrain(private var apiKey: String) {
 
     /**
      * 2. Real-Time Vision + Learned Playbook Step Engine
+     * - Normal steps with UI tags (LOW TASK) -> Uses 3.5 Flash-Lite for high speed
+     * - Stuck state OR Pure Vision without UI tags (HIGH TASK) -> Automatically upgrades to 3.8 Flash!
      */
     suspend fun decideNextStep(
         goal: String,
@@ -374,7 +395,10 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        val (raw, modelUsed) = callWithLadder(prompt, imgList, useDeep38Flash = isStuck)
+        // High Task if agent is stuck OR screen has no accessibility tags (requires pure 3.8 Flash vision)
+        val isHighTaskStep = isStuck || numberedNodesList.isBlank()
+        val (raw, modelUsed) = callWithLadder(prompt, imgList, useDeep38Flash = isHighTaskStep)
+
         return try {
             val j = parseCleanJson(raw)
             AgentStepDecision(
@@ -395,13 +419,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 3. NEW: Post-Run Automatic Self-Reflection & Optimization by Gemini 3.8 Flash!
-     * Triggered automatically whenever ANY automation finishes, stops, or fails.
-     * Gemini 3.8 compares:
-     * - What the Goal & Planned Steps were
-     * - What Steps were actually taken
-     * - All Screenshots captured during the run
-     * And saves optimized rules into Memory/<AppCategory> so the next run is faster and 100% accurate!
+     * 3. Post-Run Automatic Self-Reflection & Optimization (HIGH TASK -> Uses Gemini 3.8 Flash)
      */
     suspend fun autoReflectAndImproveAfterRun(
         appCategory: String,
@@ -480,7 +498,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 4. Interactive Chat Inside Any Past Automation Run (Powered by Gemini 3.8 Flash)
+     * 4. Interactive Chat Inside Any Past Automation Run (HIGH TASK -> Uses Gemini 3.8 Flash)
      */
     suspend fun chatAboutAutomationRunWith38Flash(
         runRecord: AutomationRunRecord,
@@ -536,7 +554,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 5. Interactive Chat Inside Any Uploaded Training Video (Powered by Gemini 3.8 Flash)
+     * 5. Interactive Chat Inside Any Uploaded Training Video (HIGH TASK -> Uses Gemini 3.8 Flash)
      */
     suspend fun chatAboutTrainingVideoWith38Flash(
         videoSession: VideoTrainingSession,
@@ -591,7 +609,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 6. Before + After Screenshot Human Touch Analyzer
+     * 6. Before + After Screenshot Human Touch Analyzer (HIGH TASK -> Uses Gemini 3.8 Flash)
      */
     suspend fun analyzeBeforeAfterHumanTouchWith38Flash(
         appCategory: String,
@@ -637,7 +655,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 7. Frame-by-Frame Uploaded Video Analyzer
+     * 7. Frame-by-Frame Uploaded Video Analyzer (HIGH TASK -> Uses Gemini 3.8 Flash)
      */
     suspend fun analyzeTrainingVideoFrames(
         appCategory: String,
@@ -709,7 +727,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 8. Safe Video Prompt + Viral YouTube Shorts Title Generator
+     * 8. Safe Video Prompt + Viral YouTube Shorts Title Generator (LOW TASK -> Uses 3.5 Flash-Lite)
      */
     suspend fun generateFlowSafePromptAndTitle(topic: String): Pair<String, String> {
         val safeRegex = Regex("(?i)\\b(boy|girl|child|kid|minor|baby|skin)\\b")
