@@ -43,8 +43,11 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -54,6 +57,7 @@ import java.io.File
 class MainActivity : AppCompatActivity() {
 
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var logAutoRefreshJob: Job? = null
 
     private val bgMatteDark = Color.parseColor("#121316")
     private val cardSlate = Color.parseColor("#1C1F26")
@@ -63,12 +67,14 @@ class MainActivity : AppCompatActivity() {
     private val accentRoyalBlue = Color.parseColor("#3B82F6")
     private val accentEmerald = Color.parseColor("#10B981")
 
+    private var currentTabIndex = 0
     private lateinit var serviceBadge: TextView
     private lateinit var tabContainers: Array<View>
     private lateinit var bottomNavButtons: Array<TextView>
 
     private lateinit var chatMessagesLayout: LinearLayout
     private lateinit var chatInputBox: EditText
+    private lateinit var planSendBtn: TextView
     private val chatHistoryBuilder = StringBuilder()
 
     private lateinit var folderPathEditText: EditText
@@ -85,7 +91,13 @@ class MainActivity : AppCompatActivity() {
     private var selectedTrainingNote = "इस वीडियो के हर फ्रेम को देखो, जहाँ गलती हुई है उसे सुधारो और सही बटन के कोऑर्डिनेट सेव कर लो"
 
     private lateinit var liveLogsTextView: TextView
+    private lateinit var ladderInfoTextView: TextView
+    private lateinit var calibratedSpecsTextView: TextView
     private lateinit var engineScrollView: ScrollView
+
+    // Shared fallback instances when Accessibility Service isn't active yet
+    private lateinit var localVault: MemoryVault
+    private lateinit var localBrain: GeminiBrain
 
     companion object {
         private const val REQ_VOICE_INPUT = 201
@@ -98,6 +110,12 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         window.statusBarColor = bgMatteDark
         window.navigationBarColor = Color.parseColor("#181B20")
+
+        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+        localVault = MemoryVault(this)
+        localBrain = GeminiBrain(prefs.getString("gemini_api_key", "") ?: "").apply {
+            onBrainLog = { msg -> AutoTouchService.log(msg) }
+        }
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -135,8 +153,8 @@ class MainActivity : AppCompatActivity() {
             ).apply { marginEnd = dp(8) }
             setOnClickListener {
                 switchTab(4)
-                refreshLiveLogsBox()
-                engineScrollView.post { engineScrollView.fullScroll(View.FOCUS_DOWN) }
+                refreshEngineTabDetails()
+                engineScrollView.post { engineScrollView.fullScroll(View.FOCUS_UP) }
             }
         }
 
@@ -204,7 +222,33 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshServiceBadge()
-        refreshLiveLogsBox()
+        refreshEngineTabDetails()
+        if (currentTabIndex == 3) refreshMemoryEverything()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (currentTabIndex == 2 && studioWebView?.canGoBack() == true) {
+            studioWebView?.goBack()
+            return
+        }
+        if (currentTabIndex != 0) {
+            switchTab(0)
+            return
+        }
+        @Suppress("DEPRECATION")
+        super.onBackPressed()
+    }
+
+    private fun getActiveBrain(): GeminiBrain {
+        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+        val savedKey = prefs.getString("gemini_api_key", "") ?: ""
+        localBrain.updateApiKey(savedKey)
+        return AutoTouchService.instance?.geminiBrain?.also { it.updateApiKey(savedKey) } ?: localBrain
+    }
+
+    private fun getActiveVault(): MemoryVault {
+        return AutoTouchService.instance?.memoryVault ?: localVault
     }
 
     private fun refreshServiceBadge() {
@@ -243,6 +287,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun switchTab(index: Int) {
+        currentTabIndex = index
         tabContainers.forEachIndexed { i, v ->
             v.visibility = if (i == index) View.VISIBLE else View.GONE
         }
@@ -255,8 +300,19 @@ class MainActivity : AppCompatActivity() {
                 btn.background = null
             }
         }
-        if (index == 3) refreshMemoryEverything()
-        if (index == 4) refreshLiveLogsBox()
+
+        logAutoRefreshJob?.cancel()
+        if (index == 3) {
+            refreshMemoryEverything()
+        } else if (index == 4) {
+            refreshEngineTabDetails()
+            logAutoRefreshJob = uiScope.launch {
+                while (isActive && currentTabIndex == 4) {
+                    delay(2500L)
+                    refreshEngineTabDetails()
+                }
+            }
+        }
     }
 
     /**
@@ -279,7 +335,7 @@ class MainActivity : AppCompatActivity() {
 
         addChatBubble(
             "AuraDroid OS",
-            "नमस्ते भाई! मुझे कोई भी काम बताओ (जैसे: 'Instagram खोलो, भोजपुरी गाना सर्च करो और पहला वीडियो चलाओ')। हर रन खत्म होने पर Gemini 3.8 खुद सारे स्क्रीनशॉट्स देखकर अगले रन के लिए अपनी मेमोरी और बेहतर कर लेगा!",
+            "नमस्ते भाई! मुझे कोई भी काम बताओ (जैसे: 'Open Instagram, search Bhojpuri video, like it, comment, and share with Rahul')।\n• तेज़ स्टेप्स के लिए 3.5 Flash-Lite और मुश्किल विज़न/Reflection के लिए Gemini 3.8 Flash अपने-आप काम करेगा!",
             isUser = false
         )
 
@@ -293,7 +349,7 @@ class MainActivity : AppCompatActivity() {
         val micBtn = TextView(this).apply {
             text = "🎙️"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
-            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setPadding(dp(8), dp(6), dp(8), dp(6))
             setOnClickListener { startVoiceInput() }
         }
 
@@ -301,17 +357,46 @@ class MainActivity : AppCompatActivity() {
             hint = "यहाँ काम समझाएं या बात करें..."
             setHintTextColor(textMuted)
             setTextColor(textPureWhite)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             background = null
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        val sendBtn = TextView(this).apply {
+        val directRunBtn = TextView(this).apply {
+            text = "⚡"
+            setTextColor(textPureWhite)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = roundedBox(accentEmerald, dp(12))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(6) }
+            setOnClickListener {
+                val msg = chatInputBox.text.toString().trim()
+                if (msg.isNotEmpty()) {
+                    val svc = AutoTouchService.instance
+                    if (svc == null) {
+                        Toast.makeText(this@MainActivity, "पहले Accessibility Service ऑन करें!", Toast.LENGTH_LONG).show()
+                        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                    } else {
+                        chatInputBox.setText("")
+                        addChatBubble("You (Direct Run)", msg, isUser = true)
+                        svc.startUniversalTask(msg, emptyList())
+                    }
+                } else {
+                    Toast.makeText(this@MainActivity, "पहले बॉक्स में काम लिखें!", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
+        planSendBtn = TextView(this).apply {
             text = "Plan ➔"
             setTextColor(textPureWhite)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(16), dp(10), dp(16), dp(10))
+            setPadding(dp(14), dp(10), dp(14), dp(10))
             background = roundedBox(accentRoyalBlue, dp(12))
             setOnClickListener {
                 val msg = chatInputBox.text.toString().trim()
@@ -324,7 +409,8 @@ class MainActivity : AppCompatActivity() {
 
         inputBar.addView(micBtn)
         inputBar.addView(chatInputBox)
-        inputBar.addView(sendBtn)
+        inputBar.addView(directRunBtn)
+        inputBar.addView(planSendBtn)
 
         container.addView(scroll)
         container.addView(inputBar)
@@ -336,38 +422,44 @@ class MainActivity : AppCompatActivity() {
         chatHistoryBuilder.append("User: $userMsg\n")
         AutoTouchService.log("💬 User Chat: $userMsg")
 
-        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
-        val apiKey = prefs.getString("gemini_api_key", "") ?: ""
-        val brain = AutoTouchService.instance?.geminiBrain ?: GeminiBrain(apiKey)
-        val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+        val brain = getActiveBrain()
+        val vault = getActiveVault()
+
+        planSendBtn.isEnabled = false
+        planSendBtn.text = "⏳..."
 
         uiScope.launch {
-            val planJson = brain.chatAndBuildDetailedPlan(
-                userMessage = userMsg,
-                chatHistory = chatHistoryBuilder.toString().takeLast(1500),
-                userProfileRules = vault.getUserProfileRules()
-            )
+            try {
+                val planJson = brain.chatAndBuildDetailedPlan(
+                    userMessage = userMsg,
+                    chatHistory = chatHistoryBuilder.toString().takeLast(1500),
+                    userProfileRules = vault.getUserProfileRules()
+                )
 
-            val reply = planJson.optString("reply", "समझ गया भाई!")
-            val ready = planJson.optBoolean("readyToExecute", false)
-            val title = planJson.optString("taskTitle", userMsg.take(30))
-            val mode = planJson.optString("executionMode", "LIVE_PHONE")
-            val modelUsed = planJson.optString("modelUsed", "Gemini")
-            val stepsArr = planJson.optJSONArray("steps") ?: JSONArray()
+                val reply = planJson.optString("reply", "समझ गया भाई!")
+                val ready = planJson.optBoolean("readyToExecute", false)
+                val title = planJson.optString("taskTitle", userMsg.take(30))
+                val mode = planJson.optString("executionMode", "LIVE_PHONE")
+                val modelUsed = planJson.optString("modelUsed", "Gemini")
+                val stepsArr = planJson.optJSONArray("steps") ?: JSONArray()
 
-            val stepsList = mutableListOf<String>()
-            for (i in 0 until stepsArr.length()) {
-                stepsList.add(stepsArr.optString(i))
+                val stepsList = mutableListOf<String>()
+                for (i in 0 until stepsArr.length()) {
+                    stepsList.add(stepsArr.optString(i))
+                }
+
+                chatHistoryBuilder.append("AI: $reply\n")
+                AutoTouchService.log("⚡ Planner [$modelUsed] Created ${stepsList.size} Steps for '$title'")
+                addChatBubble("AuraDroid ($modelUsed)", reply, isUser = false)
+
+                if (ready && stepsList.isNotEmpty()) {
+                    addDetailedPlanCardToChat(title, mode, stepsList, userMsg)
+                }
+                scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+            } finally {
+                planSendBtn.isEnabled = true
+                planSendBtn.text = "Plan ➔"
             }
-
-            chatHistoryBuilder.append("AI: $reply\n")
-            AutoTouchService.log("⚡ Planner [$modelUsed] Created ${stepsList.size} Steps for '$title'")
-            addChatBubble("AuraDroid ($modelUsed)", reply, isUser = false)
-
-            if (ready && stepsList.isNotEmpty()) {
-                addDetailedPlanCardToChat(title, mode, stepsList, userMsg)
-            }
-            scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
         }
     }
 
@@ -460,6 +552,7 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this@MainActivity, "पहले Accessibility Service ऑन करें!", Toast.LENGTH_LONG).show()
                     startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                 } else {
+                    svc.hud.showHud()
                     svc.startUniversalTask(rawGoal, steps, mode)
                 }
             }
@@ -712,9 +805,9 @@ class MainActivity : AppCompatActivity() {
         toolStrip.addView(navBtn("🖥️ Desktop") {
             isDesktopMode = !isDesktopMode
             studioWebView?.settings?.userAgentString = if (isDesktopMode) {
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
             } else {
-                "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
             }
             studioWebView?.reload()
             Toast.makeText(this, if (isDesktopMode) "Desktop View ON" else "Mobile View ON", Toast.LENGTH_SHORT).show()
@@ -733,6 +826,7 @@ class MainActivity : AppCompatActivity() {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.databaseEnabled = true
+            settings.javaScriptCanOpenWindowsAutomatically = true
             settings.setSupportZoom(true)
             settings.builtInZoomControls = true
             settings.displayZoomControls = false
@@ -767,7 +861,7 @@ class MainActivity : AppCompatActivity() {
      * TAB 4: Memory Folders, Automation Runs History & Video Training Sessions with Gemini 3.8 Flash Chat
      */
     private fun buildTab4MemoryAndVideoTrainer(): View {
-        val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+        val vault = getActiveVault()
         val scroll = ScrollView(this)
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -813,7 +907,7 @@ class MainActivity : AppCompatActivity() {
         ).apply { minLines = 3 }
 
         val saveProfileBtn = createPrimaryButton("💾 Save Personal Memory", accentEmerald) {
-            vault.saveUserProfileRules(profileInput.text.toString())
+            getActiveVault().saveUserProfileRules(profileInput.text.toString())
             Toast.makeText(this, "Personal Memory Saved!", Toast.LENGTH_SHORT).show()
         }
 
@@ -839,7 +933,7 @@ class MainActivity : AppCompatActivity() {
     private fun refreshMemoryFoldersList() {
         if (!::memoryCategoriesLayout.isInitialized) return
         memoryCategoriesLayout.removeAllViews()
-        val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+        val vault = getActiveVault()
         val summary = vault.getAllCategoriesSummary()
 
         if (summary.isEmpty()) {
@@ -891,7 +985,7 @@ class MainActivity : AppCompatActivity() {
             topHeader.addView(clearCatBtn)
             row.addView(topHeader)
 
-            val fixes = vault.recallFixesForApp(cat).takeLast(6)
+            val fixes = vault.recallFixesForApp(cat).take(6)
             for (f in fixes) {
                 val xNorm = (f.tapXRatio * 1000).toInt()
                 val yNorm = (f.tapYRatio * 1000).toInt()
@@ -910,7 +1004,7 @@ class MainActivity : AppCompatActivity() {
     private fun refreshAutomationRunsList() {
         if (!::automationRunsListLayout.isInitialized) return
         automationRunsListLayout.removeAllViews()
-        val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+        val vault = getActiveVault()
         val runs = vault.getAllAutomationRuns()
 
         if (runs.isEmpty()) {
@@ -999,9 +1093,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openAutomationRunChatDialog(runRecord: AutomationRunRecord) {
-        val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
-        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
-        val brain = AutoTouchService.instance?.geminiBrain ?: GeminiBrain(prefs.getString("gemini_api_key", "") ?: "")
+        val vault = getActiveVault()
+        val brain = getActiveBrain()
+        val liveChatHistory = runRecord.chatHistory.toMutableList()
 
         val dialogView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1025,30 +1119,44 @@ class MainActivity : AppCompatActivity() {
             dialogView.addView(tipTv)
 
             val hScroll = HorizontalScrollView(this).apply {
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(130))
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(132))
             }
             val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val thumbFrames = mutableListOf<FrameLayout>()
 
             runRecord.screenshotPaths.forEachIndexed { idx, path ->
                 val bmp = vault.loadBitmapFromPath(path) ?: return@forEachIndexed
+                val frameWrap = FrameLayout(this).apply {
+                    setPadding(dp(2), dp(2), dp(2), dp(2))
+                    background = roundedBox(Color.TRANSPARENT, dp(6), borderSubtle)
+                    layoutParams = LinearLayout.LayoutParams(dp(74), dp(126)).apply {
+                        marginEnd = dp(8)
+                    }
+                }
                 val imgView = ImageView(this).apply {
                     setImageBitmap(bmp)
                     scaleType = ImageView.ScaleType.FIT_XY
-                    layoutParams = LinearLayout.LayoutParams(dp(72), dp(124)).apply {
-                        marginEnd = dp(8)
-                    }
+                    layoutParams = FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
                     setOnTouchListener { v, ev ->
                         if (ev.action == MotionEvent.ACTION_UP) {
+                            thumbFrames.forEach { it.background = roundedBox(Color.TRANSPARENT, dp(6), borderSubtle) }
+                            frameWrap.background = roundedBox(Color.TRANSPARENT, dp(6), accentRoyalBlue)
                             val normX = ((ev.x / v.width.coerceAtLeast(1)) * 1000).toInt().coerceIn(0, 1000)
                             val normY = ((ev.y / v.height.coerceAtLeast(1)) * 1000).toInt().coerceIn(0, 1000)
                             val curText = input.text.toString()
                             input.setText("$curText [Screenshot #${idx + 1} Pin XY: ($normX, $normY)] ")
                             input.setSelection(input.text.length)
+                            Toast.makeText(this@MainActivity, "📍 Pinned Screenshot #${idx + 1}: ($normX, $normY)", Toast.LENGTH_SHORT).show()
                         }
                         true
                     }
                 }
-                strip.addView(imgView)
+                frameWrap.addView(imgView)
+                thumbFrames.add(frameWrap)
+                strip.addView(frameWrap)
             }
             hScroll.addView(strip)
             dialogView.addView(hScroll)
@@ -1062,7 +1170,7 @@ class MainActivity : AppCompatActivity() {
 
         fun appendMsg(sender: String, msgText: String) {
             val tv = TextView(this).apply {
-                setText("$sender: $msgText")
+                text = "$sender: $msgText"
                 setTextColor(if (sender == "User") Color.parseColor("#60A5FA") else accentEmerald)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                 setPadding(0, dp(4), 0, dp(4))
@@ -1071,7 +1179,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         appendMsg("Gemini 3.8", "नमस्ते भाई! मैंने '${runRecord.title}' के ${runRecord.screenshotPaths.size} स्क्रीनशॉट्स और स्टेप्स लोड कर लिए हैं।")
-        for (c in runRecord.chatHistory) {
+        for (c in liveChatHistory) {
             val parts = c.split(":", limit = 2)
             if (parts.size == 2) appendMsg(parts[0].trim(), parts[1].trim())
         }
@@ -1106,17 +1214,24 @@ class MainActivity : AppCompatActivity() {
             val userText = input.text.toString().trim()
             if (userText.isEmpty()) return@setOnClickListener
             input.setText("")
+            send.isEnabled = false
+            send.text = "⏳..."
+
             appendMsg("User", userText)
+            liveChatHistory.add("User: $userText")
             vault.appendChatToAutomationRun(runRecord.runId, "User", userText)
+
+            val updatedRunRecord = runRecord.copy(chatHistory = liveChatHistory.toList())
 
             uiScope.launch(Dispatchers.IO) {
                 val b64Imgs = vault.loadSavedImagesAsBase64(runRecord.screenshotPaths, maxImages = 6)
                 val replyObj = brain.chatAboutAutomationRunWith38Flash(
-                    runRecord = runRecord,
+                    runRecord = updatedRunRecord,
                     userCorrectionMessage = userText,
                     screenshotsBase64 = b64Imgs
                 )
 
+                liveChatHistory.add("Gemini 3.8: ${replyObj.replyText}")
                 vault.appendChatToAutomationRun(runRecord.runId, "Gemini 3.8", replyObj.replyText)
                 vault.saveStuckOrHumanFix(
                     category = runRecord.appCategory,
@@ -1129,7 +1244,9 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 withContext(Dispatchers.Main) {
-                    appendMsg("Gemini 3.8", replyObj.replyText)
+                    send.isEnabled = true
+                    send.text = "Send ➔"
+                    appendMsg("Gemini 3.8 (${replyObj.modelUsed})", replyObj.replyText)
                     chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
                     refreshMemoryEverything()
                 }
@@ -1142,7 +1259,7 @@ class MainActivity : AppCompatActivity() {
     private fun refreshVideoTrainingSessionsList() {
         if (!::videoSessionsListLayout.isInitialized) return
         videoSessionsListLayout.removeAllViews()
-        val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+        val vault = getActiveVault()
         val sessions = vault.getAllVideoTrainingSessions()
 
         if (sessions.isEmpty()) {
@@ -1201,9 +1318,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openVideoSessionChatDialog(session: VideoTrainingSession) {
-        val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
-        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
-        val brain = AutoTouchService.instance?.geminiBrain ?: GeminiBrain(prefs.getString("gemini_api_key", "") ?: "")
+        val vault = getActiveVault()
+        val brain = getActiveBrain()
+        val liveChatHistory = session.chatHistory.toMutableList()
+        val liveRulesSummary = session.extractedRulesSummary.toMutableList()
 
         val dialogView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1227,30 +1345,44 @@ class MainActivity : AppCompatActivity() {
             dialogView.addView(tipTv)
 
             val hScroll = HorizontalScrollView(this).apply {
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(130))
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(132))
             }
             val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val thumbFrames = mutableListOf<FrameLayout>()
 
             session.framePaths.forEachIndexed { idx, path ->
                 val bmp = vault.loadBitmapFromPath(path) ?: return@forEachIndexed
+                val frameWrap = FrameLayout(this).apply {
+                    setPadding(dp(2), dp(2), dp(2), dp(2))
+                    background = roundedBox(Color.TRANSPARENT, dp(6), borderSubtle)
+                    layoutParams = LinearLayout.LayoutParams(dp(74), dp(126)).apply {
+                        marginEnd = dp(8)
+                    }
+                }
                 val imgView = ImageView(this).apply {
                     setImageBitmap(bmp)
                     scaleType = ImageView.ScaleType.FIT_XY
-                    layoutParams = LinearLayout.LayoutParams(dp(72), dp(124)).apply {
-                        marginEnd = dp(8)
-                    }
+                    layoutParams = FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
                     setOnTouchListener { v, ev ->
                         if (ev.action == MotionEvent.ACTION_UP) {
+                            thumbFrames.forEach { it.background = roundedBox(Color.TRANSPARENT, dp(6), borderSubtle) }
+                            frameWrap.background = roundedBox(Color.TRANSPARENT, dp(6), accentEmerald)
                             val normX = ((ev.x / v.width.coerceAtLeast(1)) * 1000).toInt().coerceIn(0, 1000)
                             val normY = ((ev.y / v.height.coerceAtLeast(1)) * 1000).toInt().coerceIn(0, 1000)
                             val curText = input.text.toString()
                             input.setText("$curText [Frame #${idx + 1} Pin XY: ($normX, $normY)] ")
                             input.setSelection(input.text.length)
+                            Toast.makeText(this@MainActivity, "📍 Pinned Frame #${idx + 1}: ($normX, $normY)", Toast.LENGTH_SHORT).show()
                         }
                         true
                     }
                 }
-                strip.addView(imgView)
+                frameWrap.addView(imgView)
+                thumbFrames.add(frameWrap)
+                strip.addView(frameWrap)
             }
             hScroll.addView(strip)
             dialogView.addView(hScroll)
@@ -1264,7 +1396,7 @@ class MainActivity : AppCompatActivity() {
 
         fun appendMsg(sender: String, msgText: String) {
             val tv = TextView(this).apply {
-                setText("$sender: $msgText")
+                text = "$sender: $msgText"
                 setTextColor(if (sender == "User") Color.parseColor("#60A5FA") else accentEmerald)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                 setPadding(0, dp(4), 0, dp(4))
@@ -1273,7 +1405,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         appendMsg("Gemini 3.8", "नमस्ते भाई! मैंने इस वीडियो के ${session.framePaths.size} फ्रेम्स देख लिए हैं। बताइए क्या सुधार करना है?")
-        for (c in session.chatHistory) {
+        for (c in liveChatHistory) {
             val parts = c.split(":", limit = 2)
             if (parts.size == 2) appendMsg(parts[0].trim(), parts[1].trim())
         }
@@ -1308,17 +1440,28 @@ class MainActivity : AppCompatActivity() {
             val userText = input.text.toString().trim()
             if (userText.isEmpty()) return@setOnClickListener
             input.setText("")
+            send.isEnabled = false
+            send.text = "⏳..."
+
             appendMsg("User", userText)
+            liveChatHistory.add("User: $userText")
             vault.appendChatToVideoSession(session.sessionId, "User", userText)
+
+            val updatedSession = session.copy(
+                chatHistory = liveChatHistory.toList(),
+                extractedRulesSummary = liveRulesSummary.toList()
+            )
 
             uiScope.launch(Dispatchers.IO) {
                 val b64Frames = vault.loadSavedImagesAsBase64(session.framePaths, maxImages = 10)
                 val replyObj = brain.chatAboutTrainingVideoWith38Flash(
-                    videoSession = session,
+                    videoSession = updatedSession,
                     userMessage = userText,
                     videoFramesBase64 = b64Frames
                 )
 
+                liveChatHistory.add("Gemini 3.8: ${replyObj.replyText}")
+                liveRulesSummary.add(replyObj.extractedSolutionRule)
                 vault.appendChatToVideoSession(session.sessionId, "Gemini 3.8", replyObj.replyText, replyObj.extractedSolutionRule)
                 vault.saveStuckOrHumanFix(
                     category = session.appCategory,
@@ -1331,7 +1474,9 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 withContext(Dispatchers.Main) {
-                    appendMsg("Gemini 3.8", replyObj.replyText)
+                    send.isEnabled = true
+                    send.text = "Send ➔"
+                    appendMsg("Gemini 3.8 (${replyObj.modelUsed})", replyObj.replyText)
                     chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
                     refreshMemoryEverything()
                 }
@@ -1374,7 +1519,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        logControlsRow.addView(logActionBtn("🔄 Refresh", accentRoyalBlue) { refreshLiveLogsBox() })
+        logControlsRow.addView(logActionBtn("🔄 Refresh", accentRoyalBlue) { refreshEngineTabDetails() })
         logControlsRow.addView(logActionBtn("📋 Copy Logs", Color.parseColor("#334155")) {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("auradroid_logs", liveLogsTextView.text))
@@ -1382,8 +1527,8 @@ class MainActivity : AppCompatActivity() {
         })
         logControlsRow.addView(logActionBtn("🗑️ Clear", Color.parseColor("#7F1D1D")) {
             synchronized(AutoTouchService.liveLogs) { AutoTouchService.liveLogs.clear() }
-            (AutoTouchService.instance?.memoryVault ?: MemoryVault(this)).clearPersistentLogs()
-            refreshLiveLogsBox()
+            getActiveVault().clearPersistentLogs()
+            refreshEngineTabDetails()
         })
 
         liveLogsTextView = TextView(this).apply {
@@ -1399,22 +1544,22 @@ class MainActivity : AppCompatActivity() {
         logsCard.addView(logControlsRow)
         logsCard.addView(liveLogsTextView)
 
-        val apiCard = createSectionCard("🔑 Gemini API & Free-Tier Model Ladder")
+        val apiCard = createSectionCard("🔑 Gemini API & 3.5–3.8 Free-Tier Model Ladder")
         val keyInput = createCleanInput(
             prefs.getString("gemini_api_key", "") ?: "",
             "Paste your Google AI Studio Gemini API Key"
         )
-        val saveKeyBtn = createPrimaryButton("💾 Save API Key & Activate Free Ladder", accentRoyalBlue) {
+        val saveKeyBtn = createPrimaryButton("💾 Save API Key & Activate 3.5–3.8 Ladder", accentRoyalBlue) {
             val k = keyInput.text.toString().trim()
             prefs.edit().putString("gemini_api_key", k).apply()
+            localBrain.updateApiKey(k)
             AutoTouchService.instance?.geminiBrain?.updateApiKey(k)
             Toast.makeText(this, "API Key Updated!", Toast.LENGTH_SHORT).show()
-            refreshLiveLogsBox()
+            refreshEngineTabDetails()
         }
 
-        val ladderInfo = TextView(this).apply {
-            text = AutoTouchService.instance?.geminiBrain?.getActiveModelListStatus()
-                ?: "✅ gemini-3.1-flash-lite (Fastest Free First)\n✅ gemini-3.5-flash-lite\n✅ gemini-3.8-flash (Post-Run Auto-Reflection & Video Brain)\n✅ gemini-robotics-er-2-preview"
+        ladderInfoTextView = TextView(this).apply {
+            text = getActiveBrain().getActiveModelListStatus()
             setTextColor(textMuted)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setPadding(0, dp(10), 0, 0)
@@ -1423,7 +1568,7 @@ class MainActivity : AppCompatActivity() {
         apiCard.addView(keyInput)
         apiCard.addView(spacer(dp(10)))
         apiCard.addView(saveKeyBtn)
-        apiCard.addView(ladderInfo)
+        apiCard.addView(ladderInfoTextView)
 
         val modeCard = createSectionCard("🎛️ Execution Mode & Before/After Touch Learning")
 
@@ -1437,7 +1582,7 @@ class MainActivity : AppCompatActivity() {
             prefs.edit().putString("execution_mode", currentMode).apply()
             btn.text = if (currentMode == "LIVE_PHONE") "📱 Mode: LIVE REAL TOUCH (Direct Phone Control)"
             else "🌐 Mode: BACKGROUND WEB STUDIO (Silent)"
-            refreshLiveLogsBox()
+            refreshEngineTabDetails()
         }
 
         var teachMode = prefs.getBoolean("passive_teach_mode", true)
@@ -1448,7 +1593,7 @@ class MainActivity : AppCompatActivity() {
             teachMode = !teachMode
             prefs.edit().putBoolean("passive_teach_mode", teachMode).apply()
             btn.text = if (teachMode) "🎓 Before+After Auto Touch Learning: ON" else "⚪ Before+After Auto Touch Learning: OFF"
-            refreshLiveLogsBox()
+            refreshEngineTabDetails()
         }
 
         modeCard.addView(modeSwitchBtn)
@@ -1456,17 +1601,7 @@ class MainActivity : AppCompatActivity() {
         modeCard.addView(teachSwitchBtn)
 
         val bodyCard = createSectionCard("🦾 Calibrated Phone Body & On-Demand Permissions")
-        val specs = AutoTouchService.instance?.getCalibratedDeviceBodySpecs()
-        val specsTv = TextView(this).apply {
-            text = if (specs != null) {
-                "• Phone Model: ${specs.modelName}\n" +
-                    "• Real Full-Screen Pixels: ${specs.screenWidth} × ${specs.screenHeight} px\n" +
-                    "• Top Punch-Hole / Cutout Safe Zone: 0 to ${specs.cutoutSafeTop} px\n" +
-                    "• Bottom Nav Bar Height: ${specs.navBarHeight} px\n" +
-                    "• Post-Run Auto-Reflection: Gemini 3.8 Flash Active"
-            } else {
-                "Enable Accessibility Service below to calibrate your screen, notch & punch-hole cutout."
-            }
+        calibratedSpecsTextView = TextView(this).apply {
             setTextColor(textPureWhite)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
         }
@@ -1487,7 +1622,7 @@ class MainActivity : AppCompatActivity() {
         val storageBtn = createPrimaryButton("📁 3. Turn ON File Manager Access (On-Demand Only)", Color.parseColor("#0D9488")) {
             if (requestStoragePermissionsOnDemand()) {
                 Toast.makeText(this, "File Manager Access Active!", Toast.LENGTH_SHORT).show()
-                refreshLiveLogsBox()
+                refreshEngineTabDetails()
             }
         }
 
@@ -1500,7 +1635,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        bodyCard.addView(specsTv)
+        bodyCard.addView(calibratedSpecsTextView)
         bodyCard.addView(spacer(dp(12)))
         bodyCard.addView(overlayBtn)
         bodyCard.addView(spacer(dp(8)))
@@ -1515,8 +1650,28 @@ class MainActivity : AppCompatActivity() {
         container.addView(modeCard)
         container.addView(bodyCard)
         engineScrollView.addView(container)
-        refreshLiveLogsBox()
+        refreshEngineTabDetails()
         return engineScrollView
+    }
+
+    private fun refreshEngineTabDetails() {
+        refreshLiveLogsBox()
+        if (::ladderInfoTextView.isInitialized) {
+            ladderInfoTextView.text = getActiveBrain().getActiveModelListStatus()
+        }
+        if (::calibratedSpecsTextView.isInitialized) {
+            val specs = AutoTouchService.instance?.getCalibratedDeviceBodySpecs()
+            calibratedSpecsTextView.text = if (specs != null) {
+                "• Phone Model: ${specs.modelName}\n" +
+                    "• Real Full-Screen Pixels: ${specs.screenWidth} × ${specs.screenHeight} px\n" +
+                    "• Top Punch-Hole / Cutout Safe Zone: 0 to ${specs.cutoutSafeTop} px\n" +
+                    "• Bottom Nav Bar Height: ${specs.navBarHeight} px\n" +
+                    "• Low-Task Engine: Gemini 3.5 Flash-Lite / 3.5 Flash\n" +
+                    "• High-Task & Reflection Engine: Gemini 3.8 Flash Active"
+            } else {
+                "Enable Accessibility Service below to calibrate your screen, notch & punch-hole cutout."
+            }
+        }
     }
 
     private fun refreshLiveLogsBox() {
@@ -1525,12 +1680,37 @@ class MainActivity : AppCompatActivity() {
         val lines = if (inMemory.isNotEmpty()) {
             inMemory.take(45)
         } else {
-            (AutoTouchService.instance?.memoryVault ?: MemoryVault(this)).getPersistentLogs().take(45)
+            getActiveVault().getPersistentLogs().take(45)
         }
         liveLogsTextView.text = if (lines.isEmpty()) {
             "No logs yet. Start any task or change a setting to see live history here."
         } else {
             lines.joinToString("\n")
+        }
+    }
+
+    private fun resolveTreeUriToRealPath(treeUri: Uri): String {
+        return try {
+            val docId = DocumentsContract.getTreeDocumentId(treeUri)
+            when {
+                docId.startsWith("raw:") -> docId.removePrefix("raw:")
+                docId.equals("downloads", ignoreCase = true) ->
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
+                docId.contains(":") -> {
+                    val split = docId.split(":")
+                    val type = split[0]
+                    val rel = if (split.size > 1) split[1] else ""
+                    if (type.equals("primary", ignoreCase = true)) {
+                        if (rel.isEmpty()) Environment.getExternalStorageDirectory().absolutePath
+                        else "${Environment.getExternalStorageDirectory().absolutePath}/$rel"
+                    } else {
+                        "/storage/$type/$rel"
+                    }
+                }
+                else -> Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
+            }
+        } catch (_: Exception) {
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
         }
     }
 
@@ -1543,17 +1723,18 @@ class MainActivity : AppCompatActivity() {
             REQ_VOICE_INPUT -> {
                 val spoken = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull() ?: return
                 chatInputBox.setText(spoken)
+                chatInputBox.setSelection(spoken.length)
             }
 
             REQ_PICK_FOLDER_TREE -> {
                 val treeUri = data.data ?: return
-                val docId = DocumentsContract.getTreeDocumentId(treeUri)
-                val split = docId.split(":")
-                val resolvedPath = if (split.size >= 2) {
-                    "${Environment.getExternalStorageDirectory().absolutePath}/${split[1]}"
-                } else {
-                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
-                }
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        treeUri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+                } catch (_: Exception) {}
+                val resolvedPath = resolveTreeUriToRealPath(treeUri)
                 folderPathEditText.setText(resolvedPath)
                 getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
                     .edit().putString("yt_folder_path", resolvedPath).apply()
@@ -1571,10 +1752,9 @@ class MainActivity : AppCompatActivity() {
 
             REQ_PICK_TRAINING_VIDEO -> {
                 val videoUri = data.data ?: return
-                Toast.makeText(this, "12 फ्रेम्स निकालकर Gemini 3.8 Flash से एनालाइज किया जा रहा है...", Toast.LENGTH_LONG).show()
-                val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
-                val brain = AutoTouchService.instance?.geminiBrain ?: GeminiBrain(prefs.getString("gemini_api_key", "") ?: "")
-                val vault = AutoTouchService.instance?.memoryVault ?: MemoryVault(this)
+                Toast.makeText(this, "फ्रेम्स निकालकर Gemini 3.8 Flash से एनालाइज किया जा रहा है...", Toast.LENGTH_LONG).show()
+                val brain = getActiveBrain()
+                val vault = getActiveVault()
 
                 uiScope.launch(Dispatchers.IO) {
                     val (session, framesB64) = vault.createVideoTrainingSession(
@@ -1600,14 +1780,19 @@ class MainActivity : AppCompatActivity() {
                             tapYRatio = rule.tapYRatio,
                             sourceType = rule.sourceType
                         )
-                        vault.appendChatToVideoSession(session.sessionId, "Gemini 3.8", "Learned Rule: ${rule.solutionRule}", rule.solutionRule)
+                        vault.appendChatToVideoSession(
+                            session.sessionId,
+                            "Gemini 3.8",
+                            "Learned Rule: ${rule.solutionRule}",
+                            rule.solutionRule
+                        )
                     }
 
                     withContext(Dispatchers.Main) {
                         refreshMemoryEverything()
                         Toast.makeText(
                             this@MainActivity,
-                            "✅ Video Trained & Saved in Memory/$selectedTrainingCategory!",
+                            "✅ Video Trained (${learnedRulesList.size} Rules) & Saved in Memory/${session.appCategory}!",
                             Toast.LENGTH_LONG
                         ).show()
                     }
@@ -1710,7 +1895,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        logAutoRefreshJob?.cancel()
         uiScope.cancel()
+        try {
+            studioWebView?.stopLoading()
+            studioWebView?.destroy()
+        } catch (_: Exception) {}
         super.onDestroy()
     }
 }
