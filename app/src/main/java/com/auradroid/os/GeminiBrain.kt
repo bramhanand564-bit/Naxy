@@ -43,6 +43,12 @@ data class MemoryChatReply(
     val modelUsed: String
 )
 
+data class PostRunReflectionResult(
+    val reflectionSummary: String,
+    val learnedRules: List<LearnedFixRecord>,
+    val modelUsed: String
+)
+
 class GeminiBrain(private var apiKey: String) {
 
     // 100% Free-Tier Fastest -> Smartest Model Ladder
@@ -58,7 +64,7 @@ class GeminiBrain(private var apiKey: String) {
         "gemini-3.1-pro-preview"
     )
 
-    // Dedicated Gemini 3.8 Flash Brain for Run Review Chat, Video Chat & Touch Learning
+    // Dedicated Gemini 3.8 Flash Brain for Post-Run Auto-Reflection, Run Review Chat, Video Chat & Touch Learning
     private val deep38FlashLadder = listOf(
         "gemini-3.8-flash",
         "gemini-flash-latest",
@@ -303,7 +309,7 @@ class GeminiBrain(private var apiKey: String) {
         val imgList = if (screenshotBitmap != null) listOf(bitmapToHdWebpBase64(screenshotBitmap)) else emptyList()
 
         val memoryBlock = if (recalledFixes.isNotEmpty()) {
-            "🧠 LEARNED APP MEMORY, RUN-CHAT CORRECTIONS & VIDEO-TRAINED COORDINATES (HIGHEST PRIORITY!):\n" +
+            "🧠 LEARNED APP MEMORY, POST-RUN AUTO-REFLECTIONS & VIDEO COORDINATES (HIGHEST PRIORITY!):\n" +
                 recalledFixes.joinToString("\n") { fix ->
                     val px = (fix.tapXRatio * bodySpecs.screenWidth).toInt()
                     val py = (fix.tapYRatio * bodySpecs.screenHeight).toInt()
@@ -348,9 +354,9 @@ class GeminiBrain(private var apiKey: String) {
             1. Check RECENT ACTIONS ALREADY COMPLETED:
                - If you already tapped "Like", DO NOT tap Like again.
                - If you already posted a comment and closed the comment sheet, DO NOT open comments again—move to Share!
-               - On the Instagram Share sheet: Once you have tapped a friend's avatar (e.g., Rahul) ONCE and a blue "Send" button appears at the bottom (around Y=910 in 0..1000 scale), DO NOT tap the friend's avatar again (tapping again unselects them!). Immediately tap the bottom blue "Send" button! And once "Sent" appears or the share sheet closes, return "DONE" immediately!
+               - On the Instagram Share sheet: Once you have tapped a friend's avatar (e.g., Rahul) ONCE and a blue "Send" button appears at the bottom (around Y=910 in 0..1000 scale), DO NOT tap the friend's avatar again! Immediately tap the bottom blue "Send" button! And once "Sent" appears or the share sheet closes, return "DONE" immediately!
             2. If you see "Comments on this post have been limited", press "BACK" and then "SWIPE" up to the next Reel.
-            3. Check LEARNED APP MEMORY above: If a user correction or video rule matches this screen, follow its exact instruction and coordinates!
+            3. Check LEARNED APP MEMORY above: If a post-run reflection, user correction, or video rule matches this screen, follow its exact instruction and coordinates!
             4. Prefer "CLICK_TAG" with the exact "tagId" whenever the target button/box is in the list.
             5. Otherwise use "CLICK_XY" with 0..1000 normalized coordinates.
             
@@ -389,8 +395,92 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 3. Interactive Chat Inside Any Past Automation Run (Powered by Gemini 3.8 Flash)
-     * User can explain what went wrong in that specific run while Gemini 3.8 looks at the run's screenshots & step logs!
+     * 3. NEW: Post-Run Automatic Self-Reflection & Optimization by Gemini 3.8 Flash!
+     * Triggered automatically whenever ANY automation finishes, stops, or fails.
+     * Gemini 3.8 compares:
+     * - What the Goal & Planned Steps were
+     * - What Steps were actually taken
+     * - All Screenshots captured during the run
+     * And saves optimized rules into Memory/<AppCategory> so the next run is faster and 100% accurate!
+     */
+    suspend fun autoReflectAndImproveAfterRun(
+        appCategory: String,
+        goal: String,
+        plannedSteps: List<String>,
+        actualStepsTaken: List<String>,
+        finalStatus: String,
+        runBitmaps: List<Bitmap>
+    ): PostRunReflectionResult {
+        val imgsBase64 = runBitmaps.takeLast(8).map { bitmapToHdWebpBase64(it, maxHeight = 960) }
+
+        val prompt = """
+            You are Gemini 3.8 Flash Autonomous Self-Reflection & Optimization Architect for AuraDroid OS.
+            An automation run just ended. You already know what the user's Goal was, what should have happened (Planned Steps), what actually happened (Actual Steps Taken), and you have the sequential Screenshots from the run!
+            
+            RUN CONTEXT:
+            - App Category: $appCategory
+            - User Goal: $goal
+            - Planned Steps (What should have happened): ${plannedSteps.joinToString(" -> ")}
+            - Actual Steps Taken: ${actualStepsTaken.joinToString(" | ")}
+            - Final Run Status: $finalStatus
+            
+            YOUR TASK:
+            1. Examine all ${imgsBase64.size} sequential screenshots from this run carefully.
+            2. Identify where the agent succeeded, where it hesitated/repeated steps, or why it failed/stopped short of the goal.
+            3. Formulate 1 to 3 concrete, high-precision optimization rules ("rules") with exact 0.0 to 1.0 screen tap coordinates ("tapXRatio", "tapYRatio") so that the VERY NEXT TIME the user runs this task in "$appCategory", it executes 100% smoothly without any mistake!
+            4. Write a short Hinglish summary ("reflectionSummary") of what you learned from reviewing these screenshots.
+            
+            Return ONLY valid JSON:
+            {
+              "reflectionSummary": "Short Hinglish summary of what went right/wrong and how you optimized it for the next run",
+              "rules": [
+                {
+                  "screenWhen": "Specific screen state seen in the screenshots",
+                  "actionInstruction": "Exact optimized action and button to tap immediately next time",
+                  "tapXRatio": 0.50,
+                  "tapYRatio": 0.91
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val (raw, modelUsed) = callWithLadder(prompt, imgsBase64, useDeep38Flash = true)
+        onBrainLog?.invoke("🧠 [$modelUsed] Completed Post-Run Auto-Reflection on ${imgsBase64.size} screenshots!")
+
+        val extractedRules = mutableListOf<LearnedFixRecord>()
+        var summaryText = "मैंने इस रन के सभी स्क्रीनशॉट्स का विश्लेषण करके अगले रन के लिए मेमोरी को और बेहतर बना दिया है।"
+
+        try {
+            val j = parseCleanJson(raw)
+            summaryText = j.optString("reflectionSummary", summaryText)
+            val arr = j.optJSONArray("rules") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val item = arr.getJSONObject(i)
+                extractedRules.add(
+                    LearnedFixRecord(
+                        id = "refl_${System.currentTimeMillis()}_$i",
+                        appCategory = appCategory,
+                        sourceType = "AUTO_3.8_REFLECTION ($modelUsed)",
+                        screenSignature = "post_run_reflection_$i",
+                        problemDescription = item.optString("screenWhen", "Optimized step in $appCategory"),
+                        solutionRule = item.optString("actionInstruction", "Follow auto-reflected coordinate"),
+                        tapXRatio = item.optDouble("tapXRatio", 0.5).toFloat(),
+                        tapYRatio = item.optDouble("tapYRatio", 0.5).toFloat(),
+                        timestamp = "Auto-Reflected"
+                    )
+                )
+            }
+        } catch (_: Exception) {}
+
+        return PostRunReflectionResult(
+            reflectionSummary = summaryText,
+            learnedRules = extractedRules,
+            modelUsed = modelUsed
+        )
+    }
+
+    /**
+     * 4. Interactive Chat Inside Any Past Automation Run (Powered by Gemini 3.8 Flash)
      */
     suspend fun chatAboutAutomationRunWith38Flash(
         runRecord: AutomationRunRecord,
@@ -410,11 +500,6 @@ class GeminiBrain(private var apiKey: String) {
             
             Attached are the actual screenshots captured during this Automation Run.
             The User just told you: "$userCorrectionMessage"
-            
-            INSTRUCTIONS:
-            1. Look at the attached screenshots from this run and the user's explanation.
-            2. Reply clearly and warmly in Hinglish ("replyText") explaining what mistake you spotted in the screenshots/steps and confirming the exact fix you have locked into memory for the next run.
-            3. Extract a permanent rule ("problemScreen" and "solutionRule") and the exact 0.0 to 1.0 screen tap coordinates ("tapXRatio", "tapYRatio") so the next time this automation runs, it executes 100% accurately!
             
             Return ONLY valid JSON:
             {
@@ -451,8 +536,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 4. Interactive Chat Inside Any Uploaded Training Video (Powered by Gemini 3.8 Flash)
-     * User can chat about the uploaded video while Gemini 3.8 inspects the extracted video frames!
+     * 5. Interactive Chat Inside Any Uploaded Training Video (Powered by Gemini 3.8 Flash)
      */
     suspend fun chatAboutTrainingVideoWith38Flash(
         videoSession: VideoTrainingSession,
@@ -471,11 +555,6 @@ class GeminiBrain(private var apiKey: String) {
             
             Attached are the sequential frames from the user's training video.
             The User just said: "$userMessage"
-            
-            INSTRUCTIONS:
-            1. Inspect the attached video frames carefully alongside the user's message.
-            2. Reply clearly in Hinglish ("replyText") confirming what you see in the video frames and how you have updated the app's tapping coordinates/workflow.
-            3. Extract a concrete rule ("problemScreen" and "solutionRule") and 0.0 to 1.0 coordinates ("tapXRatio", "tapYRatio") to save into Memory/${videoSession.appCategory}.
             
             Return ONLY valid JSON:
             {
@@ -512,7 +591,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 5. Before + After Screenshot Human Touch Analyzer (Powered by Gemini 3.8 Flash)
+     * 6. Before + After Screenshot Human Touch Analyzer
      */
     suspend fun analyzeBeforeAfterHumanTouchWith38Flash(
         appCategory: String,
@@ -558,7 +637,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 6. Frame-by-Frame Uploaded Video Analyzer
+     * 7. Frame-by-Frame Uploaded Video Analyzer
      */
     suspend fun analyzeTrainingVideoFrames(
         appCategory: String,
@@ -630,7 +709,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 7. Safe Video Prompt + Viral YouTube Shorts Title Generator
+     * 8. Safe Video Prompt + Viral YouTube Shorts Title Generator
      */
     suspend fun generateFlowSafePromptAndTitle(topic: String): Pair<String, String> {
         val safeRegex = Regex("(?i)\\b(boy|girl|child|kid|minor|baby|skin)\\b")
