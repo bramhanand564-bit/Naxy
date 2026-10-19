@@ -34,10 +34,18 @@ data class AgentStepDecision(
     val modelUsed: String = ""
 )
 
+data class MemoryChatReply(
+    val replyText: String,
+    val extractedProblem: String,
+    val extractedSolutionRule: String,
+    val tapXRatio: Float,
+    val tapYRatio: Float,
+    val modelUsed: String
+)
+
 class GeminiBrain(private var apiKey: String) {
 
-    // 100% Free-Tier Fastest -> Smartest Model Ladder (Matches AI Studio Free Models)
-    // Starts with ultra-fast Lite models to save quota, then steps up to 3.8 Flash & Robotics-ER-2!
+    // 100% Free-Tier Fastest -> Smartest Model Ladder
     private val freeTierFastLadder = mutableListOf(
         "gemini-3.1-flash-lite",
         "gemini-3.5-flash-lite",
@@ -50,9 +58,8 @@ class GeminiBrain(private var apiKey: String) {
         "gemini-3.1-pro-preview"
     )
 
-    // Deep Analyzer Ladder for Frame-by-Frame Video Training & Before/After Touch Learning
-    // Uses gemini-3.8-flash first (Fast + High-Intelligence Agent Model) before ever touching Pro!
-    private val deepLearningLadder = listOf(
+    // Dedicated Gemini 3.8 Flash Brain for Run Review Chat, Video Chat & Touch Learning
+    private val deep38FlashLadder = listOf(
         "gemini-3.8-flash",
         "gemini-flash-latest",
         "gemini-robotics-er-2-preview",
@@ -61,7 +68,6 @@ class GeminiBrain(private var apiKey: String) {
         "gemini-3.1-pro-preview"
     )
 
-    // Models that returned 404/403 (Unavailable/Paid) or 429 (Quota Exhausted)
     private val blockedModels = mutableSetOf<String>()
     private val quotaCooldownModels = mutableMapOf<String, Long>()
 
@@ -104,20 +110,15 @@ class GeminiBrain(private var apiKey: String) {
         return JSONObject("{$body}")
     }
 
-    /**
-     * Step-by-Step Free-Tier Ladder Executor:
-     * Always tries the fastest low-quota model first. If a model fails or hits quota (429),
-     * it automatically skips to the next free model and logs the exact transition.
-     */
     private suspend fun callWithLadder(
         prompt: String,
         imagesBase64: List<String> = emptyList(),
-        useDeepAnalyzer: Boolean = false
+        useDeep38Flash: Boolean = false
     ): Pair<String, String> = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) return@withContext Pair("", "No API Key")
 
         val now = System.currentTimeMillis()
-        val baseLadder = if (useDeepAnalyzer) deepLearningLadder else freeTierFastLadder
+        val baseLadder = if (useDeep38Flash) deep38FlashLadder else freeTierFastLadder
 
         val candidates = baseLadder.filter { m ->
             !blockedModels.contains(m) && (quotaCooldownModels[m] ?: 0L) <= now
@@ -138,9 +139,8 @@ class GeminiBrain(private var apiKey: String) {
                     }
                 }
                 429 -> {
-                    // Quota limit hit on this model -> put on 3-minute cooldown & move to next free model!
                     quotaCooldownModels[model] = System.currentTimeMillis() + 180_000L
-                    onBrainLog?.invoke("⚠️ Quota full on [$model] (429) -> Auto-switching to next model...")
+                    onBrainLog?.invoke("⚠️ Quota full on [$model] (429) -> Switching to next free model...")
                 }
                 404, 403, 400 -> {
                     blockedModels.add(model)
@@ -256,10 +256,9 @@ class GeminiBrain(private var apiKey: String) {
             
             User just said: "$userMessage"
             
-            Analyze if the user is asking a question, discussing an idea, or giving an automation task.
             If critical info is missing, set "readyToExecute": false and ask briefly in "reply".
-            If the task is clear, break it down into small, crystal-clear sequential steps in "steps" array and set "readyToExecute": true.
-            Also decide "executionMode": "LIVE_PHONE" (for Instagram, WhatsApp, YouTube App, Phone Settings) or "BACKGROUND_WEB" (for websites, Google Flow, forms).
+            If the task is clear, break it down into small sequential steps in "steps" array and set "readyToExecute": true.
+            Also decide "executionMode": "LIVE_PHONE" or "BACKGROUND_WEB".
             
             Return ONLY valid JSON:
             {
@@ -275,12 +274,12 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        val (raw, model) = callWithLadder(sysPrompt, useDeepAnalyzer = false)
+        val (raw, model) = callWithLadder(sysPrompt, useDeep38Flash = false)
         return try {
             parseCleanJson(raw).put("modelUsed", model)
         } catch (_: Exception) {
             JSONObject().apply {
-                put("reply", if (raw.isNotBlank()) raw else "Bhai, apni Gemini API Key ek baar Engine tab mein check kar lo.")
+                put("reply", if (raw.isNotBlank()) raw else "भाई, अपनी Gemini API Key एक बार Engine टैब में चेक कर लो।")
                 put("readyToExecute", false)
                 put("steps", JSONArray())
             }
@@ -288,9 +287,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 2. Real-Time Vision + Learned App Playbook Step Engine
-     * CRITICAL UPGRADE: Always injects Learned Video & Human-Touch Fixes for this App from Step 1
-     * so the Baymax Hand goes straight to the exact learned point!
+     * 2. Real-Time Vision + Learned Playbook Step Engine
      */
     suspend fun decideNextStep(
         goal: String,
@@ -305,9 +302,8 @@ class GeminiBrain(private var apiKey: String) {
     ): AgentStepDecision {
         val imgList = if (screenshotBitmap != null) listOf(bitmapToHdWebpBase64(screenshotBitmap)) else emptyList()
 
-        // Always include learned playbook rules for this app so AI never repeats past mistakes!
         val memoryBlock = if (recalledFixes.isNotEmpty()) {
-            "🧠 LEARNED APP MEMORY & VIDEO-TRAINED COORDINATES (FOLLOW STRICTLY!):\n" +
+            "🧠 LEARNED APP MEMORY, RUN-CHAT CORRECTIONS & VIDEO-TRAINED COORDINATES (HIGHEST PRIORITY!):\n" +
                 recalledFixes.joinToString("\n") { fix ->
                     val px = (fix.tapXRatio * bodySpecs.screenWidth).toInt()
                     val py = (fix.tapYRatio * bodySpecs.screenHeight).toInt()
@@ -340,7 +336,7 @@ class GeminiBrain(private var apiKey: String) {
             
             OVERALL GOAL: $goal
             PLANNED SUB-TASKS: $plannedJoined
-            RECENT ACTIONS ALREADY COMPLETED (DO NOT REPEAT COMPLETED ACTIONS!):
+            RECENT ACTIONS ALREADY COMPLETED (NEVER REPEAT COMPLETED ACTIONS!):
             $recentJoined
             $monitorRule
             $memoryBlock
@@ -349,15 +345,14 @@ class GeminiBrain(private var apiKey: String) {
             $numberedNodesList
             
             CRITICAL EXECUTION RULES:
-            1. Look at RECENT ACTIONS ALREADY COMPLETED: If you already tapped "Like" on the current video, DO NOT tap Like again (tapping Like twice unlikes it!). Move immediately to the next step (e.g., Comment or Share).
-            2. If you opened a Comment sheet on Instagram and see "Comments on this post have been limited" or no comment input box:
-               - First close the comment sheet (or press "BACK") and then "SWIPE" up (from Y=800 to Y=200) to move to the next Reel where comments are open!
-            3. Check LEARNED APP MEMORY above: If a learned rule matches the current screen, use its exact TAG_ID or Learned 0..1000 XY coordinates!
-            4. Prefer "CLICK_TAG" with the exact "tagId" whenever the target button/box is in the list (guarantees dead-center tap!).
-            5. If an icon/element is visible in the screenshot but NOT in the tag list, use "CLICK_XY" with 0..1000 normalized coordinates.
-            6. To type text into a focused input or search bar, return "TYPE" with "tagId" (or x,y) and "text".
-            7. To scroll or swipe to the next Reel/Page, return "SWIPE" with x=500, y=800, endX=500, endY=200.
-            8. To close a popup/sheet, return "BACK".
+            1. Check RECENT ACTIONS ALREADY COMPLETED:
+               - If you already tapped "Like", DO NOT tap Like again.
+               - If you already posted a comment and closed the comment sheet, DO NOT open comments again—move to Share!
+               - On the Instagram Share sheet: Once you have tapped a friend's avatar (e.g., Rahul) ONCE and a blue "Send" button appears at the bottom (around Y=910 in 0..1000 scale), DO NOT tap the friend's avatar again (tapping again unselects them!). Immediately tap the bottom blue "Send" button! And once "Sent" appears or the share sheet closes, return "DONE" immediately!
+            2. If you see "Comments on this post have been limited", press "BACK" and then "SWIPE" up to the next Reel.
+            3. Check LEARNED APP MEMORY above: If a user correction or video rule matches this screen, follow its exact instruction and coordinates!
+            4. Prefer "CLICK_TAG" with the exact "tagId" whenever the target button/box is in the list.
+            5. Otherwise use "CLICK_XY" with 0..1000 normalized coordinates.
             
             Return ONLY valid JSON:
             {
@@ -373,8 +368,7 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        // Normal steps use fastest free model first; if stuck, escalates to 3.8-flash deep analyzer
-        val (raw, modelUsed) = callWithLadder(prompt, imgList, useDeepAnalyzer = isStuck)
+        val (raw, modelUsed) = callWithLadder(prompt, imgList, useDeep38Flash = isStuck)
         return try {
             val j = parseCleanJson(raw)
             AgentStepDecision(
@@ -395,9 +389,130 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 3. Before + After Screenshot Human Touch Analyzer (Powered by Gemini 3.8 Flash)
-     * Compares Screenshot 1 (Before Human Tap) and Screenshot 2 (After Human Tap) + Exact Tap Point
-     * to learn why the AI was wrong and how the user fixed it!
+     * 3. Interactive Chat Inside Any Past Automation Run (Powered by Gemini 3.8 Flash)
+     * User can explain what went wrong in that specific run while Gemini 3.8 looks at the run's screenshots & step logs!
+     */
+    suspend fun chatAboutAutomationRunWith38Flash(
+        runRecord: AutomationRunRecord,
+        userCorrectionMessage: String,
+        screenshotsBase64: List<String>
+    ): MemoryChatReply {
+        val prompt = """
+            You are Gemini 3.8 Flash Run-Correction Architect inside AuraDroid OS.
+            The user is reviewing a past Automation Run and chatting with you to teach you what went wrong and how to fix it permanently.
+            
+            AUTOMATION RUN DETAILS:
+            - Task Title: ${runRecord.title}
+            - App Category: ${runRecord.appCategory}
+            - Final Status: ${runRecord.status}
+            - Steps Taken by Agent: ${runRecord.stepsSummary.joinToString(" -> ")}
+            - Previous Discussion on this Run: ${runRecord.chatHistory.takeLast(6).joinToString(" | ")}
+            
+            Attached are the actual screenshots captured during this Automation Run.
+            The User just told you: "$userCorrectionMessage"
+            
+            INSTRUCTIONS:
+            1. Look at the attached screenshots from this run and the user's explanation.
+            2. Reply clearly and warmly in Hinglish ("replyText") explaining what mistake you spotted in the screenshots/steps and confirming the exact fix you have locked into memory for the next run.
+            3. Extract a permanent rule ("problemScreen" and "solutionRule") and the exact 0.0 to 1.0 screen tap coordinates ("tapXRatio", "tapYRatio") so the next time this automation runs, it executes 100% accurately!
+            
+            Return ONLY valid JSON:
+            {
+              "replyText": "Clear Hinglish reply explaining what you understood from the screenshots and how you fixed the rule",
+              "problemScreen": "Which screen or step in ${runRecord.appCategory} had the issue",
+              "solutionRule": "Exact action and coordinate to tap next time on this screen",
+              "tapXRatio": 0.50,
+              "tapYRatio": 0.94
+            }
+        """.trimIndent()
+
+        val (raw, modelUsed) = callWithLadder(prompt, screenshotsBase64, useDeep38Flash = true)
+        onBrainLog?.invoke("💬 [$modelUsed] Learned Run Correction for ${runRecord.appCategory}")
+        return try {
+            val j = parseCleanJson(raw)
+            MemoryChatReply(
+                replyText = j.optString("replyText", "समझ गया भाई! मैंने इस रन के स्क्रीनशॉट्स देखकर यह नियम हमेशा के लिए सेव कर लिया है।"),
+                extractedProblem = j.optString("problemScreen", "Correction for ${runRecord.title}"),
+                extractedSolutionRule = j.optString("solutionRule", userCorrectionMessage),
+                tapXRatio = j.optDouble("tapXRatio", 0.5).toFloat(),
+                tapYRatio = j.optDouble("tapYRatio", 0.5).toFloat(),
+                modelUsed = modelUsed
+            )
+        } catch (_: Exception) {
+            MemoryChatReply(
+                replyText = if (raw.isNotBlank()) raw else "समझ गया भाई! मैंने आपकी बात को ${runRecord.appCategory} की मेमोरी में सेव कर लिया है।",
+                extractedProblem = "Run Correction (${runRecord.title})",
+                extractedSolutionRule = userCorrectionMessage,
+                tapXRatio = 0.5f,
+                tapYRatio = 0.5f,
+                modelUsed = modelUsed
+            )
+        }
+    }
+
+    /**
+     * 4. Interactive Chat Inside Any Uploaded Training Video (Powered by Gemini 3.8 Flash)
+     * User can chat about the uploaded video while Gemini 3.8 inspects the extracted video frames!
+     */
+    suspend fun chatAboutTrainingVideoWith38Flash(
+        videoSession: VideoTrainingSession,
+        userMessage: String,
+        videoFramesBase64: List<String>
+    ): MemoryChatReply {
+        val prompt = """
+            You are Gemini 3.8 Flash Video-Memory Coach inside AuraDroid OS.
+            The user uploaded a training video for app "${videoSession.appCategory}" and is now chatting with you to explain specific frames, mistakes, or tapping points in the video.
+            
+            VIDEO SESSION CONTEXT:
+            - App Category: ${videoSession.appCategory}
+            - Initial Note: ${videoSession.userNote}
+            - Rules Extracted So Far: ${videoSession.extractedRulesSummary.joinToString(" | ")}
+            - Previous Chat History: ${videoSession.chatHistory.takeLast(6).joinToString(" | ")}
+            
+            Attached are the sequential frames from the user's training video.
+            The User just said: "$userMessage"
+            
+            INSTRUCTIONS:
+            1. Inspect the attached video frames carefully alongside the user's message.
+            2. Reply clearly in Hinglish ("replyText") confirming what you see in the video frames and how you have updated the app's tapping coordinates/workflow.
+            3. Extract a concrete rule ("problemScreen" and "solutionRule") and 0.0 to 1.0 coordinates ("tapXRatio", "tapYRatio") to save into Memory/${videoSession.appCategory}.
+            
+            Return ONLY valid JSON:
+            {
+              "replyText": "Clear Hinglish response referencing the video frames and confirming the updated rule",
+              "problemScreen": "Specific screen in the video",
+              "solutionRule": "Exact action & button to tap based on user's guidance",
+              "tapXRatio": 0.50,
+              "tapYRatio": 0.85
+            }
+        """.trimIndent()
+
+        val (raw, modelUsed) = callWithLadder(prompt, videoFramesBase64, useDeep38Flash = true)
+        onBrainLog?.invoke("🎬 [$modelUsed] Answered Video Memory Chat for ${videoSession.appCategory}")
+        return try {
+            val j = parseCleanJson(raw)
+            MemoryChatReply(
+                replyText = j.optString("replyText", "समझ गया भाई! मैंने वीडियो के फ्रेम्स देखकर यह स्टेप और टैप पॉइंट अपडेट कर लिया है।"),
+                extractedProblem = j.optString("problemScreen", "Video Frame Guidance (${videoSession.appCategory})"),
+                extractedSolutionRule = j.optString("solutionRule", userMessage),
+                tapXRatio = j.optDouble("tapXRatio", 0.5).toFloat(),
+                tapYRatio = j.optDouble("tapYRatio", 0.5).toFloat(),
+                modelUsed = modelUsed
+            )
+        } catch (_: Exception) {
+            MemoryChatReply(
+                replyText = if (raw.isNotBlank()) raw else "समझ गया भाई! मैंने इस वीडियो के लिए आपका निर्देश सेव कर लिया है।",
+                extractedProblem = "Video Chat Guidance",
+                extractedSolutionRule = userMessage,
+                tapXRatio = 0.5f,
+                tapYRatio = 0.5f,
+                modelUsed = modelUsed
+            )
+        }
+    }
+
+    /**
+     * 5. Before + After Screenshot Human Touch Analyzer (Powered by Gemini 3.8 Flash)
      */
     suspend fun analyzeBeforeAfterHumanTouchWith38Flash(
         appCategory: String,
@@ -417,15 +532,10 @@ class GeminiBrain(private var apiKey: String) {
 
         val prompt = """
             You are Gemini 3.8 Flash Memory Architect for AuraDroid OS.
-            During the task "$goal" inside app "$appCategory", the AI agent was stuck or making a mistake, so the Human User manually tapped the screen!
-            
-            - Image 1 (if present): BEFORE Screenshot (the screen where AI was stuck/confused).
+            During the task "$goal" inside app "$appCategory", the Human User manually tapped the screen!
+            - Image 1: BEFORE Screenshot.
             - Human Touch Action: Tapped at 0..1000 coordinates X=$normX, Y=$normY on UI element [$clickedNodeDesc].
-            - Image 2 (if present): AFTER Screenshot (the new screen that opened right after the human's tap).
-            
-            Compare Image 1 and Image 2 carefully:
-            1. Identify what screen/situation Image 1 was ("problem").
-            2. Write a crystal-clear actionable instruction ("solutionRule") so that next time the agent sees Image 1, it immediately taps [$clickedNodeDesc] at 0..1000 coordinates ($normX, $normY) to reach Image 2!
+            - Image 2: AFTER Screenshot.
             
             Return ONLY valid JSON:
             {
@@ -434,7 +544,7 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        val (raw, modelUsed) = callWithLadder(prompt, imgs, useDeepAnalyzer = true)
+        val (raw, modelUsed) = callWithLadder(prompt, imgs, useDeep38Flash = true)
         onBrainLog?.invoke("🧠 [$modelUsed] Analyzed Before+After Human Touch for $appCategory")
         return try {
             val j = parseCleanJson(raw)
@@ -448,9 +558,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 4. Frame-by-Frame Uploaded Video Error & Coordinate Extractor (Powered by Gemini 3.8 Flash)
-     * Inspects up to 12 sequential video frames, spots where the agent went wrong or where the user tapped,
-     * and returns structured step-by-step coordinate rules for that app!
+     * 6. Frame-by-Frame Uploaded Video Analyzer
      */
     suspend fun analyzeTrainingVideoFrames(
         appCategory: String,
@@ -462,30 +570,23 @@ class GeminiBrain(private var apiKey: String) {
             The user uploaded a screen-recording video for app "$appCategory" with note: "$userInstruction".
             
             Look at all ${framesBase64.size} sequential video frames carefully:
-            1. Detect every mistake the AI made in the video (for example: tapping the wrong place, getting stuck on 'Comments on this post have been limited', or pressing Back when keyboard wasn't open).
-            2. Detect every correct button/location that needs to be tapped on each screen (estimate its 0.0 to 1.0 screen X,Y ratio from the frame!).
-            3. Extract 3 to 6 concrete step rules for "$appCategory" so that when the user runs this task again, the Baymax Hand taps the 100% exact coordinates on every screen.
+            1. Detect every mistake the AI made in the video and every correct button that needs to be tapped.
+            2. Estimate the exact 0.0 to 1.0 screen X,Y ratio for each target button.
             
             Return ONLY valid JSON with a "rules" array:
             {
               "rules": [
                 {
-                  "screenWhen": "Instagram Search tab open",
-                  "actionInstruction": "Tap top search bar 'Search with Meta AI' and type query",
-                  "tapXRatio": 0.45,
-                  "tapYRatio": 0.07
-                },
-                {
-                  "screenWhen": "Instagram Reel Comment sheet says 'Comments on this post have been limited'",
-                  "actionInstruction": "Press BACK to close comment sheet, then SWIPE up (500,800 -> 500,200) to open next Reel",
+                  "screenWhen": "Description of screen in $appCategory",
+                  "actionInstruction": "Exact button to tap and what to do",
                   "tapXRatio": 0.50,
-                  "tapYRatio": 0.50
+                  "tapYRatio": 0.90
                 }
               ]
             }
         """.trimIndent()
 
-        val (raw, modelUsed) = callWithLadder(prompt, framesBase64, useDeepAnalyzer = true)
+        val (raw, modelUsed) = callWithLadder(prompt, framesBase64, useDeep38Flash = true)
         onBrainLog?.invoke("🎬 [$modelUsed] Completed Frame-by-Frame Video Analysis (${framesBase64.size} frames)")
 
         val extracted = mutableListOf<LearnedFixRecord>()
@@ -529,7 +630,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 5. Zero-Policy-Violation Safe Video Prompt + Viral YouTube Shorts Title Generator
+     * 7. Safe Video Prompt + Viral YouTube Shorts Title Generator
      */
     suspend fun generateFlowSafePromptAndTitle(topic: String): Pair<String, String> {
         val safeRegex = Regex("(?i)\\b(boy|girl|child|kid|minor|baby|skin)\\b")
@@ -538,7 +639,6 @@ class GeminiBrain(private var apiKey: String) {
         val prompt = """
             Create:
             1. A policy-safe, cinematic 8-second vertical 9:16 AI video generation prompt about: "$sanitizedTopic".
-               STRICT RULE: NEVER use words like boy, girl, child, kid, minor, teen, or skin.
             2. A viral YouTube Shorts title with emojis and #shorts #viral hashtags (under 75 chars).
             
             Return ONLY JSON:
@@ -548,7 +648,7 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        val (raw, _) = callWithLadder(prompt, useDeepAnalyzer = false)
+        val (raw, _) = callWithLadder(prompt, useDeep38Flash = false)
         return try {
             val j = parseCleanJson(raw)
             Pair(
