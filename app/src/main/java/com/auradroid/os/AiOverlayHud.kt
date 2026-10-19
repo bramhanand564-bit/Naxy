@@ -1,5 +1,8 @@
 package com.auradroid.os
 
+import android.accessibilityservice.AccessibilityService
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
@@ -15,7 +18,6 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import kotlin.math.hypot
@@ -59,7 +61,9 @@ class AiOverlayHud(
     private val autoCollapseRunnable = Runnable {
         if (!isTaskActivelyRunning) {
             sideBarContainer?.visibility = View.GONE
-            webCardContainer?.visibility = View.GONE
+            if (webCardContainer?.visibility == View.VISIBLE) {
+                setWebCardVisibility(false)
+            }
             baymaxFaceView?.setMood(BotMood.IDLE)
         }
     }
@@ -68,6 +72,33 @@ class AiOverlayHud(
         try {
             WebView.enableSlowWholeDocumentDraw()
         } catch (_: Exception) {}
+    }
+
+    private fun resolveBestOverlayType(): Int {
+        if (context is AccessibilityService) {
+            return WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+        }
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+    }
+
+    private fun addViewWithFallback(view: View, params: WindowManager.LayoutParams) {
+        try {
+            windowManager.addView(view, params)
+        } catch (_: Exception) {
+            // Fallback to standard application overlay if accessibility token is not yet ready
+            params.type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            } else {
+                @Suppress("DEPRECATION")
+                WindowManager.LayoutParams.TYPE_PHONE
+            }
+            windowManager.addView(view, params)
+        }
     }
 
     fun showHud() {
@@ -83,9 +114,14 @@ class AiOverlayHud(
 
     fun hideHud() {
         mainHandler.post {
+            mainHandler.removeCallbacks(autoCollapseRunnable)
+            baymaxFaceView?.stopAnimations()
+            handOverlayView?.stopAnimations()
             if (!isAdded) return@post
             try {
                 podRootLayout?.let { windowManager.removeViewImmediate(it) }
+            } catch (_: Exception) {}
+            try {
                 handOverlayView?.let { windowManager.removeViewImmediate(it) }
             } catch (_: Exception) {}
             isAdded = false
@@ -127,20 +163,33 @@ class AiOverlayHud(
     }
 
     fun getOrCreateBackgroundWebView(): WebView? {
+        if (backgroundWebView == null && !isAdded) {
+            showHud()
+        }
         return backgroundWebView
     }
 
     /**
      * Captures a sharp screenshot directly from the Background WebView's internal canvas
-     * even when the mini window is hidden!
+     * even when the mini window is hidden (View.GONE)!
      */
     fun captureWebViewCanvasBitmap(): Bitmap? {
         val wv = backgroundWebView ?: return null
         return try {
-            val w = wv.width.coerceAtLeast(540)
-            val h = wv.height.coerceAtLeast(960)
-            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val targetW = if (wv.width > 100) wv.width else dp(340)
+            val targetH = if (wv.height > 100) wv.height else dp(600)
+
+            // If WebView is hidden (View.GONE), ensure it is measured & laid out so DOM and canvas are valid
+            if (wv.width <= 100 || wv.height <= 100) {
+                val wSpec = View.MeasureSpec.makeMeasureSpec(targetW, View.MeasureSpec.EXACTLY)
+                val hSpec = View.MeasureSpec.makeMeasureSpec(targetH, View.MeasureSpec.EXACTLY)
+                wv.measure(wSpec, hSpec)
+                wv.layout(0, 0, targetW, targetH)
+            }
+
+            val bmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(bmp)
+            canvas.drawColor(Color.WHITE)
             wv.draw(canvas)
             bmp
         } catch (_: Exception) {
@@ -149,10 +198,10 @@ class AiOverlayHud(
     }
 
     private fun createHandCursorOverlay() {
-        handOverlayView = BaymaxHandOverlayView(context)
-        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else WindowManager.LayoutParams.TYPE_PHONE
+        handOverlayView = BaymaxHandOverlayView(context).apply {
+            alpha = 0f
+        }
+        val overlayType = resolveBestOverlayType()
 
         handOverlayParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -160,22 +209,26 @@ class AiOverlayHud(
             overlayType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         )
-        windowManager.addView(handOverlayView, handOverlayParams)
+        handOverlayView?.let { view ->
+            handOverlayParams?.let { params ->
+                addViewWithFallback(view, params)
+            }
+        }
     }
 
     private fun createFloatingBaymaxPod() {
-        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else WindowManager.LayoutParams.TYPE_PHONE
+        val overlayType = resolveBestOverlayType()
 
         podParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -307,7 +360,7 @@ class AiOverlayHud(
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(dp(6), dp(2), dp(4), dp(2))
             setOnClickListener {
-                webCardContainer?.visibility = View.GONE
+                setWebCardVisibility(false)
             }
         }
 
@@ -321,18 +374,26 @@ class AiOverlayHud(
                 0,
                 1f
             )
+            isFocusable = true
+            isFocusableInTouchMode = true
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.databaseEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             settings.userAgentString =
-                "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
             webViewClient = WebViewClient()
             webChromeClient = WebChromeClient()
+
+            // Pre-measure & layout so background WebView works immediately even while hidden
+            val wSpec = View.MeasureSpec.makeMeasureSpec(dp(340), View.MeasureSpec.EXACTLY)
+            val hSpec = View.MeasureSpec.makeMeasureSpec(dp(600), View.MeasureSpec.EXACTLY)
+            measure(wSpec, hSpec)
+            layout(0, 0, dp(340), dp(600))
         }
 
         webCardContainer?.addView(webHeader)
@@ -342,12 +403,34 @@ class AiOverlayHud(
         podRootLayout?.addView(webCardContainer)
 
         setupDragAndTapOnBaymaxFace()
-        windowManager.addView(podRootLayout, podParams)
+        podRootLayout?.let { root ->
+            podParams?.let { params ->
+                addViewWithFallback(root, params)
+            }
+        }
+    }
+
+    /**
+     * Toggles Web Card and dynamically updates Window focusability so soft keyboard works when open
+     */
+    private fun setWebCardVisibility(show: Boolean) {
+        webCardContainer?.visibility = if (show) View.VISIBLE else View.GONE
+        val params = podParams ?: return
+        val root = podRootLayout ?: return
+        if (show) {
+            params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+            params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        } else {
+            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        }
+        try {
+            if (isAdded) windowManager.updateViewLayout(root, params)
+        } catch (_: Exception) {}
     }
 
     private fun toggleWebCardVisibility() {
-        val vis = webCardContainer?.visibility == View.VISIBLE
-        webCardContainer?.visibility = if (vis) View.GONE else View.VISIBLE
+        val currentlyVisible = webCardContainer?.visibility == View.VISIBLE
+        setWebCardVisibility(!currentlyVisible)
     }
 
     private fun setupDragAndTapOnBaymaxFace() {
@@ -359,6 +442,10 @@ class AiOverlayHud(
 
         baymaxFaceView?.setOnTouchListener { _, event ->
             val params = podParams ?: return@setOnTouchListener false
+            val dm = context.resources.displayMetrics
+            val maxX = (dm.widthPixels - dp(58)).coerceAtLeast(100)
+            val maxY = (dm.heightPixels - dp(90)).coerceAtLeast(200)
+
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     startX = params.x
@@ -373,8 +460,8 @@ class AiOverlayHud(
                     val dy = (event.rawY - touchY).toInt()
                     if (hypot(dx.toDouble(), dy.toDouble()) > dp(8)) {
                         isDragging = true
-                        params.x = startX + dx
-                        params.y = startY + dy
+                        params.x = (startX + dx).coerceIn(0, maxX)
+                        params.y = (startY + dy).coerceIn(0, maxY)
                         try {
                             windowManager.updateViewLayout(podRootLayout, params)
                         } catch (_: Exception) {}
@@ -396,7 +483,7 @@ class AiOverlayHud(
         mainHandler.removeCallbacks(autoCollapseRunnable)
         if (sideBarContainer?.visibility == View.VISIBLE && !isTaskActivelyRunning) {
             sideBarContainer?.visibility = View.GONE
-            webCardContainer?.visibility = View.GONE
+            setWebCardVisibility(false)
         } else {
             sideBarContainer?.visibility = View.VISIBLE
             if (!isTaskActivelyRunning) {
@@ -417,6 +504,8 @@ class AiOverlayHud(
         private var blinkScaleY = 1f
         private var gazeOffsetX = 0f
         private var gazeOffsetY = 0f
+        private var blinkAnimator: ValueAnimator? = null
+        private var isRunningBlinkLoop = false
 
         private val headPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor("#F8FAFC")
@@ -444,7 +533,9 @@ class AiOverlayHud(
 
         private val blinkRunnable = object : Runnable {
             override fun run() {
-                ValueAnimator.ofFloat(1f, 0.08f, 1f).apply {
+                if (!isRunningBlinkLoop) return
+                blinkAnimator?.cancel()
+                blinkAnimator = ValueAnimator.ofFloat(1f, 0.08f, 1f).apply {
                     duration = 220L
                     addUpdateListener {
                         blinkScaleY = it.animatedValue as Float
@@ -452,14 +543,35 @@ class AiOverlayHud(
                     }
                     start()
                 }
-                val nextBlink = if (currentMood == BotMood.THINKING) 1600L else 3400L
+                if (currentMood == BotMood.THINKING) {
+                    gazeOffsetX = if (gazeOffsetX <= 0f) dp(1).toFloat() else -dp(1).toFloat()
+                }
+                val nextBlink = if (currentMood == BotMood.THINKING) 1400L else 3200L
                 mainHandler.postDelayed(this, nextBlink)
             }
         }
 
         init {
             setLayerType(LAYER_TYPE_SOFTWARE, null)
-            mainHandler.postDelayed(blinkRunnable, 2000L)
+        }
+
+        override fun onAttachedToWindow() {
+            super.onAttachedToWindow()
+            if (!isRunningBlinkLoop) {
+                isRunningBlinkLoop = true
+                mainHandler.postDelayed(blinkRunnable, 1800L)
+            }
+        }
+
+        override fun onDetachedFromWindow() {
+            stopAnimations()
+            super.onDetachedFromWindow()
+        }
+
+        fun stopAnimations() {
+            isRunningBlinkLoop = false
+            mainHandler.removeCallbacks(blinkRunnable)
+            blinkAnimator?.cancel()
         }
 
         fun setMood(mood: BotMood) {
@@ -539,6 +651,7 @@ class AiOverlayHud(
     /**
      * Cute Plump Baymax Hand Cursor Overlay (No flight trail lines!)
      * Appears directly at the dead-center of the button being tapped or swiped.
+     * Automatically sets view alpha = 0f when idle so Android 12+ never blocks touches underneath!
      */
     private inner class BaymaxHandOverlayView(context: Context) : View(context) {
         private var handX = -100f
@@ -546,6 +659,7 @@ class AiOverlayHud(
         private var handAlpha = 0
         private var rippleRadius = 0f
         private var pressScale = 1f
+        private var activeAnimator: ValueAnimator? = null
 
         private val handFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor("#F8FAFC")
@@ -564,11 +678,19 @@ class AiOverlayHud(
             strokeWidth = dp(2).toFloat()
         }
 
+        fun stopAnimations() {
+            activeAnimator?.cancel()
+            handAlpha = 0
+            alpha = 0f
+        }
+
         fun triggerPlumpHandTap(x: Float, y: Float) {
+            activeAnimator?.cancel()
             handX = x
             handY = y
-            ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 480L
+            alpha = 1f
+            activeAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 460L
                 interpolator = DecelerateInterpolator()
                 addUpdateListener { anim ->
                     val f = anim.animatedValue as Float
@@ -577,13 +699,22 @@ class AiOverlayHud(
                     pressScale = if (f < 0.35f) 0.85f else 1f
                     invalidate()
                 }
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        handAlpha = 0
+                        alpha = 0f
+                        invalidate()
+                    }
+                })
                 start()
             }
         }
 
         fun triggerPlumpHandSwipe(startX: Float, startY: Float, endX: Float, endY: Float) {
-            ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 520L
+            activeAnimator?.cancel()
+            alpha = 1f
+            activeAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 500L
                 interpolator = DecelerateInterpolator()
                 addUpdateListener { anim ->
                     val f = anim.animatedValue as Float
@@ -594,6 +725,13 @@ class AiOverlayHud(
                     pressScale = 0.92f
                     invalidate()
                 }
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        handAlpha = 0
+                        alpha = 0f
+                        invalidate()
+                    }
+                })
                 start()
             }
         }
