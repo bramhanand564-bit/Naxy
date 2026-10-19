@@ -28,6 +28,7 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
+import android.webkit.WebView
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -99,11 +100,13 @@ class AutoTouchService : AccessibilityService() {
     private var consecutiveSameScreenCount = 0
     private var lastScreenSignature = ""
 
-    // Captures each run's screenshots & steps for the new Automation Runs History
+    // Run Session Tracking for Post-Run Gemini 3.8 Auto-Reflection
     private val currentRunBitmaps = mutableListOf<Bitmap>()
     private val currentRunSteps = mutableListOf<String>()
+    private val currentPlannedSteps = mutableListOf<String>()
     private var activeRunId = ""
     private var activeRunTitle = ""
+    private var activeRunFinalized = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -214,6 +217,9 @@ class AutoTouchService : AccessibilityService() {
         )
     }
 
+    /**
+     * Real-Time Before + After Screenshot Human Touch Learning
+     */
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -241,11 +247,15 @@ class AutoTouchService : AccessibilityService() {
             val goal = currentTaskGoal
             val sig = lastScreenSignature
 
-            log("👆 Human Touch Intervention on [$nodeDesc]! Capturing AFTER screenshot...")
+            log("👆 Human Touch Detected on [$nodeDesc]! Capturing AFTER screenshot...")
+            currentRunSteps.add("Human Intervened: Tapped [$nodeDesc] at (${rect.centerX()}, ${rect.centerY()})")
 
             serviceScope.launch {
                 delay(1200L)
                 val afterBitmap = takeHdDisplayScreenshotWithTimeout(2000L)
+                if (afterBitmap != null) {
+                    currentRunBitmaps.add(afterBitmap)
+                }
                 withContext(Dispatchers.IO) {
                     val (prob, rule) = geminiBrain.analyzeBeforeAfterHumanTouchWith38Flash(
                         appCategory = cat,
@@ -275,16 +285,68 @@ class AutoTouchService : AccessibilityService() {
 
     override fun onInterrupt() {}
 
+    /**
+     * Saves the Run Session and automatically triggers Gemini 3.8 Flash Post-Run Self-Reflection!
+     */
+    private fun finalizeRunAndTriggerAutoReflection(finalStatus: String) {
+        if (activeRunFinalized || activeRunId.isEmpty()) return
+        activeRunFinalized = true
+
+        val rId = activeRunId
+        val rTitle = activeRunTitle
+        val rCat = currentAppCategory
+        val rGoal = currentTaskGoal
+        val rPlanned = currentPlannedSteps.toList()
+        val rSteps = currentRunSteps.toList()
+        val rBitmaps = currentRunBitmaps.toList()
+
+        memoryVault.saveAutomationRunSession(
+            runId = rId,
+            title = rTitle,
+            appCategory = rCat,
+            status = finalStatus,
+            stepsSummary = rSteps,
+            capturedBitmaps = rBitmaps
+        )
+
+        if (rBitmaps.isNotEmpty() || rSteps.isNotEmpty()) {
+            serviceScope.launch(Dispatchers.IO) {
+                log("🧠 Gemini 3.8 Post-Run Auto-Reflection started for '$rTitle' [$finalStatus]...")
+                val reflection = geminiBrain.autoReflectAndImproveAfterRun(
+                    appCategory = rCat,
+                    goal = rGoal,
+                    plannedSteps = rPlanned,
+                    actualStepsTaken = rSteps,
+                    finalStatus = finalStatus,
+                    runBitmaps = rBitmaps
+                )
+
+                memoryVault.appendChatToAutomationRun(
+                    runId = rId,
+                    sender = "Gemini 3.8 Auto-Reflection",
+                    message = reflection.reflectionSummary
+                )
+
+                for (rule in reflection.learnedRules) {
+                    memoryVault.saveStuckOrHumanFix(
+                        category = rCat,
+                        screenSignature = rule.screenSignature,
+                        problemDescription = rule.problemDescription,
+                        solutionRule = rule.solutionRule,
+                        tapXRatio = rule.tapXRatio,
+                        tapYRatio = rule.tapYRatio,
+                        sourceType = rule.sourceType
+                    )
+                }
+                log("✨ Auto-Reflection Complete! Saved ${reflection.learnedRules.size} optimized rules in Memory/$rCat.")
+            }
+        }
+    }
+
     fun stopCurrentTask(reason: String = "Stopped") {
-        if (isAgentRunning && activeRunId.isNotEmpty()) {
-            memoryVault.saveAutomationRunSession(
-                runId = activeRunId,
-                title = activeRunTitle,
-                appCategory = currentAppCategory,
-                status = if (reason.contains("Complete", true)) "SUCCESS" else "STOPPED",
-                stepsSummary = currentRunSteps,
-                capturedBitmaps = currentRunBitmaps
-            )
+        if (isAgentRunning) {
+            val status = if (reason.contains("Complete", true)) "SUCCESS" else "STOPPED"
+            finalizeRunAndTriggerAutoReflection(status)
         }
         isAgentRunning = false
         currentTaskJob?.cancel()
@@ -313,8 +375,12 @@ class AutoTouchService : AccessibilityService() {
 
         activeRunId = "run_${System.currentTimeMillis()}"
         activeRunTitle = goal.take(35)
+        activeRunFinalized = false
         currentRunBitmaps.clear()
         currentRunSteps.clear()
+        currentPlannedSteps.clear()
+        currentPlannedSteps.addAll(plannedSteps)
+        currentAppCategory = memoryVault.resolveCategoryFolder("", goal)
 
         currentTaskJob = serviceScope.launch {
             try {
@@ -330,6 +396,7 @@ class AutoTouchService : AccessibilityService() {
 
                 if (execMode == "BACKGROUND_WEB") {
                     runBackgroundWebAgentLoop(goal, plannedSteps)
+                    finalizeRunAndTriggerAutoReflection("SUCCESS")
                     return@launch
                 }
 
@@ -347,7 +414,7 @@ class AutoTouchService : AccessibilityService() {
                     hud.updateStatus("🚀 Opening $autoTargetApp...", BotMood.WORKING, taskRunning = true)
                     launchAppByNameOrPackage(autoTargetApp)
                     stepHistory.add("Opened $autoTargetApp app")
-                    currentRunSteps.add("Opened $autoTargetApp app")
+                    currentRunSteps.add("Step 0: Directly opened $autoTargetApp app")
                     delay(3200L)
                 }
 
@@ -372,13 +439,12 @@ class AutoTouchService : AccessibilityService() {
                         lastScreenSignature = currentSig
                     }
 
-                    // Instagram "Comments limited" auto-handler
                     val hasLimitedComments = taggedElements.any {
                         it.label.contains("Comments on this post have been limited", true) ||
                             it.label.contains("comments are limited", true)
                     }
                     if (hasLimitedComments) {
-                        log("⚠️ Detected limited comments! Swipe to next Reel...")
+                        log("⚠️ Detected limited comments! Swiping to next Reel...")
                         hud.updateStatus("Comments limited -> Next Reel", BotMood.WORKING, taskRunning = true)
                         performGlobalAction(GLOBAL_ACTION_BACK)
                         delay(1200L)
@@ -389,7 +455,7 @@ class AutoTouchService : AccessibilityService() {
                             (specs.screenHeight * 0.22f).toInt()
                         )
                         stepHistory.add("Closed limited comment sheet and swiped to next Reel")
-                        currentRunSteps.add("Skipped limited comments reel")
+                        currentRunSteps.add("Step $stepNumber: Skipped limited comments reel")
                         delay(2200L)
                         continue
                     }
@@ -436,14 +502,7 @@ class AutoTouchService : AccessibilityService() {
                             } else {
                                 hud.updateStatus("🎉 Task Complete!", BotMood.HAPPY, taskRunning = false)
                                 log("✅ Task Completed Successfully: ${decision.reason}")
-                                memoryVault.saveAutomationRunSession(
-                                    runId = activeRunId,
-                                    title = activeRunTitle,
-                                    appCategory = currentAppCategory,
-                                    status = "SUCCESS",
-                                    stepsSummary = currentRunSteps,
-                                    capturedBitmaps = currentRunBitmaps
-                                )
+                                finalizeRunAndTriggerAutoReflection("SUCCESS")
                                 isAgentRunning = false
                                 break
                             }
@@ -546,25 +605,11 @@ class AutoTouchService : AccessibilityService() {
                     }
                 }
             } catch (_: CancellationException) {
-                memoryVault.saveAutomationRunSession(
-                    runId = activeRunId,
-                    title = activeRunTitle,
-                    appCategory = currentAppCategory,
-                    status = "STOPPED",
-                    stepsSummary = currentRunSteps,
-                    capturedBitmaps = currentRunBitmaps
-                )
+                finalizeRunAndTriggerAutoReflection("STOPPED")
                 hud.updateStatus("Stopped", BotMood.IDLE, taskRunning = false)
             } catch (e: Exception) {
                 log("⚠️ Task Exception: ${e.message}")
-                memoryVault.saveAutomationRunSession(
-                    runId = activeRunId,
-                    title = activeRunTitle,
-                    appCategory = currentAppCategory,
-                    status = "FAILED",
-                    stepsSummary = currentRunSteps,
-                    capturedBitmaps = currentRunBitmaps
-                )
+                finalizeRunAndTriggerAutoReflection("FAILED")
                 hud.updateStatus("Paused", BotMood.ERROR, taskRunning = false)
             } finally {
                 isAgentRunning = false
@@ -581,6 +626,16 @@ class AutoTouchService : AccessibilityService() {
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
         geminiBrain.updateApiKey(prefs.getString("gemini_api_key", "") ?: "")
 
+        activeRunId = "run_yt_${System.currentTimeMillis()}"
+        activeRunTitle = "YouTube Upload: ${rawDisplayName.take(20)}"
+        activeRunFinalized = false
+        currentAppCategory = "YouTube"
+        currentTaskGoal = "Upload video $rawDisplayName to YouTube Shorts"
+        currentPlannedSteps.clear()
+        currentPlannedSteps.addAll(listOf("Click Next on Trimmer", "Click Next on Editor", "Paste Caption", "Click Upload Short"))
+        currentRunBitmaps.clear()
+        currentRunSteps.clear()
+
         currentTaskJob = serviceScope.launch {
             try {
                 isAgentRunning = true
@@ -590,10 +645,13 @@ class AutoTouchService : AccessibilityService() {
                 val (_, viralTitle) = geminiBrain.generateFlowSafePromptAndTitle(cleanTopic)
                 log("✨ Generated Viral Title: $viralTitle")
                 uploadVideoUriToYouTubeShorts(videoUri, viralTitle)
+                finalizeRunAndTriggerAutoReflection("SUCCESS")
             } catch (_: CancellationException) {
+                finalizeRunAndTriggerAutoReflection("STOPPED")
                 hud.updateStatus("Stopped", BotMood.IDLE, taskRunning = false)
             } catch (e: Exception) {
                 log("⚠️ Upload Error: ${e.message}")
+                finalizeRunAndTriggerAutoReflection("FAILED")
                 hud.updateStatus("Upload Paused", BotMood.ERROR, taskRunning = false)
             } finally {
                 isAgentRunning = false
@@ -609,6 +667,16 @@ class AutoTouchService : AccessibilityService() {
         currentTaskJob?.cancel()
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
         geminiBrain.updateApiKey(prefs.getString("gemini_api_key", "") ?: "")
+
+        activeRunId = "run_yt_${System.currentTimeMillis()}"
+        activeRunTitle = "YouTube Folder Auto-Upload"
+        activeRunFinalized = false
+        currentAppCategory = "YouTube"
+        currentTaskGoal = "Upload video from folder $folderInputRaw to YouTube Shorts"
+        currentPlannedSteps.clear()
+        currentPlannedSteps.addAll(listOf("Select Video", "Tap Next twice", "Paste Title in Caption box", "Tap Upload Short"))
+        currentRunBitmaps.clear()
+        currentRunSteps.clear()
 
         currentTaskJob = serviceScope.launch {
             try {
@@ -631,11 +699,13 @@ class AutoTouchService : AccessibilityService() {
                         uploadVideoUriToYouTubeShorts(uri, viralTitle)
                         uploadedSet.add(uri.toString())
                         prefs.edit().putStringSet("uploaded_videos_set", uploadedSet).apply()
+                        finalizeRunAndTriggerAutoReflection("SUCCESS")
                         return@launch
                     }
 
                     hud.updateStatus("No new videos found!", BotMood.ERROR, taskRunning = false)
                     log("⚠️ No un-uploaded videos found in [${resolvedDir.absolutePath}].")
+                    finalizeRunAndTriggerAutoReflection("FAILED")
                     return@launch
                 }
 
@@ -657,10 +727,13 @@ class AutoTouchService : AccessibilityService() {
 
                 uploadedSet.add(chosenVideo.absolutePath)
                 prefs.edit().putStringSet("uploaded_videos_set", uploadedSet).apply()
+                finalizeRunAndTriggerAutoReflection("SUCCESS")
             } catch (_: CancellationException) {
+                finalizeRunAndTriggerAutoReflection("STOPPED")
                 hud.updateStatus("Stopped", BotMood.IDLE, taskRunning = false)
             } catch (e: Exception) {
                 log("⚠️ YouTube Upload Error: ${e.message}")
+                finalizeRunAndTriggerAutoReflection("FAILED")
                 hud.updateStatus("Upload Paused", BotMood.ERROR, taskRunning = false)
             } finally {
                 isAgentRunning = false
@@ -763,11 +836,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Perfected YouTube Shorts Uploader:
-     * - Only presses Next 2 times max to reach Add details screen[span_0](start_span)[span_0](end_span)[span_1](start_span)[span_1](end_span)[span_2](start_span)[span_2](end_span)
-     * - Pastes title and taps Upload Short dead-center[span_3](start_span)[span_3](end_span)[span_4](start_span)[span_4](end_span)[span_5](start_span)[span_5](end_span)
-     */
     private suspend fun uploadVideoUriToYouTubeShorts(videoUri: Uri, viralTitle: String) {
         val specs = getCalibratedDeviceBodySpecs()
 
@@ -786,26 +854,34 @@ class AutoTouchService : AccessibilityService() {
         log("🚀 Sent video to YouTube Shorts. Waiting for Trimmer...")
         delay(5000L)
 
-        // Step 1 & 2: Advance past Trimmer & Editor screens (max 2 Next clicks)[span_6](start_span)[span_6](end_span)[span_7](start_span)[span_7](end_span)[span_8](start_span)[span_8](end_span)
+        // Step 1 & 2: Advance past Trimmer & Editor screens (max 2 Next clicks)
         for (attempt in 1..2) {
             if (!isAgentRunning) return
+            takeHdDisplayScreenshotWithTimeout(2000L)?.let { currentRunBitmaps.add(it) }
             val fallbackX = (specs.screenWidth * 0.88f).toInt()
             val fallbackY = (specs.screenHeight * 0.94f).toInt()
             hud.updateStatus("Tap: Next (#$attempt)", BotMood.WORKING, taskRunning = true)
             log("👆 Tapping Next button ($fallbackX, $fallbackY)")
             performPhysicalTap(fallbackX, fallbackY)
+            currentRunSteps.add("Tapped Next (#$attempt) at ($fallbackX, $fallbackY)")
             delay(4200L)
         }
 
-        // Step 3: Tap 'Caption your Short' & Paste Viral Title[span_9](start_span)[span_9](end_span)[span_10](start_span)[span_10](end_span)[span_11](start_span)[span_11](end_span)
+        // Step 3: Tap 'Caption your Short' & Paste Viral Title
+        takeHdDisplayScreenshotWithTimeout(2000L)?.let {
+            lastStepScreenshot = it
+            currentRunBitmaps.add(it)
+        }
         hud.updateStatus("Typing Viral Caption...", BotMood.WORKING, taskRunning = true)
         val capX = (specs.screenWidth * 0.52f).toInt()
         val capY = (specs.screenHeight * 0.16f).toInt()
         log("👆 Tapping Caption Box ($capX, $capY)")
         performPhysicalTap(capX, capY)
+        currentRunSteps.add("Tapped Caption Box at ($capX, $capY)")
         delay(1600L)
 
         typeAndPasteTextReliably(viralTitle)
+        currentRunSteps.add("Pasted Viral Title: $viralTitle")
         delay(1200L)
 
         if (isSoftKeyboardOpen()) {
@@ -814,9 +890,10 @@ class AutoTouchService : AccessibilityService() {
             delay(1400L)
         }
 
-        // Step 4: Tap White 'Upload Short' Button at Bottom Center (96.4% height)[span_12](start_span)[span_12](end_span)[span_13](start_span)[span_13](end_span)[span_14](start_span)[span_14](end_span)
+        // Step 4: Tap White 'Upload Short' Button at Bottom Center (96.4% height)
         for (retry in 1..3) {
             if (!isAgentRunning) return
+            takeHdDisplayScreenshotWithTimeout(2000L)?.let { currentRunBitmaps.add(it) }
             val postElements = scanScreenInteractiveElements(specs)
             val uploadNode = postElements.find {
                 it.label.contains("Upload Short", true) || it.label.equals("Upload", true)
@@ -828,6 +905,7 @@ class AutoTouchService : AccessibilityService() {
             hud.updateStatus("Tap: Upload Short (#$retry)", BotMood.WORKING, taskRunning = true)
             log("👆 Physical Tap on Upload Short Center ($tapX, $tapY)")
             performPhysicalTap(tapX, tapY)
+            currentRunSteps.add("Tapped Upload Short (#$retry) at ($tapX, $tapY)")
             delay(4200L)
 
             val afterElements = scanScreenInteractiveElements(specs)
@@ -954,6 +1032,9 @@ class AutoTouchService : AccessibilityService() {
             val domTagList = injectVisualNumberStickersInWebView(webView)
             delay(400L)
             val webBitmap = hud.captureWebViewCanvasBitmap()
+            if (webBitmap != null) {
+                currentRunBitmaps.add(webBitmap)
+            }
 
             val decision = geminiBrain.decideNextStep(
                 goal = goal,
@@ -968,6 +1049,7 @@ class AutoTouchService : AccessibilityService() {
             )
 
             log("🌐 Web Step $step [${decision.modelUsed}]: ${decision.action} -> ${decision.reason}")
+            currentRunSteps.add("Web Step $step: ${decision.action} (${decision.reason})")
             if (decision.action == "DONE") {
                 hud.updateStatus("🎉 Web Task Done!", BotMood.HAPPY, taskRunning = false)
                 break
@@ -1002,7 +1084,7 @@ class AutoTouchService : AccessibilityService() {
                     return summary.join('\\n');
                 })();
             """.trimIndent()
-            webView.evaluateJavascript(js) { res ->
+            webView.evaluateJavascript(js) { res: String? ->
                 cont.resume(res?.trim('"')?.replace("\\n", "\n") ?: "")
             }
         }
@@ -1045,7 +1127,7 @@ class AutoTouchService : AccessibilityService() {
                     return '';
                 })();
             """.trimIndent()
-            webView.evaluateJavascript(js) { res ->
+            webView.evaluateJavascript(js) { res: String? ->
                 cont.resume(res?.trim('"') ?: "")
             }
         }
