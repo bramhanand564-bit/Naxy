@@ -103,7 +103,6 @@ class AutoTouchService : AccessibilityService() {
     private var consecutiveSameScreenCount = 0
     private var lastScreenSignature = ""
 
-    // Run Session Tracking for Post-Run Gemini 3.8 Auto-Reflection (Capped to prevent OOM)
     private val currentRunBitmaps = mutableListOf<Bitmap>()
     private val currentRunSteps = mutableListOf<String>()
     private val currentPlannedSteps = mutableListOf<String>()
@@ -231,16 +230,13 @@ class AutoTouchService : AccessibilityService() {
         )
     }
 
-    /**
-     * Real-Time Before + After Screenshot Human Touch Learning
-     */
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
         val teachEnabled = prefs.getBoolean("passive_teach_mode", true)
 
         val timeSinceAgentTap = System.currentTimeMillis() - lastAgentTapTimestamp
-        if (teachEnabled && isAgentRunning && timeSinceAgentTap > 1100L &&
+        if (teachEnabled && isAgentRunning && timeSinceAgentTap > 1400L &&
             event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED
         ) {
             val pkg = event.packageName?.toString() ?: ""
@@ -297,9 +293,6 @@ class AutoTouchService : AccessibilityService() {
 
     override fun onInterrupt() {}
 
-    /**
-     * Saves the Run Session and automatically triggers Gemini 3.8 Flash Post-Run Self-Reflection!
-     */
     private fun finalizeRunAndTriggerAutoReflection(finalStatus: String) {
         if (activeRunFinalized || activeRunId.isEmpty()) return
         activeRunFinalized = true
@@ -368,7 +361,7 @@ class AutoTouchService : AccessibilityService() {
     }
 
     /**
-     * Universal Autonomous Goal-Based Executor
+     * Universal Autonomous Goal-Based Executor + Direct Chat Scheduler & Upload Trigger
      */
     fun startUniversalTask(
         goal: String,
@@ -380,6 +373,38 @@ class AutoTouchService : AccessibilityService() {
         geminiBrain.updateApiKey(prefs.getString("gemini_api_key", "") ?: "")
 
         val execMode = forceMode ?: prefs.getString("execution_mode", "LIVE_PHONE") ?: "LIVE_PHONE"
+
+        // 1. Check if user set Daily Upload Schedule Time directly from Chat!
+        if (execMode.startsWith("SCHEDULE_YT_")) {
+            val timeHm = execMode.removePrefix("SCHEDULE_YT_").trim().ifEmpty { "19:00" }
+            val pipeType = if (goal.contains("flow", true)) "FLOW_YT" else "FOLDER_YT"
+            prefs.edit()
+                .putBoolean("scheduler_enabled", true)
+                .putString("schedule_time_hm", timeHm)
+                .putString("scheduled_pipeline_type", pipeType)
+                .apply()
+            hud.updateStatus("⏰ Daily Upload Set: $timeHm", BotMood.HAPPY, taskRunning = false)
+            log("⏰ Chat Activated 24/7 Daily YouTube Scheduler at $timeHm [$pipeType]!")
+            return
+        }
+
+        // 2. Check if user triggered Folder or Flow YouTube Upload directly from Chat!
+        if (execMode == "YOUTUBE_FOLDER_UPLOAD") {
+            val folder = prefs.getString(
+                "yt_folder_path",
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
+            ) ?: ""
+            val pickOldest = prefs.getBoolean("yt_pick_oldest", true)
+            startYouTubeFolderAutoUpload(folder, pickOldest)
+            return
+        }
+        if (execMode == "GOOGLE_FLOW_UPLOAD") {
+            val topic = prefs.getString("flow_topic", goal.take(40)) ?: goal.take(40)
+            val count = prefs.getInt("flow_daily_videos", 1)
+            startGoogleFlowToYouTubePipeline(topic, count)
+            return
+        }
+
         val isContinuousMonitor = goal.contains("बात करते रहो", true) ||
             goal.contains("monitor", true) ||
             goal.contains("wait for reply", true) ||
@@ -403,6 +428,7 @@ class AutoTouchService : AccessibilityService() {
                 lastScreenSignature = ""
                 val stepHistory = mutableListOf<String>()
                 var stepNumber = 0
+                var hasAlreadyCommentedInThisRun = false
 
                 hud.updateStatus("Starting: ${goal.take(22)}...", BotMood.THINKING, taskRunning = true)
                 log("🚀 Starting Task [$execMode]: $goal")
@@ -452,21 +478,31 @@ class AutoTouchService : AccessibilityService() {
                         lastScreenSignature = currentSig
                     }
 
-                    // Auto-recover if stuck on exact same screen 3 times in a row
+                    // Auto-Close Instagram Comment Sheet if comment was ALREADY posted in this run!
+                    if (hasAlreadyCommentedInThisRun && activePkg.contains("instagram")) {
+                        val commentSheetStillOpen = taggedElements.any {
+                            it.label.contains("Join the conversation", true) ||
+                                it.label.contains("Add a comment", true) ||
+                                it.label.equals("Reply", true)
+                        }
+                        if (commentSheetStillOpen) {
+                            log("⌨️ Comment already posted! Auto-closing Comment Sheet to expose Share button...")
+                            hud.updateStatus("Closing Comment Sheet...", BotMood.WORKING, taskRunning = true)
+                            if (isSoftKeyboardOpen()) {
+                                performGlobalAction(GLOBAL_ACTION_BACK)
+                                delay(1000L)
+                            }
+                            performGlobalAction(GLOBAL_ACTION_BACK)
+                            delay(1400L)
+                            stepHistory.add("Closed comment sheet to return to Reel screen")
+                            continue
+                        }
+                    }
+
                     if (consecutiveSameScreenCount >= 3) {
                         log("⚠️ Screen unchanged for 3 steps! Performing smart unstick...")
-                        if (isSoftKeyboardOpen()) {
-                            performGlobalAction(GLOBAL_ACTION_BACK)
-                            stepHistory.add("Closed keyboard to unstick view")
-                        } else {
-                            performPhysicalSwipe(
-                                specs.screenWidth / 2,
-                                (specs.screenHeight * 0.70f).toInt(),
-                                specs.screenWidth / 2,
-                                (specs.screenHeight * 0.35f).toInt()
-                            )
-                            stepHistory.add("Slightly scrolled screen to reveal hidden buttons")
-                        }
+                        performGlobalAction(GLOBAL_ACTION_BACK)
+                        stepHistory.add("Pressed BACK to unstick keyboard/sheet")
                         consecutiveSameScreenCount = 1
                         delay(1500L)
                     }
@@ -503,22 +539,21 @@ class AutoTouchService : AccessibilityService() {
                         "[${it.tagId}] ${it.label} (${it.className}) -> Center(${it.centerX}, ${it.centerY})"
                     }
 
-                    // Free-Tier Rate Limit Pacing: Ensure at least 3.2s gap between Gemini API calls to prevent HTTP 429
                     val elapsedSinceLastAi = System.currentTimeMillis() - lastAiCallTimestamp
-                    if (elapsedSinceLastAi in 1..3199L) {
-                        delay(3200L - elapsedSinceLastAi)
+                    if (elapsedSinceLastAi in 1..2500L) {
+                        delay(2500L - elapsedSinceLastAi)
                     }
 
                     hud.updateStatus("🧠 Step $stepNumber Thinking...", BotMood.THINKING, taskRunning = true)
                     lastAiCallTimestamp = System.currentTimeMillis()
 
                     val effectiveHistory = if (isStuck) {
-                        stepHistory + "⚠️ WARNING: Screen did NOT change after last action! Try a different TAG_ID or use CLICK_XY on the visual screenshot button!"
+                        stepHistory + "⚠️ WARNING: Screen did NOT change after last action! Do NOT repeat the last tap!"
                     } else {
                         stepHistory
                     }
 
-                    val decision = withTimeoutOrNull(32000L) {
+                    val decision = withTimeoutOrNull(24000L) {
                         geminiBrain.decideNextStep(
                             goal = goal,
                             planSteps = plannedSteps,
@@ -579,7 +614,7 @@ class AutoTouchService : AccessibilityService() {
                                 performPhysicalTap(px, py)
                                 stepHistory.add("Tapped XY($px,$py)")
                             }
-                            delay(2200L + Random.nextLong(150L, 400L))
+                            delay(2200L + Random.nextLong(150L, 350L))
                         }
 
                         "CLICK_XY" -> {
@@ -593,7 +628,7 @@ class AutoTouchService : AccessibilityService() {
                                 performPhysicalTap(px, py)
                                 stepHistory.add("Tapped XY($px,$py)")
                             }
-                            delay(2200L + Random.nextLong(150L, 400L))
+                            delay(2200L + Random.nextLong(150L, 350L))
                         }
 
                         "LONG_PRESS_XY" -> {
@@ -609,25 +644,38 @@ class AutoTouchService : AccessibilityService() {
                             val targetLabel = target?.label ?: ""
                             if (target != null) {
                                 tapElementSmartly(target, forceAccessibilityClick = false)
-                                delay(850L)
+                                delay(900L)
                             } else if (decision.x > 0 && decision.y > 0) {
                                 performPhysicalTap(
                                     convertNormalizedX(decision.x, specs),
                                     convertNormalizedY(decision.y, specs)
                                 )
-                                delay(850L)
+                                delay(900L)
                             }
 
                             val typedOk = typeAndPasteTextReliably(decision.text, target?.node)
-                            stepHistory.add("Typed '${decision.text}'")
                             delay(1000L)
 
                             if (activePkg.contains("whatsapp") || isContinuousMonitor) {
                                 clickWhatsAppSendIfPresent()
+                                stepHistory.add("Typed and sent '${decision.text}'")
                             } else if (activePkg.contains("instagram") || activePkg.contains("youtube")) {
-                                handleSmartPostOrSearchAfterType(decision.text, targetLabel, decision.reason, typedOk)
+                                val wasCommentSubmitted = handleSmartPostOrSearchAfterType(
+                                    typedText = decision.text,
+                                    targetLabel = targetLabel,
+                                    decisionReason = decision.reason,
+                                    typedOk = typedOk
+                                )
+                                if (wasCommentSubmitted) {
+                                    hasAlreadyCommentedInThisRun = true
+                                    stepHistory.add("COMPLETED COMMENT: Typed and posted comment '${decision.text}' and closed comment sheet!")
+                                } else {
+                                    stepHistory.add("Typed '${decision.text}' and submitted")
+                                }
+                            } else {
+                                stepHistory.add("Typed '${decision.text}'")
                             }
-                            delay(2000L)
+                            delay(1800L)
                         }
 
                         "SWIPE" -> {
@@ -642,10 +690,10 @@ class AutoTouchService : AccessibilityService() {
 
                         "WAIT" -> {
                             hud.updateStatus("⏳ ${decision.reason}", BotMood.THINKING, taskRunning = true)
-                            delay(3200L)
+                            delay(2800L)
                         }
 
-                        else -> delay(2200L)
+                        else -> delay(2000L)
                     }
                 }
             } catch (_: CancellationException) {
@@ -662,9 +710,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Direct Single Picked Video URI -> YouTube Shorts Auto-Uploader
-     */
     fun startSinglePickedVideoYouTubeUpload(videoUri: Uri, rawDisplayName: String) {
         currentTaskJob?.cancel()
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -704,9 +749,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Folder Video -> YouTube Shorts Auto-Uploader
-     */
     fun startYouTubeFolderAutoUpload(folderInputRaw: String, pickOldestFirst: Boolean) {
         currentTaskJob?.cancel()
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -880,6 +922,9 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
+    /**
+     * 100% Fixed YouTube Shorts & Video Uploader
+     */
     private suspend fun uploadVideoUriToYouTubeShorts(videoUri: Uri, viralTitle: String) {
         val specs = getCalibratedDeviceBodySpecs()
 
@@ -895,19 +940,31 @@ class AutoTouchService : AccessibilityService() {
         }
 
         hud.updateStatus("Opening YouTube Shorts...", BotMood.WORKING, taskRunning = true)
-        log("🚀 Sent video to YouTube Shorts. Waiting for Trimmer...")
+        log("🚀 Sent video to YouTube Shorts. Waiting for screen...")
         delay(5000L)
 
-        // Step 1 & 2: Advance past Trimmer & Editor screens (max 2 Next clicks)
+        // Step 1 & 2: Advance past Trimmer & Editor ONLY if not already on 'Add details' screen!
         for (attempt in 1..2) {
             if (!isAgentRunning) return
-            recordRunBitmapSafely(takeHdDisplayScreenshotWithTimeout(2000L))
             val screenElements = scanScreenInteractiveElements(specs)
+
+            val alreadyOnAddDetails = screenElements.any {
+                it.label.contains("Add details", true) ||
+                    it.label.contains("Caption your Short", true) ||
+                    it.label.contains("Create a title", true) ||
+                    it.label.contains("Upload Short", true)
+            }
+            if (alreadyOnAddDetails) {
+                log("✅ Already on 'Add details' screen! Skipping Next (#$attempt).")
+                break
+            }
+
+            recordRunBitmapSafely(takeHdDisplayScreenshotWithTimeout(2000L))
             val nextNode = screenElements.find {
                 it.label.equals("Next", true) || it.label.equals("आगे बढ़ें", true)
             }
-            val tapX = nextNode?.centerX ?: (specs.screenWidth * 0.88f).toInt()
-            val tapY = nextNode?.centerY ?: (specs.screenHeight * 0.94f).toInt()
+            val tapX = nextNode?.centerX ?: (specs.screenWidth * 0.86f).toInt()
+            val tapY = nextNode?.centerY ?: (specs.screenHeight * 0.955f).toInt()
             hud.updateStatus("Tap: Next (#$attempt)", BotMood.WORKING, taskRunning = true)
             log("👆 Tapping Next button ($tapX, $tapY)")
             performPhysicalTap(tapX, tapY)
@@ -915,21 +972,73 @@ class AutoTouchService : AccessibilityService() {
             delay(4200L)
         }
 
-        // Step 3: Tap 'Caption your Short' & Paste Viral Title
+        for (waitLoad in 1..3) {
+            val checkEls = scanScreenInteractiveElements(specs)
+            val loaded = checkEls.any {
+                it.label.contains("Caption", true) ||
+                    it.label.contains("Create a title", true) ||
+                    it.label.contains("Upload", true) ||
+                    it.label.contains("Public", true)
+            }
+            if (loaded) break
+            delay(1500L)
+        }
+
+        dismissDiscardDialogIfPresent(specs)
+
+        // Step 3: Find & Tap exact 'Caption your Short' or 'Create a title' box
         recordRunBitmapSafely(takeHdDisplayScreenshotWithTimeout(2000L))
         hud.updateStatus("Typing Viral Caption...", BotMood.WORKING, taskRunning = true)
+
         val detailsElements = scanScreenInteractiveElements(specs)
         val captionNode = detailsElements.find {
-            it.label.contains("Caption", true) || it.className.contains("EditText", true)
+            it.label.contains("Caption your Short", true) ||
+                it.label.contains("Create a title", true) ||
+                it.label.contains("Add a title", true) ||
+                (it.className.contains("EditText", true) && it.centerY < specs.screenHeight / 2)
         }
-        val capX = captionNode?.centerX ?: (specs.screenWidth * 0.52f).toInt()
-        val capY = captionNode?.centerY ?: (specs.screenHeight * 0.16f).toInt()
-        log("👆 Tapping Caption Box ($capX, $capY)")
-        performPhysicalTap(capX, capY)
-        currentRunSteps.add("Tapped Caption Box at ($capX, $capY)")
-        delay(1600L)
 
-        typeAndPasteTextReliably(viralTitle, captionNode?.node)
+        val isRegularUploadScreen = detailsElements.any { it.label.contains("Create a title", true) }
+        val capX = captionNode?.centerX ?: if (isRegularUploadScreen) {
+            (specs.screenWidth * 0.45f).toInt()
+        } else {
+            (specs.screenWidth * 0.56f).toInt()
+        }
+        val capY = captionNode?.centerY ?: if (isRegularUploadScreen) {
+            (specs.screenHeight * 0.43f).toInt()
+        } else {
+            (specs.screenHeight * 0.118f).toInt()
+        }
+
+        log("👆 Tapping Caption/Title Box at ($capX, $capY)")
+        if (captionNode != null) {
+            tapElementSmartly(captionNode, forceAccessibilityClick = true)
+        } else {
+            performPhysicalTap(capX, capY)
+        }
+        currentRunSteps.add("Tapped Caption Box at ($capX, $capY)")
+        delay(1500L)
+
+        // Re-scan AFTER tapping so we grab the newly activated EditText!
+        val afterTapElements = scanScreenInteractiveElements(specs)
+        val activeEditNode = afterTapElements.find {
+            it.node?.isFocused == true ||
+                it.node?.isEditable == true ||
+                it.className.contains("EditText", true) ||
+                it.label.contains("Caption your Short", true) ||
+                it.label.contains("Create a title", true)
+        }
+
+        var pastedOk = typeAndPasteTextReliably(viralTitle, activeEditNode?.node)
+        if (!pastedOk) {
+            performPhysicalTap(capX, capY)
+            delay(1000L)
+            val retryEls = scanScreenInteractiveElements(specs)
+            val retryNode = retryEls.find { it.node?.isEditable == true || it.className.contains("EditText", true) }
+            pastedOk = typeAndPasteTextReliably(viralTitle, retryNode?.node)
+        }
+
+        log("✍️ Caption Paste Status ($pastedOk): $viralTitle")
         currentRunSteps.add("Pasted Viral Title: $viralTitle")
         delay(1200L)
 
@@ -939,13 +1048,19 @@ class AutoTouchService : AccessibilityService() {
             delay(1400L)
         }
 
-        // Step 4: Tap White 'Upload Short' Button at Bottom Center (96.4% height)
+        dismissDiscardDialogIfPresent(specs)
+
+        // Step 4: Tap White 'Upload Short' / 'Upload' Button at Bottom Center (96.4% height)
         for (retry in 1..3) {
             if (!isAgentRunning) return
+            dismissDiscardDialogIfPresent(specs)
             recordRunBitmapSafely(takeHdDisplayScreenshotWithTimeout(2000L))
+
             val postElements = scanScreenInteractiveElements(specs)
             val uploadNode = postElements.find {
-                it.label.contains("Upload Short", true) || it.label.equals("Upload", true)
+                it.label.contains("Upload Short", true) ||
+                    it.label.equals("Upload", true) ||
+                    it.label.contains("शॉर्ट अपलोड करें", true)
             }
 
             val tapX = uploadNode?.centerX ?: (specs.screenWidth / 2)
@@ -953,13 +1068,19 @@ class AutoTouchService : AccessibilityService() {
 
             hud.updateStatus("Tap: Upload Short (#$retry)", BotMood.WORKING, taskRunning = true)
             log("👆 Physical Tap on Upload Short Center ($tapX, $tapY)")
-            performPhysicalTap(tapX, tapY)
+            if (uploadNode != null && retry >= 2) {
+                tapElementSmartly(uploadNode, forceAccessibilityClick = true)
+            } else {
+                performPhysicalTap(tapX, tapY)
+            }
             currentRunSteps.add("Tapped Upload Short (#$retry) at ($tapX, $tapY)")
             delay(4200L)
 
             val afterElements = scanScreenInteractiveElements(specs)
             val stillOnDetails = afterElements.any {
-                it.label.contains("Add details", true) || it.label.contains("Upload Short", true)
+                it.label.contains("Add details", true) ||
+                    it.label.contains("Upload Short", true) ||
+                    it.label.contains("Select audience", true)
             }
             if (!stillOnDetails) {
                 break
@@ -968,6 +1089,23 @@ class AutoTouchService : AccessibilityService() {
 
         hud.updateStatus("🎉 UPLOAD SUCCESS!", BotMood.HAPPY, taskRunning = false)
         log("🎉 YouTube Short Uploaded Successfully: $viralTitle")
+    }
+
+    private suspend fun dismissDiscardDialogIfPresent(specs: DeviceBodySpecs) {
+        val els = scanScreenInteractiveElements(specs)
+        val hasDiscardPopup = els.any {
+            it.label.contains("Discard changes", true) || it.label.contains("not be saved", true)
+        }
+        if (hasDiscardPopup) {
+            val cancelBtn = els.find { it.label.equals("Cancel", true) || it.label.equals("रद्द करें", true) }
+            if (cancelBtn != null) {
+                log("⚠️ Dismissing 'Discard changes?' popup by tapping Cancel!")
+                tapElementSmartly(cancelBtn, forceAccessibilityClick = true)
+            } else {
+                performPhysicalTap((specs.screenWidth * 0.55f).toInt(), (specs.screenHeight * 0.57f).toInt())
+            }
+            delay(1200L)
+        }
     }
 
     private fun isSoftKeyboardOpen(): Boolean {
@@ -1203,7 +1341,7 @@ class AutoTouchService : AccessibilityService() {
         schedulerJob = serviceScope.launch {
             var lastTriggeredMinute = ""
             while (isActive) {
-                delay(25000L)
+                delay(20000L)
                 val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
                 if (!prefs.getBoolean("scheduler_enabled", false) || isAgentRunning) continue
 
@@ -1231,9 +1369,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Scans active application window(s) while ignoring our own HUD overlay
-     */
     private fun scanScreenInteractiveElements(specs: DeviceBodySpecs): List<TaggedUiElement> {
         val result = mutableListOf<TaggedUiElement>()
         val seenBoundsLabels = mutableSetOf<String>()
@@ -1242,7 +1377,7 @@ class AutoTouchService : AccessibilityService() {
         fun traverse(node: AccessibilityNodeInfo?) {
             if (node == null || !node.isVisibleToUser) return
             val nodePkg = node.packageName?.toString() ?: ""
-            if (nodePkg == packageName) return // Never scan our own HUD overlay
+            if (nodePkg == packageName) return
 
             val rect = Rect()
             node.getBoundsInScreen(rect)
@@ -1293,7 +1428,6 @@ class AutoTouchService : AccessibilityService() {
             traverse(activeRoot)
         }
 
-        // Also check floating dialogs / bottom sheets in other application windows
         try {
             for (win in windows) {
                 if (win.type == AccessibilityWindowInfo.TYPE_APPLICATION ||
@@ -1310,9 +1444,6 @@ class AutoTouchService : AccessibilityService() {
         return result
     }
 
-    /**
-     * Builds a comprehensive signature covering top, middle, and bottom sheet UI elements
-     */
     private fun buildScreenSignature(pkg: String, elements: List<TaggedUiElement>): String {
         if (elements.isEmpty()) return "$pkg:empty:${isSoftKeyboardOpen()}"
         val topPart = elements.take(10).joinToString("|") { "${it.label}@${it.centerY / 45}" }
@@ -1341,17 +1472,13 @@ class AutoTouchService : AccessibilityService() {
             ?.takeIf { hypot((it.centerX - px).toDouble(), (it.centerY - py).toDouble()) <= 78.0 }
     }
 
-    /**
-     * Smart hybrid tap: uses physical gesture tap with tiny human jitter,
-     * and falls back to Accessibility ACTION_CLICK on node/parent if stuck.
-     */
     private suspend fun tapElementSmartly(element: TaggedUiElement, forceAccessibilityClick: Boolean = false) {
         if (forceAccessibilityClick && element.node != null) {
             var curr: AccessibilityNodeInfo? = element.node
             var clicked = false
             for (depth in 0..3) {
                 if (curr == null) break
-                if (curr.isClickable && curr.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                if ((curr.isClickable || curr.isEditable) && curr.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
                     clicked = true
                     break
                 }
@@ -1365,10 +1492,6 @@ class AutoTouchService : AccessibilityService() {
             }
         }
         performPhysicalTap(element.centerX, element.centerY)
-    }
-
-    private suspend fun tapDeadCenterOfElement(element: TaggedUiElement) {
-        tapElementSmartly(element, forceAccessibilityClick = false)
     }
 
     private suspend fun performPhysicalTap(x: Int, y: Int) {
@@ -1410,9 +1533,6 @@ class AutoTouchService : AccessibilityService() {
         delay(420L)
     }
 
-    /**
-     * Reliably sets text on the target or currently focused EditText first, before falling back to any editable field
-     */
     private suspend fun typeAndPasteTextReliably(
         textToType: String,
         preferredNode: AccessibilityNodeInfo? = null
@@ -1430,6 +1550,7 @@ class AutoTouchService : AccessibilityService() {
         fun tryApplyTextToNode(node: AccessibilityNodeInfo?): Boolean {
             if (node == null) return false
             node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
@@ -1445,8 +1566,7 @@ class AutoTouchService : AccessibilityService() {
             return false
         }
 
-        // Priority 1: Preferred node passed from CLICK_TAG / TYPE target
-        if (preferredNode != null && (preferredNode.isEditable || preferredNode.className?.toString()?.contains("EditText", true) == true)) {
+        if (preferredNode != null) {
             if (tryApplyTextToNode(preferredNode)) {
                 delay(350L)
                 return true
@@ -1456,14 +1576,12 @@ class AutoTouchService : AccessibilityService() {
         val root = rootInActiveWindow ?: return false
         var setSuccess = false
 
-        // Priority 2: Currently focused editable node
         val focusedInput = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
         if (focusedInput != null && tryApplyTextToNode(focusedInput)) {
             delay(350L)
             return true
         }
 
-        // Priority 3: Traverse tree looking strictly for isFocused first, then any EditText
         fun traverseEditable(node: AccessibilityNodeInfo?, requireFocused: Boolean) {
             if (node == null || setSuccess) return
             val isEdit = node.isEditable || node.className?.toString()?.contains("EditText", true) == true
@@ -1488,63 +1606,77 @@ class AutoTouchService : AccessibilityService() {
     }
 
     /**
-     * Context-aware handler after typing on Instagram / YouTube:
-     * Distinguishes between Commenting, Share-Sheet Friend Search, and Main Video Search!
+     * Submits Instagram/YouTube comment or search after typing.
+     * Returns TRUE if a comment was submitted and its sheet was auto-closed!
      */
     private suspend fun handleSmartPostOrSearchAfterType(
         typedText: String,
         targetLabel: String,
         decisionReason: String,
         typedOk: Boolean
-    ) {
+    ): Boolean {
         val specs = getCalibratedDeviceBodySpecs()
         val elements = scanScreenInteractiveElements(specs)
 
         val combinedContext = "$targetLabel $decisionReason".lowercase(Locale.ROOT)
-        val isCommentContext = combinedContext.contains("comment") || combinedContext.contains("कमेंट")
+        val isCommentContext = combinedContext.contains("comment") ||
+            combinedContext.contains("कमेंट") ||
+            elements.any { it.label.contains("Join the conversation", true) || it.label.contains("Add a comment", true) }
+
         val isShareSearchContext = combinedContext.contains("share") ||
             combinedContext.contains("friend") ||
             elements.any { it.label.contains("Send separately", true) || it.label.contains("Add a message", true) }
 
-        // 1. If in Share Sheet searching for a friend (e.g., Rahul), hide keyboard so friend list & Send button are visible!
+        // 1. Share Sheet Friend Search (e.g., Rahul) -> Hide keyboard so friend list is exposed
         if (isShareSearchContext) {
             if (isSoftKeyboardOpen()) {
                 performGlobalAction(GLOBAL_ACTION_BACK)
                 delay(900L)
             }
-            return
+            return false
         }
 
-        // 2. Look for an explicit Post / Send button on screen (especially for Comments)
-        val postBtn = elements.find {
-            it.label.equals("Post", true) ||
-                it.label.equals("Send", true) ||
-                it.label.contains("post_comment", true) ||
-                it.label.equals("पोस्ट करें", true)
-        }
-        if (postBtn != null) {
-            tapElementSmartly(postBtn, forceAccessibilityClick = false)
-            return
+        // 2. Comment Context -> Submit comment AND automatically close keyboard + comment sheet!
+        if (isCommentContext) {
+            val postBtn = elements.find {
+                it.label.equals("Post", true) ||
+                    it.label.equals("Send", true) ||
+                    it.label.contains("post_comment", true) ||
+                    it.label.equals("पोस्ट करें", true)
+            }
+            if (postBtn != null) {
+                tapElementSmartly(postBtn, forceAccessibilityClick = false)
+            } else if (isSoftKeyboardOpen()) {
+                performPhysicalTap((specs.screenWidth * 0.91f).toInt(), (specs.screenHeight * 0.91f).toInt())
+            }
+            delay(1800L)
+
+            // Auto-close keyboard & comment sheet so the main Reel & Share button are immediately visible!
+            if (isSoftKeyboardOpen()) {
+                performGlobalAction(GLOBAL_ACTION_BACK)
+                delay(1000L)
+            }
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            delay(1200L)
+            return true
         }
 
-        // 3. If it's a Search query, look for a matching search suggestion row or press bottom-right Search key
-        if (!isCommentContext) {
-            val searchSuggestion = elements.find {
-                it.label.contains("row_search_for_x", true) ||
-                    (it.centerY in (specs.cutoutSafeTop + 120)..(specs.screenHeight / 2) &&
-                        it.label.equals(typedText.trim(), true) &&
-                        !it.className.contains("EditText", true))
-            }
-            if (searchSuggestion != null) {
-                tapElementSmartly(searchSuggestion, forceAccessibilityClick = false)
-                return
-            }
-
-            if (isSoftKeyboardOpen() && typedOk) {
-                // Tap bottom-right keyboard Search/Enter button
-                performPhysicalTap((specs.screenWidth * 0.90f).toInt(), (specs.screenHeight * 0.91f).toInt())
-            }
+        // 3. Search Bar Context -> Tap matching search suggestion or keyboard Search key
+        val searchSuggestion = elements.find {
+            it.label.contains("row_search_for_x", true) ||
+                (it.centerY in (specs.cutoutSafeTop + 120)..(specs.screenHeight / 2) &&
+                    it.label.equals(typedText.trim(), true) &&
+                    !it.className.contains("EditText", true))
         }
+        if (searchSuggestion != null) {
+            tapElementSmartly(searchSuggestion, forceAccessibilityClick = false)
+            return false
+        }
+
+        if (isSoftKeyboardOpen() && typedOk) {
+            performPhysicalTap((specs.screenWidth * 0.90f).toInt(), (specs.screenHeight * 0.91f).toInt())
+        }
+        return false
     }
 
     private suspend fun clickWhatsAppSendIfPresent() {
@@ -1560,9 +1692,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Respects Android 11+ minimum interval between screenshots and auto-retries once if throttled
-     */
     private suspend fun takeHdDisplayScreenshotWithTimeout(timeoutMs: Long = 2500L): Bitmap? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
 
