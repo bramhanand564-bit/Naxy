@@ -177,6 +177,13 @@ class GeminiBrain(private var apiKey: String) {
         return JSONObject("{$body}")
     }
 
+    /**
+     * Work-Wise Smart Model Shifter:
+     * - First-Time Run / Unconfirmed Screen -> 3.8-Flash + Robotics-ER Co-Pilot (COPILOT_38_ROBOTICS)
+     * - Precision Icon / Coordinate -> Robotics-ER + 3.8-Flash (ROBOTICS_XY)
+     * - Fast Known Step -> Alternates 3.5-Flash-Lite & 3.1-Flash-Lite (FAST_LITE)
+     * - Text / Prompt / Casual -> Gemma-31B & 26B (GEMMA_TEXT)
+     */
     private fun buildSmartGearLadder(preferredGear: String, hasImages: Boolean, isStuck: Boolean): List<String> {
         if (!hasImages && preferredGear == "GEMMA_TEXT") {
             return gemmaCasualAndTextLadder + listOf("gemini-3.8-flash")
@@ -185,6 +192,13 @@ class GeminiBrain(private var apiKey: String) {
             return listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite")
         }
         return when (preferredGear) {
+            "COPILOT_38_ROBOTICS" -> {
+                // Alternates between 3.8-Flash and Robotics-ER so both work together on first-time runs without hitting 429!
+                fastRelayToggle = !fastRelayToggle
+                val first = if (fastRelayToggle) "gemini-3.8-flash" else "gemini-robotics-er-2-preview"
+                val second = if (fastRelayToggle) "gemini-robotics-er-2-preview" else "gemini-3.8-flash"
+                listOf(first, second, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview")
+            }
             "PRO_DEEP_DIAGNOSIS" -> listOf("gemini-3.1-pro-preview", "gemini-3.8-flash", "gemini-robotics-er-2-preview")
             "ROBOTICS_PRECISION" -> listOf("gemini-robotics-er-2-preview", "gemini-3.1-pro-preview", "gemini-3.8-flash")
             "HEAVY_38_ONLY" -> listOf("gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite")
@@ -204,7 +218,7 @@ class GeminiBrain(private var apiKey: String) {
         prompt: String,
         imagesBase64: List<String> = emptyList(),
         useDeep38Flash: Boolean = true,
-        preferredGear: String = if (useDeep38Flash) "HEAVY_38_ONLY" else "FAST_LITE",
+        preferredGear: String = if (useDeep38Flash) "COPILOT_38_ROBOTICS" else "FAST_LITE",
         isStuck: Boolean = false
     ): Pair<String, String> = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) return@withContext Pair("", "No API Key")
@@ -216,7 +230,6 @@ class GeminiBrain(private var apiKey: String) {
         val now = System.currentTimeMillis()
         val primaryModel = gearLadder.first()
 
-        // 13s Pacer for 3.8-Flash / 12s for Robotics / 35s for 3.1-Pro so quota never runs out
         if (preferredGear == "HEAVY_38_ONLY" || preferredGear == "PRO_DEEP_DIAGNOSIS" || preferredGear == "ROBOTICS_PRECISION") {
             val waitPrimary = getWaitTimeMsForModel(primaryModel, now)
             if (waitPrimary in 1L..36_000L) {
@@ -231,7 +244,7 @@ class GeminiBrain(private var apiKey: String) {
             readyModels + (gearLadder - readyModels.toSet())
         } else {
             val fastest = gearLadder.minByOrNull { getWaitTimeMsForModel(it, afterWaitNow) } ?: primaryModel
-            val w = getWaitTimeMsForModel(fastest, afterWaitNow).coerceIn(1_000L, 14_000L)
+            val w = getWaitTimeMsForModel(fastest, afterWaitNow).coerceIn(1_000L, 13_000L)
             onBrainLog?.invoke("⏱️ Pacer Wait (${w / 1000L}s) for [$fastest]...")
             delay(w)
             listOf(fastest) + (gearLadder - fastest)
@@ -281,7 +294,7 @@ class GeminiBrain(private var apiKey: String) {
             val payload = JSONObject().apply {
                 put("contents", JSONArray().put(JSONObject().put("parts", partsArray)))
                 put("generationConfig", JSONObject().apply {
-                    put("temperature", 0.15)
+                    put("temperature", 0.1)
                     if (!model.startsWith("gemma")) put("responseMimeType", "application/json")
                 })
             }
@@ -309,9 +322,8 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 1. Task Decider & Modular Skill Planner:
-     * Breaks any new goal (e.g. "Hindi song search send Rahul") into reusable Skill Blocks
-     * ([SKILL_SEARCH], [SKILL_LIKE], [SKILL_COMMENT], [SKILL_SHARE_FRIEND]) and assigns specialist model gears!
+     * 1. Task Decider & Modular Micro-Step Planner:
+     * Breaks tasks into explicit, verifiable micro-steps so no action (like typing in the Search box or clicking Send) is ever skipped!
      */
     suspend fun chatAndBuildDetailedPlan(
         userMessage: String,
@@ -332,8 +344,10 @@ class GeminiBrain(private var apiKey: String) {
             4. Folder to YouTube -> "executionMode": "YOUTUBE_FOLDER_UPLOAD", "readyToExecute": true.
             5. Google Flow to YouTube -> "executionMode": "GOOGLE_FLOW_UPLOAD", "readyToExecute": true.
             6. Background web mode -> "executionMode": "BACKGROUND_WEB", "readyToExecute": true.
-            7. For phone automation, decompose the user's request into Modular Reusable Skill Steps so previously learned skills (like how to Search, how to Play first video, how to Like, how to Comment & Back, how to Share to a friend) transfer across ANY topic or friend name!
-               Tag each step with its model gear: "[FAST_LITE]", "[ROBOTICS_XY]", or "[DEEP_3.8]".
+            7. For phone automation, break every action into SEPARATE, CONFIRMABLE micro-steps:
+               - Never combine "Tap bottom search icon" and "Type query in top search bar" into one step! Make them 2 separate steps so each click is confirmed!
+               - Never combine "Select friend" and "Tap bottom blue Send button" into one step! Make them 2 separate steps!
+               Tag each step with its specialist model gear: "[FAST_LITE]", "[ROBOTICS_XY]", or "[DEEP_3.8]".
             
             Return ONLY valid JSON:
             {
@@ -342,10 +356,15 @@ class GeminiBrain(private var apiKey: String) {
               "taskTitle": "Short title",
               "executionMode": "LIVE_PHONE",
               "steps": [
-                "Step 1 [FAST_LITE] [SKILL_OPEN]: Open target app",
-                "Step 2 [ROBOTICS_XY] [SKILL_SEARCH]: Tap search icon and type target query",
-                "Step 3 [DEEP_3.8] [SKILL_SELECT_VIDEO]: Tap the best matching video/reel from search results",
-                "Step 4 [ROBOTICS_XY] [SKILL_SHARE_FRIEND]: Tap Share icon, search friend name, select friend, and tap bottom Send button"
+                "Step 1 [FAST_LITE] [SKILL_OPEN]: Open Instagram app",
+                "Step 2 [ROBOTICS_XY] [SKILL_SEARCH_TAB]: Tap bottom Search magnifying glass icon to open Explore page",
+                "Step 3 [FAST_LITE] [SKILL_SEARCH_TYPE]: Tap top 'Search with Meta AI' bar, type target query, and submit search",
+                "Step 4 [DEEP_3.8] [SKILL_SELECT_VIDEO]: Confirm search results loaded and tap the first matching video",
+                "Step 5 [ROBOTICS_XY] [SKILL_LIKE]: Tap the Like heart icon on the right side of the Reel",
+                "Step 6 [ROBOTICS_XY] [SKILL_COMMENT]: Tap Comment icon, type comment in 'Join the conversation...', tap post arrow, then press BACK",
+                "Step 7 [ROBOTICS_XY] [SKILL_SHARE_OPEN]: Tap Share paper-plane icon to open Share sheet",
+                "Step 8 [ROBOTICS_XY] [SKILL_SHARE_SELECT]: Tap friend's profile once to select them (blue checkmark)",
+                "Step 9 [FAST_LITE] [SKILL_SHARE_SEND]: Confirm blue 'Send' button appeared at bottom and tap 'Send'"
               ]
             }
         """.trimIndent()
@@ -365,7 +384,64 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 2. Real-Time Vision + Cross-Task Skill Transfer Engine + 5s Phone Load Delay
+     * Pre/Post-Click Confirmation Engine:
+     * Inspects the live XML nodes and recent action history to CONFIRM whether a click succeeded
+     * and prevents repeating toggles (like selecting/unselecting Rahul on the Share sheet!).
+     */
+    private fun checkDeterministicClickConfirmation(
+        goal: String,
+        currentStepHistory: List<String>,
+        numberedNodesList: String
+    ): AgentStepDecision? {
+        val recentJoined = currentStepHistory.takeLast(6).joinToString(" | ").lowercase(Locale.ROOT)
+        val lines = numberedNodesList.lines()
+
+        // 1. SHARE SHEET SEND CONFIRMATION:
+        // If the bottom blue "Send" button is visible on the Share sheet (because a friend like rahulmishra_110 was just selected!),
+        // NEVER tap the friend's avatar again (which unselects them!). Immediately click the "Send" button!
+        val sendButtonLine = lines.firstOrNull { line ->
+            (line.contains("\"Send\"", ignoreCase = true) || line.contains("text=Send", ignoreCase = true) || line.contains("desc=Send", ignoreCase = true)) &&
+                !line.contains("Send a", ignoreCase = true) && !line.contains("Send message", ignoreCase = true)
+        }
+        if (sendButtonLine != null && (recentJoined.contains("rahul") || recentJoined.contains("select") || recentJoined.contains("share") || lines.any { it.contains("Write a message", ignoreCase = true) })) {
+            val tagMatch = Regex("\\[(\\d+)]").find(sendButtonLine)
+            val tagId = tagMatch?.groupValues?.get(1)?.toIntOrNull() ?: -1
+            onBrainLog?.invoke("✅ Click Confirmed: Friend selected & 'Send' button detected! Clicking 'Send' immediately...")
+            return if (tagId >= 0) {
+                AgentStepDecision(
+                    action = "CLICK_TAG",
+                    tagId = tagId,
+                    x = 500,
+                    y = 928,
+                    reason = "Confirmed & Tapping Send button",
+                    modelUsed = "ConfirmEngine"
+                )
+            } else {
+                AgentStepDecision(
+                    action = "CLICK_XY",
+                    x = 500,
+                    y = 928,
+                    reason = "Confirmed & Tapping Send XY",
+                    modelUsed = "ConfirmEngine"
+                )
+            }
+        }
+
+        // 2. POST-SEND COMPLETION CONFIRMATION:
+        // If we already clicked the final "Send" button on the Share sheet, confirm task is DONE!
+        if (currentStepHistory.takeLast(2).any { it.contains("Tapping Send", ignoreCase = true) || it.contains("Send button", ignoreCase = true) }) {
+            val shareSheetStillOpen = lines.any { it.contains("Write a message", ignoreCase = true) || it.contains("Add to story", ignoreCase = true) }
+            if (!shareSheetStillOpen) {
+                onBrainLog?.invoke("🎉 Post-Click Confirmed: Video shared & Share sheet closed! Task DONE.")
+                return AgentStepDecision(action = "DONE", reason = "Confirmed video shared!", modelUsed = "ConfirmEngine")
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * 2. Real-Time Vision + Click Confirmation + First-Time 3.8 & Robotics Co-Pilot + Cross-Task Skill Transfer
      */
     suspend fun decideNextStep(
         goal: String,
@@ -380,7 +456,7 @@ class GeminiBrain(private var apiKey: String) {
     ): AgentStepDecision {
         isLiveTaskCurrentlyRunning = true
 
-        // Minimum 5-Second Phone & Internet Load Delay
+        // RULE 1: Minimum 5-Second Phone & Internet Load Delay
         val now = System.currentTimeMillis()
         val elapsed = now - lastLiveStepTimestampMs
         if (lastLiveStepTimestampMs > 0L && elapsed in 1L..4_999L) {
@@ -390,26 +466,30 @@ class GeminiBrain(private var apiKey: String) {
         }
         lastLiveStepTimestampMs = System.currentTimeMillis()
 
+        // RULE 2: Deterministic Pre/Post-Click Confirmation Check (Instant 0ms fix for Share Send & Completion!)
+        if (!isContinuousMonitor) {
+            checkDeterministicClickConfirmation(goal, currentStepHistory, numberedNodesList)?.let { confirmedDecision ->
+                return confirmedDecision
+            }
+        }
+
         val imgList = if (screenshotBitmap != null) listOf(bitmapToHdWebpBase64(screenshotBitmap)) else emptyList()
 
         val sortedFixes = recalledFixes.sortedByDescending {
             it.sourceType.contains("PRO_ROBOTICS") || it.sourceType.contains("SKILL") || it.sourceType.contains("CHAT")
         }
 
-        // Cross-Task Skill Generalization Block: Applies learned coordinates from past tasks (e.g. Bhojpuri) to new tasks (e.g. Hindi song)!
         val mandatorySkillTransferBlock = if (sortedFixes.isNotEmpty()) {
             """
-            🚨 UNIVERSAL LEARNED APP SKILLS & MANDATORY XY COORDINATES (CROSS-TASK TRANSFER!):
-            These skills & coordinates were verified by Gemini 3.1 Pro & Robotics-ER in previous tasks on this app.
-            IMPORTANT: Apply these learned button coordinates to the CURRENT task ("$goal") even if the search topic (e.g. Hindi song vs Bhojpuri video) or friend name changed!
-            - For example, if a learned skill shows where the Search icon, Reel card, Like button, Comment button, Share (paper plane) icon, Share search bar, or bottom Send button is, USE THAT EXACT COORDINATE (`CLICK_XY`) and substitute the new text from "$goal"!
+            🚨 CONFIRMED UNIVERSAL APP SKILLS & MANDATORY XY COORDINATES (CROSS-TASK TRANSFER!):
+            Apply these verified coordinates from previous runs to the current goal "$goal" (substitute the new search query or friend name as needed):
             """.trimIndent() + "\n" +
                 sortedFixes.take(14).joinToString("\n") { fix ->
                     val px = (fix.tapXRatio * bodySpecs.screenWidth).toInt()
                     val py = (fix.tapYRatio * bodySpecs.screenHeight).toInt()
                     val normX = (fix.tapXRatio * 1000).toInt()
                     val normY = (fix.tapYRatio * 1000).toInt()
-                    "👉 [LEARNED SKILL - ${fix.sourceType}] Screen/Skill [${fix.problemDescription}]: ${fix.solutionRule} -> Verified Point: CLICK_XY x=$normX, y=$normY (Pixels: $px, $py)"
+                    "👉 [CONFIRMED SKILL - ${fix.sourceType}] When on [${fix.problemDescription}]: ${fix.solutionRule} -> CLICK_XY x=$normX, y=$normY (Pixels: $px, $py)"
                 }
         } else ""
 
@@ -420,33 +500,47 @@ class GeminiBrain(private var apiKey: String) {
         val currentStepIndex = currentStepHistory.size
         val activePlannedStep = planSteps.getOrNull(currentStepIndex) ?: planSteps.lastOrNull() ?: goal
 
+        // First-Time Run vs Learned Run Model Selection:
+        // - If this app has NO confirmed skills in Memory yet (First-Time Run!) -> Use COPILOT_38_ROBOTICS (3.8-Flash + Robotics-ER working together!)
+        // - Once skills are learned, shift model based on step work type ([FAST_LITE], [ROBOTICS_XY], [DEEP_3.8])!
+        val isFirstTimeForApp = sortedFixes.isEmpty()
         val preferredGear = when {
             isStuck -> "ROBOTICS_PRECISION"
+            isFirstTimeForApp -> "COPILOT_38_ROBOTICS"
             activePlannedStep.contains("ROBOTICS_XY", ignoreCase = true) -> "ROBOTICS_XY"
             activePlannedStep.contains("DEEP_3.8", ignoreCase = true) -> "HEAVY_38_ONLY"
             activePlannedStep.contains("FAST_LITE", ignoreCase = true) -> "FAST_LITE"
-            sortedFixes.isNotEmpty() -> "HEAVY_38_ONLY"
-            else -> "FAST_LITE"
+            else -> "COPILOT_38_ROBOTICS"
         }
 
         val navTop = bodySpecs.screenHeight - bodySpecs.navBarHeight
         val prompt = """
-            You are AuraDroid OS Autonomous Vision & Cross-Task Skill Transfer Engine.
+            You are AuraDroid OS Autonomous Vision + Click Confirmation Engine (Gemini 3.8 + Robotics Co-Pilot).
             
             DEVICE BODY SPECS: ${bodySpecs.modelName} (${bodySpecs.screenWidth}x${bodySpecs.screenHeight} px), Safe Top Y>${bodySpecs.cutoutSafeTop}, Nav Y>$navTop
-            CURRENT OVERALL GOAL: $goal
-            ACTIVE PLANNED STEP: $activePlannedStep
-            ALL PLANNED SUB-TASKS: ${planSteps.joinToString(" -> ")}
-            RECENT COMPLETED ACTIONS (DO NOT REPEAT!): ${currentStepHistory.takeLast(10).joinToString(" | ")}
+            OVERALL GOAL: $goal
+            PLANNED WORKFLOW: ${planSteps.joinToString(" -> ")}
+            COMPLETED ACTIONS SO FAR (VERIFY & DO NOT REPEAT!):
+            ${currentStepHistory.takeLast(12).joinToString(" | ")}
             $monitorRule
             
-            INTERACTIVE ELEMENTS ON SCREEN:
+            INTERACTIVE ELEMENTS CURRENTLY ON SCREEN:
             $numberedNodesList
             
-            CRITICAL EXECUTION & SKILL TRANSFER RULES:
-            1. CROSS-TASK SKILL TRANSFER: Look at UNIVERSAL LEARNED APP SKILLS below. If a learned skill teaches how to Search, Select a Video, Like, Comment, or Share to a Friend (like Rahul), transfer that exact skill & CLICK_XY coordinate to the current goal "$goal" (only skip sub-skills like Like/Comment if the current goal "$goal" did not ask for them!).
-            2. If Comment sheet or Keyboard is open and blocking the Share/Like buttons, return "BACK".
-            3. On Instagram Share sheet: tap Search bar -> type friend's name -> tap friend's row -> tap bottom blue "Send" button (around Y=910) -> return "DONE".
+            MANDATORY CLICK-CONFIRMATION & VERIFICATION RULES (READ CAREFULLY!):
+            1. STEP-BY-STEP VISUAL CONFIRMATION BEFORE CLICKING:
+               - Look at the attached screenshot and INTERACTIVE ELEMENTS CURRENTLY ON SCREEN to confirm whether the previous click actually succeeded!
+            2. INSTAGRAM SEARCH CONFIRMATION (DO NOT PICK RANDOM EXPLORE VIDEOS!):
+               - When on the Explore page (where "Search with Meta AI" or "Search" bar is at the top), check if the target search query from "$goal" has ALREADY been typed and searched!
+               - If "Search with Meta AI" is visible and you have NOT typed the search query yet, YOU MUST use action "TYPE" (with the search bar's tagId or x=450, y=115 and text="<search query>")! NEVER click a random video from the Explore grid before typing the search query!
+            3. INSTAGRAM COMMENT CONFIRMATION:
+               - When the Comment sheet is open ("Join the conversation..." or "Add a comment..."), if you have NOT typed the comment yet, use action "TYPE" on the comment box (x=420, y=935) with a nice comment text.
+               - Once the comment is posted, press "BACK" to close the comment sheet so the main Reel buttons (Like, Comment, Share) are visible again.
+            4. INSTAGRAM SHARE SHEET CONFIRMATION (NEVER UNSELECT THE FRIEND!):
+               - When the Share sheet is open:
+                 a) If the blue "Send" button (or "Write a message...") is visible at the bottom of the screen, THAT CONFIRMS THE FRIEND IS ALREADY SELECTED (blue checkmark)!
+                 b) NEVER tap the friend's profile/avatar a second time (tapping again unselects them)! Immediately tap the bottom blue "Send" button (x=500, y=928)!
+                 c) If the friend (e.g. Rahul) is visible in the Share grid and "Send" is NOT visible yet, tap the friend's profile ONCE.
             
             $mandatorySkillTransferBlock
             
@@ -460,14 +554,14 @@ class GeminiBrain(private var apiKey: String) {
               "endY": 200,
               "text": "",
               "packageNameOrSetting": "",
-              "reason": "Brief 5-word status"
+              "reason": "Confirmed state & exact action"
             }
         """.trimIndent()
 
         val (raw, modelUsed) = callWithLadder(
             prompt = prompt,
             imagesBase64 = imgList,
-            useDeep38Flash = (preferredGear == "HEAVY_38_ONLY"),
+            useDeep38Flash = (preferredGear != "FAST_LITE"),
             preferredGear = preferredGear,
             isStuck = isStuck
         )
@@ -493,8 +587,6 @@ class GeminiBrain(private var apiKey: String) {
 
     /**
      * 3. 40-Second Idle-Only 2-Stage Autonomous Auditor & Universal Skill Extractor
-     * Stage 1: Gemini 3.1 Pro diagnoses every step & generalizes reusable skills ({query}, {friend}).
-     * Stage 2 (after 15s calm pause): Gemini Robotics-ER calculates exact 0..1 coordinates so user doesn't have to pin manually!
      */
     suspend fun autoReflectAndImproveAfterRun(
         appCategory: String,
@@ -506,7 +598,6 @@ class GeminiBrain(private var apiKey: String) {
     ): PostRunReflectionResult {
         isLiveTaskCurrentlyRunning = false
 
-        // Wait 10s in Idle before starting Stage 1; abort immediately if user starts any live task!
         delay(10_000L)
         if (isLiveTaskCurrentlyRunning || (System.currentTimeMillis() - lastLiveStepTimestampMs) < 8_000L) {
             onBrainLog?.invoke("⏸️ Deferred Autonomous Audit because a live task is running.")
@@ -516,7 +607,6 @@ class GeminiBrain(private var apiKey: String) {
         val imgsBase64 = runBitmaps.takeLast(8).map { bitmapToHdWebpBase64(it, maxHeight = 960) }
         val stepByStepLog = actualStepsTaken.mapIndexed { idx, s -> "Step ${idx + 1}: $s" }.joinToString("\n")
 
-        // STAGE 1: Gemini 3.1 Pro Deep Step-by-Step Diagnosis & Skill Generalization
         val stage1ProPrompt = """
             You are Gemini 3.1 Pro Autonomous Step-by-Step Auditor & Universal Skill Architect for AuraDroid OS.
             A run in app "$appCategory" finished with status "$finalStatus" for goal "$goal".
@@ -525,15 +615,15 @@ class GeminiBrain(private var apiKey: String) {
             $stepByStepLog
             
             Examine all ${imgsBase64.size} sequential screenshots step by step (Step 1, Step 2, Step 3...):
-            1. Find every step that succeeded and every step that tapped the wrong place, got stuck, or was stopped.
-            2. GENERALIZE into Reusable Modular App Skills (e.g. "[SKILL_SEARCH]", "[SKILL_PLAY_REEL]", "[SKILL_LIKE]", "[SKILL_COMMENT_AND_BACK]", "[SKILL_SHARE_TO_FRIEND]") using placeholders like {search_query} or {friend_name} so future tasks with DIFFERENT songs/videos/friends can reuse the exact same button coordinates!
+            1. Verify which clicks were confirmed successful and which steps skipped typing, repeated a click (like selecting/unselecting a friend on Share sheet), or tapped the wrong place.
+            2. Generalize into Reusable Modular App Skills ("[SKILL_SEARCH_TYPE]", "[SKILL_SELECT_VIDEO]", "[SKILL_LIKE]", "[SKILL_COMMENT_AND_BACK]", "[SKILL_SHARE_SELECT]", "[SKILL_SHARE_SEND]") using {search_query} and {friend_name} placeholders!
             
             Return ONLY JSON:
             {
               "diagnosisSummary": "Step-by-step Hinglish diagnosis of each step",
               "draftSkills": [
                 {
-                  "skillName": "[SKILL_SEARCH] or [SKILL_SHARE_TO_FRIEND] etc.",
+                  "skillName": "[SKILL_SEARCH_TYPE] or [SKILL_SHARE_SEND] etc.",
                   "screenState": "Reusable screen description in $appCategory",
                   "whatToTap": "Exact visual icon/button that must be tapped"
                 }
@@ -549,7 +639,6 @@ class GeminiBrain(private var apiKey: String) {
             preferredGear = "PRO_DEEP_DIAGNOSIS"
         )
 
-        // Calm 15-Second Pacer Wait before Stage 2 (Total ~35-40s calm background healing!)
         for (sec in 1..15) {
             if (isLiveTaskCurrentlyRunning) {
                 onBrainLog?.invoke("⏸️ Paused Stage 2 Audit because a live task started.")
@@ -558,23 +647,22 @@ class GeminiBrain(private var apiKey: String) {
             delay(1_000L)
         }
 
-        // STAGE 2: Gemini Robotics-ER Pinpoints Exact 0.0..1.0 Coordinates for Each Reusable Skill!
         val stage2RoboticsPrompt = """
             You are Gemini Robotics-ER Spatial Coordinate Engineer for AuraDroid OS.
             Stage 1 Pro Diagnosis for "$appCategory" (Goal: "$goal"):
             $stage1Raw
             
-            Look at the ${imgsBase64.size} screenshots and measure the EXACT 0.00 to 1.00 screen X,Y coordinates ("tapXRatio", "tapYRatio") for every reusable skill & fix so the AI can execute them autonomously on ANY future task (e.g. searching a different song or sharing to a friend) without human pinning!
+            Look at the ${imgsBase64.size} screenshots and measure the EXACT 0.00 to 1.00 screen X,Y coordinates ("tapXRatio", "tapYRatio") for every reusable skill & fix so the AI can execute them autonomously on ANY future task!
             
             Return ONLY valid JSON:
             {
               "reflectionSummary": "Clear Hinglish Step-by-Step audit report & reusable skills learned",
               "rules": [
                 {
-                  "screenWhen": "[UNIVERSAL_SKILL] Reusable screen state in $appCategory (works for any query/friend)",
-                  "actionInstruction": "MANDATORY SKILL OVERRIDE: Exact action & button to tap (use {query} / {friend} placeholder if typing)",
+                  "screenWhen": "[UNIVERSAL_SKILL] Reusable screen state in $appCategory",
+                  "actionInstruction": "MANDATORY SKILL OVERRIDE: Exact action & button to tap",
                   "tapXRatio": 0.50,
-                  "tapYRatio": 0.91
+                  "tapYRatio": 0.92
                 }
               ]
             }
@@ -631,7 +719,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 4. Interactive Chat Inside Any Past Automation Run (Uses Robotics + Pro to auto-calculate XY even if user didn't pin!)
+     * 4. Interactive Chat Inside Any Past Automation Run
      */
     suspend fun chatAboutAutomationRunWith38Flash(
         runRecord: AutomationRunRecord,
@@ -646,8 +734,8 @@ class GeminiBrain(private var apiKey: String) {
             Steps Taken: ${runRecord.stepsSummary.mapIndexed { i, s -> "Step ${i + 1}: $s" }.joinToString(" | ")}
             User Correction: "$userCorrectionMessage"
             
-            1. Even if the user did NOT manually pin coordinates, inspect the attached screenshots yourself and measure the exact 0.00..1.00 "tapXRatio" and "tapYRatio" of the correct button!
-            2. Generalize "solutionRule" as a Reusable Skill so it works both for re-running "${runRecord.title}" AND for any future task in "${runRecord.appCategory}" (e.g. searching a different song or sharing to a friend).
+            1. Inspect the attached screenshots yourself and measure the exact 0.00..1.00 "tapXRatio" and "tapYRatio" of the correct button!
+            2. Generalize "solutionRule" as a Reusable Skill so it works both for re-running "${runRecord.title}" AND for any future task in "${runRecord.appCategory}".
             
             Return ONLY valid JSON:
             {
@@ -655,7 +743,7 @@ class GeminiBrain(private var apiKey: String) {
               "problemScreen": "[UNIVERSAL_SKILL] Screen/Step in ${runRecord.appCategory}",
               "solutionRule": "MANDATORY SKILL OVERRIDE: Exact action and coordinate to tap",
               "tapXRatio": 0.50,
-              "tapYRatio": 0.91
+              "tapYRatio": 0.92
             }
         """.trimIndent()
 
@@ -743,7 +831,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 6. Before + After Screenshot Human Touch Analyzer (Generalizes touch into a Reusable Skill!)
+     * 6. Before + After Screenshot Human Touch Analyzer
      */
     suspend fun analyzeBeforeAfterHumanTouchWith38Flash(
         appCategory: String,
