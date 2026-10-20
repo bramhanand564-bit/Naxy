@@ -111,7 +111,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var calibratedSpecsTextView: TextView
     private lateinit var engineScrollView: ScrollView
 
-    // Shared fallback instances when Accessibility Service isn't active yet
     private lateinit var localVault: MemoryVault
     private lateinit var localBrain: GeminiBrain
 
@@ -191,11 +190,7 @@ class MainActivity : AppCompatActivity() {
         header.addView(serviceBadge)
 
         val contentFrame = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            )
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
 
         val tab1HomeChat = buildTab1HomeAndChatPlanner()
@@ -345,7 +340,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(14), dp(10), dp(14), dp(10))
         }
 
-        // Top Home Companion Card: Full-Body Chanchal Bot + Friendly Daily Report & Troubleshooter
         val companionCard = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -546,7 +540,7 @@ class MainActivity : AppCompatActivity() {
         if (failedRun != null) {
             homeBotStatusTitle.text = "$greetingPrefix (1 टास्क में ध्यान दें)"
             homeBotReportSubtitle.text = "आज $successCount टास्क पूरे हुए, लेकिन '${failedRun.title.take(22)}' में रुकावट आई। नीचे '🛠️ गलती सुधारें' दबाएं ताकि AI इसे ठीक कर दे!"
-            homeBotView.setBotMood( isHappy = false, isCurious = true)
+            homeBotView.setBotMood(isHappy = false, isCurious = true)
         } else if (runs.isNotEmpty()) {
             homeBotStatusTitle.text = "$greetingPrefix सारे टास्क फिट हैं ✅"
             homeBotReportSubtitle.text = "सर, आपके $successCount टास्क सफलतापूर्वक पूरे हो गए हैं! कोई भी पेंडिंग एरर नहीं है।"
@@ -751,8 +745,6 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * TAB 2: Numbered Tasks Menu (#1 Google Flow, #2 Multi-Website Free Video Hub, #3 Local Folder Auto-Uploader)
-     * + Background vs Live Phone Switch per Automation + Story Mode + Multi-Platform Linker (YouTube + Instagram + Custom)
-     * + Idle Phone Trigger & Skip 10 Min
      */
     private fun buildTab2AutomationsAndScheduler(): View {
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -764,12 +756,9 @@ class MainActivity : AppCompatActivity() {
 
         val defaultDownloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
 
-        // =========================================================================
-        // TASK #1: GOOGLE FLOW AUTOMATION (Single / Story Mode + Folder + Multi-Platform Linker)
-        // =========================================================================
+        // TASK #1: GOOGLE FLOW AUTOMATION
         val flowCard = createSectionCard("1️⃣ #1 Task: Google Flow AI Video Studio")
 
-        // Per-Automation Execution Mode Switch: Background vs Live Phone
         var flowExecMode = prefs.getString("flow_execution_mode", "BACKGROUND") ?: "BACKGROUND"
         val flowModeSwitchBtn = TextView(this).apply {
             text = if (flowExecMode == "BACKGROUND") {
@@ -797,7 +786,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Story Mode vs Single Video Toggle
         var isStoryMode = prefs.getBoolean("flow_story_mode", false)
         val storyModeBtn = TextView(this).apply {
             text = if (isStoryMode) {
@@ -830,7 +818,6 @@ class MainActivity : AppCompatActivity() {
             "कितनी वीडियो बनानी हैं? (1, 2, या 3 Story Parts)"
         )
 
-        // Custom Download Save Folder for Flow
         flowDownloadFolderEditText = createCleanInput(
             prefs.getString("custom_download_folder", defaultDownloadDir) ?: defaultDownloadDir,
             "किस फोल्डर में डाउनलोड/सेव होगा?"
@@ -842,10 +829,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Multi-Platform Linker (YouTube + Instagram + Custom)
         val multiPlatformBox = buildMultiPlatformLinkerBox(prefs)
 
-        // Mini AI Assistant inside Task #1 to set topic, story & timer via conversation
         val aiTaskHelperBtn = createPrimaryButton("🤖 AI से बात करके टॉपिक, स्टोरी और टाइम सेट करें", accentPurple) {
             showMiniTaskAiAssistantDialog(topicInput, creditLimitInput)
         }
@@ -890,9 +875,7 @@ class MainActivity : AppCompatActivity() {
         flowCard.addView(spacer(dp(10)))
         flowCard.addView(runFlowNowBtn)
 
-        // =========================================================================
-        // TASK #2: MULTI-WEBSITE FREE VIDEO HUB (Gemini / ChatGPT / Kling / Hailuo + Free Quota)
-        // =========================================================================
+        // TASK #2: MULTI-WEBSITE FREE VIDEO HUB
         val freeHubCard = createSectionCard("2️⃣ #2 Task: Multi-Website Free AI Video Hub")
 
         var selectedFreeSite = prefs.getString("free_hub_site", "https://gemini.google.com") ?: "https://gemini.google.com"
@@ -1016,9 +999,7 @@ class MainActivity : AppCompatActivity() {
         freeHubCard.addView(spacer(dp(10)))
         freeHubCard.addView(runFreeHubBtn)
 
-        // =========================================================================
         // TASK #3: LOCAL FOLDER / GALLERY VIDEO -> YOUTUBE & INSTAGRAM AUTO-UPLOADER
-        // =========================================================================
         val ytCard = createSectionCard("3️⃣ #3 Task: Folder Video ➔ YouTube & Instagram Uploader")
 
         var folderUploadBgMode = prefs.getBoolean("bg_youtube_upload", true)
@@ -1141,9 +1122,7 @@ class MainActivity : AppCompatActivity() {
         ytCard.addView(spacer(dp(8)))
         ytCard.addView(pickSingleVideoBtn)
 
-        // =========================================================================
-        // 24/7 SMART SCHEDULER + IDLE PHONE MODE ("जब फोन फ्री हो") + SKIP FOR 10 MIN
-        // =========================================================================
+        // 24/7 SMART SCHEDULER + IDLE PHONE MODE + SKIP FOR 10 MIN
         val schedCard = createSectionCard("⏰ 24/7 Smart Scheduler + Idle Phone & Skip Control")
         val timeInput = createCleanInput(
             prefs.getString("schedule_time_hm", "19:00") ?: "19:00",
@@ -1187,7 +1166,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Quick Snooze / Skip Actions Row
         val snoozeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, dp(8), 0, dp(4))
@@ -1265,9 +1243,6 @@ class MainActivity : AppCompatActivity() {
         return scroll
     }
 
-    /**
-     * Multi-Platform Linker Box (YouTube Shorts + Instagram Reels + Custom Platform Creator)
-     */
     private fun buildMultiPlatformLinkerBox(prefs: android.content.SharedPreferences): View {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1351,7 +1326,7 @@ class MainActivity : AppCompatActivity() {
                 )
                 AlertDialog.Builder(this@MainActivity, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
                     .setTitle("➕ नया अपलोड प्लेटफॉर्म लिंक करें")
-                    .setView(input)
+                    .setView(input as View)
                     .setPositiveButton("Link Save करें") { _, _ ->
                         val v = input.text.toString().trim()
                         prefs.edit().putString("custom_linked_platforms", v).apply()
@@ -1380,7 +1355,7 @@ class MainActivity : AppCompatActivity() {
         AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
             .setTitle("🤖 Mini Task AI Configurator")
             .setMessage("भाई, अपनी भाषा में बताइए कि आपको किस टाइप की वीडियो, कितने भाग (Story) और किस टाइम पर अपलोड करवानी है:")
-            .setView(input)
+            .setView(input as View)
             .setPositiveButton("⚡ AI से ऑटो-सेट करें") { _, _ ->
                 val userWish = input.text.toString().trim()
                 if (userWish.isEmpty()) return@setPositiveButton
@@ -1395,7 +1370,6 @@ class MainActivity : AppCompatActivity() {
                     val extractedTitle = plan.optString("taskTitle", userWish).ifEmpty { userWish }
                     topicField.setText(extractedTitle)
 
-                    // Check if user mentioned time like 7, 8, 9, etc.
                     val timeRegex = Regex("(\\d{1,2})[:.](\\d{2})")
                     val match = timeRegex.find(userWish)
                     if (match != null) {
@@ -1533,7 +1507,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * TAB 4: Memory Folders, Automation Runs History & Video Training Sessions with Gemini 3.8 Flash Chat
+     * TAB 4: Memory Folders, Automation Runs History & Video Training Sessions
      */
     private fun buildTab4MemoryAndVideoTrainer(): View {
         val vault = getActiveVault()
@@ -1881,7 +1855,7 @@ class MainActivity : AppCompatActivity() {
 
         val dialog = AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
             .setTitle("💬 Fix Run: ${runRecord.title}")
-            .setView(dialogView)
+            .setView(dialogView as View)
             .setPositiveButton("बंद करें") { d, _ -> d.dismiss() }
             .create()
 
@@ -2107,7 +2081,7 @@ class MainActivity : AppCompatActivity() {
 
         val dialog = AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
             .setTitle("💬 Video Chat: ${session.appCategory}")
-            .setView(dialogView)
+            .setView(dialogView as View)
             .setPositiveButton("बंद करें") { d, _ -> d.dismiss() }
             .create()
 
@@ -2172,9 +2146,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(24))
         }
 
-        // =========================================================================
-        // NEW CARD: FLOATING CHANCHAL BOT STEALTH MODE, TRANSPARENCY SLIDER & GREETINGS
-        // =========================================================================
         val stealthCard = createSectionCard("👻 Floating Chanchal Bot: Stealth Mode & Corner Transparency")
 
         var isStealth = prefs.getBoolean("hud_stealth_mode", false)
@@ -2245,9 +2216,6 @@ class MainActivity : AppCompatActivity() {
         stealthCard.addView(spacer(dp(10)))
         stealthCard.addView(testEdgePeekBtn)
 
-        // =========================================================================
-        // LIVE LOGS CARD
-        // =========================================================================
         val logsCard = createSectionCard("📜 Live System & Action History Logs")
         val logControlsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -2594,4 +2562,213 @@ class MainActivity : AppCompatActivity() {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
             }
-            startActivityForResult(intent, REQ_VOICE_
+            startActivityForResult(intent, REQ_VOICE_INPUT)
+        } catch (_: Exception) {
+            Toast.makeText(this, "Voice input not supported", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun createSectionCard(title: String): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = roundedBox(cardSlate, dp(16), borderSubtle)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(16) }
+
+            val header = TextView(this@MainActivity).apply {
+                text = title
+                setTextColor(textPureWhite)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(0, 0, 0, dp(12))
+            }
+            addView(header)
+        }
+    }
+
+    private fun createCleanInput(initialText: String, hintText: String): EditText {
+        return EditText(this).apply {
+            setText(initialText)
+            hint = hintText
+            setHintTextColor(textMuted)
+            setTextColor(textPureWhite)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = roundedBox(bgMatteDark, dp(10), borderSubtle)
+        }
+    }
+
+    private fun createPrimaryButton(label: String, color: Int, onClick: (TextView) -> Unit): TextView {
+        return TextView(this).apply {
+            text = label
+            gravity = Gravity.CENTER
+            setTextColor(textPureWhite)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = roundedBox(color, dp(12))
+            setOnClickListener { onClick(this) }
+        }
+    }
+
+    private fun roundedBox(fillColor: Int, radiusPx: Int, strokeColor: Int? = null): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(fillColor)
+            cornerRadius = radiusPx.toFloat()
+            if (strokeColor != null) setStroke(dp(1), strokeColor)
+        }
+    }
+
+    private fun spacer(heightPx: Int): View {
+        return View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, heightPx)
+        }
+    }
+
+    private fun dp(value: Int): Int {
+        return TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP,
+            value.toFloat(),
+            resources.displayMetrics
+        ).toInt()
+    }
+
+    override fun onDestroy() {
+        logAutoRefreshJob?.cancel()
+        uiScope.cancel()
+        try {
+            studioWebView?.stopLoading()
+            studioWebView?.destroy()
+        } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
+    /**
+     * Cute Full-Body Chanchal Bot View for Home Page (Head, Eyes, Tiny Cute Mouth, Waving Arms & Feet)
+     */
+    inner class FullBodyChanchalBotView(context: Context) : View(context) {
+        private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#FFFFFF")
+            style = Paint.Style.FILL
+        }
+        private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#38BDF8")
+            style = Paint.Style.STROKE
+            strokeWidth = dp(2).toFloat()
+        }
+        private val featurePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#0F172A")
+            style = Paint.Style.FILL
+        }
+        private val mouthStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#0F172A")
+            style = Paint.Style.STROKE
+            strokeWidth = dp(2).toFloat()
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val blushPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#F472B6")
+            alpha = 130
+            style = Paint.Style.FILL
+        }
+
+        private var animPhase = 0f
+        private var waveBoost = 0f
+        private var isHappyMood = true
+        private var isCuriousMood = false
+        private val mouthPath = Path()
+        private val rect = RectF()
+
+        private val idleAnimator = ValueAnimator.ofFloat(0f, (Math.PI * 2).toFloat()).apply {
+            duration = 2600L
+            repeatCount = ValueAnimator.INFINITE
+            interpolator = LinearInterpolator()
+            addUpdateListener {
+                animPhase = it.animatedValue as Float
+                if (waveBoost > 0.02f) waveBoost *= 0.92f else waveBoost = 0f
+                invalidate()
+            }
+        }
+
+        override fun onAttachedToWindow() {
+            super.onAttachedToWindow()
+            if (!idleAnimator.isStarted) idleAnimator.start()
+        }
+
+        override fun onDetachedFromWindow() {
+            idleAnimator.cancel()
+            super.onDetachedFromWindow()
+        }
+
+        fun triggerPlayfulJumpAndWave() {
+            waveBoost = 1f
+            invalidate()
+        }
+
+        fun setBotMood(isHappy: Boolean, isCurious: Boolean) {
+            isHappyMood = isHappy
+            isCuriousMood = isCurious
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val cx = w / 2f
+            val bobY = sin(animPhase.toDouble()).toFloat() * dp(3) - (waveBoost * dp(6))
+            val glanceX = sin((animPhase * 0.7f).toDouble()).toFloat() * dp(2)
+
+            // Cute Feet
+            canvas.drawOval(cx - dp(18), h - dp(14), cx - dp(4), h - dp(4), bodyPaint)
+            canvas.drawOval(cx + dp(4), h - dp(14), cx + dp(18), h - dp(4), bodyPaint)
+
+            // Chubby Torso
+            rect.set(cx - dp(24), h * 0.42f + bobY, cx + dp(24), h - dp(10) + bobY)
+            canvas.drawRoundRect(rect, dp(22).toFloat(), dp(22).toFloat(), bodyPaint)
+            canvas.drawRoundRect(rect, dp(22).toFloat(), dp(22).toFloat(), shadowPaint)
+
+            // Waving Arms
+            val waveOffset = sin((animPhase * 2f).toDouble()).toFloat() * dp(6) + (waveBoost * dp(12))
+            canvas.drawOval(cx - dp(34), h * 0.46f + bobY - waveOffset, cx - dp(20), h * 0.68f + bobY, bodyPaint)
+            canvas.drawOval(cx + dp(20), h * 0.46f + bobY + waveOffset, cx + dp(34), h * 0.68f + bobY, bodyPaint)
+
+            // Cute Head
+            rect.set(cx - dp(26), dp(8).toFloat() + bobY, cx + dp(26), h * 0.46f + bobY)
+            canvas.drawRoundRect(rect, dp(24).toFloat(), dp(24).toFloat(), bodyPaint)
+            canvas.drawRoundRect(rect, dp(24).toFloat(), dp(24).toFloat(), shadowPaint)
+
+            // Rosy Cheeks
+            val eyeY = h * 0.26f + bobY
+            canvas.drawCircle(cx - dp(15) + glanceX, eyeY + dp(5), dp(4).toFloat(), blushPaint)
+            canvas.drawCircle(cx + dp(15) + glanceX, eyeY + dp(5), dp(4).toFloat(), blushPaint)
+
+            // Expressive Chanchal Eyes
+            val leftEyeX = cx - dp(10) + glanceX
+            val rightEyeX = cx + dp(10) + glanceX
+            val eyeR = if (isCuriousMood) dp(5).toFloat() else dp(4).toFloat()
+            canvas.drawLine(leftEyeX, eyeY, rightEyeX, eyeY, mouthStrokePaint)
+            canvas.drawCircle(leftEyeX, eyeY, eyeR, featurePaint)
+            canvas.drawCircle(rightEyeX, eyeY, eyeR, featurePaint)
+
+            // Tiny Cute Expressive Mouth
+            val mouthY = eyeY + dp(8)
+            if (isCuriousMood) {
+                canvas.drawCircle(cx + glanceX, mouthY, dp(3).toFloat(), mouthStrokePaint)
+            } else {
+                mouthPath.reset()
+                mouthPath.moveTo(cx - dp(4) + glanceX, mouthY)
+                mouthPath.quadTo(
+                    cx + glanceX,
+                    mouthY + if (isHappyMood) dp(4).toFloat() else -dp(2).toFloat(),
+                    cx + dp(4) + glanceX,
+                    mouthY
+                )
+                canvas.drawPath(mouthPath, mouthStrokePaint)
+            }
+        }
+    }
+}
