@@ -2172,4 +2172,3 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 }
-```
