@@ -22,7 +22,7 @@ data class DeviceBodySpecs(
 )
 
 data class AgentStepDecision(
-    val action: String,         // CLICK_TAG, CLICK_XY, LONG_PRESS_XY, TYPE, SWIPE, BACK, LAUNCH_APP, OPEN_SETTINGS, WAIT, DONE
+    val action: String,
     val tagId: Int = -1,
     val x: Int = 0,
     val y: Int = 0,
@@ -53,7 +53,7 @@ class GeminiBrain(private var apiKey: String) {
 
     private val rateLock = Any()
 
-    // SMART VISION & HIGH-ACCURACY LADDER (Starts with 3.8 Flash up to 9 RPM, then rotates to 3.5 Lite -> 3.1 Lite -> 3.1 Pro)
+    // Smart 9-RPM Free-Tier Vision Ladder
     private val smartVisionLadder = listOf(
         "gemini-3.8-flash",
         "gemini-3.5-flash-lite",
@@ -64,7 +64,7 @@ class GeminiBrain(private var apiKey: String) {
         "gemma-4-26b-a4b-it"
     )
 
-    // TEXT-ONLY / LIGHT TASK LADDER (Saves 3.8 Flash's 9 RPM exclusively for live screen vision!)
+    // Light Text Task Ladder (Saves 3.8 Flash's 9 RPM for live screen vision)
     private val lightTextTaskLadder = listOf(
         "gemini-3.5-flash-lite",
         "gemini-3.1-flash-lite",
@@ -73,7 +73,6 @@ class GeminiBrain(private var apiKey: String) {
         "gemini-3.1-pro-preview"
     )
 
-    // Sliding-window 60-second request timestamp tracker per model bucket
     private val modelRequestTimestamps = mutableMapOf<String, MutableList<Long>>()
     private val blockedModels = mutableSetOf<String>()
     private val quotaCooldownModels = mutableMapOf<String, Long>()
@@ -84,26 +83,22 @@ class GeminiBrain(private var apiKey: String) {
         apiKey = newKey.trim()
     }
 
-    /**
-     * Hard limit per 60 seconds (9 RPM Jugad so we NEVER hit Google's 10-15 RPM wall!)
-     */
     private fun getMaxSafeRpmForModel(model: String): Int {
-        return when {
-            model.contains("pro") -> 4
-            else -> 9 // Strictly max 9 requests per 60 seconds for 3.8-flash, 3.5-flash-lite, 3.1-flash-lite
+        return if (model.contains("pro")) 4 else 9
+    }
+
+    private fun getUsedRpmInLastMinute(model: String, nowMs: Long = System.currentTimeMillis()): Int =
+        synchronized(rateLock) {
+            val list = modelRequestTimestamps.getOrPut(model) { mutableListOf() }
+            list.removeAll { nowMs - it > 60_000L }
+            return list.size
         }
-    }
 
-    private fun getUsedRpmInLastMinute(model: String, nowMs: Long = System.currentTimeMillis()): Int = synchronized(rateLock) {
-        val list = modelRequestTimestamps.getOrPut(model) { mutableListOf() }
-        list.removeAll { nowMs - it > 60_000L }
-        return list.size
-    }
-
-    private fun hasSafeRpmSlot(model: String, nowMs: Long = System.currentTimeMillis()): Boolean = synchronized(rateLock) {
-        val used = getUsedRpmInLastMinute(model, nowMs)
-        return used < getMaxSafeRpmForModel(model)
-    }
+    private fun hasSafeRpmSlot(model: String, nowMs: Long = System.currentTimeMillis()): Boolean =
+        synchronized(rateLock) {
+            val used = getUsedRpmInLastMinute(model, nowMs)
+            return used < getMaxSafeRpmForModel(model)
+        }
 
     private fun recordModelRequestTimestamp(model: String) = synchronized(rateLock) {
         val nowMs = System.currentTimeMillis()
@@ -151,11 +146,6 @@ class GeminiBrain(private var apiKey: String) {
         return JSONObject("{$body}")
     }
 
-    /**
-     * Smart 9-RPM Load-Balanced Caller:
-     * Uses 3.8 Flash up to 9 requests/min for maximum accuracy, then seamlessly rotates to
-     * 3.5-flash-lite (9 RPM) -> 3.1-flash-lite (9 RPM) -> 3.1-pro-preview (4 RPM) -> robotics/gemma!
-     */
     private suspend fun callWithLadder(
         prompt: String,
         imagesBase64: List<String> = emptyList(),
@@ -166,7 +156,6 @@ class GeminiBrain(private var apiKey: String) {
         val now = System.currentTimeMillis()
         val baseLadder = if (useDeep38Flash) smartVisionLadder else lightTextTaskLadder
 
-        // 1. Pick models that are NOT blocked, NOT in 429 cooldown, AND under our 9-RPM guard
         val availableUnder9Rpm = baseLadder.filter { m ->
             !blockedModels.contains(m) &&
                 (quotaCooldownModels[m] ?: 0L) <= now &&
@@ -188,6 +177,7 @@ class GeminiBrain(private var apiKey: String) {
         }
 
         for (model in candidates) {
+            val usedBefore = getUsedRpmInLastMinute(model, now)
             recordModelRequestTimestamp(model)
             val result = executeSingleModelCall(model, prompt, imagesBase64)
             when (result.first) {
@@ -197,7 +187,9 @@ class GeminiBrain(private var apiKey: String) {
                     }
                 }
                 429 -> {
-                    quotaCooldownModels[model] = System.currentTimeMillis() + 35_000L
+                    // If 429 happens on the very first call of the minute, daily quota is full -> 10m cooldown
+                    val cooldownMs = if (usedBefore <= 1) 600_000L else 35_000L
+                    quotaCooldownModels[model] = System.currentTimeMillis() + cooldownMs
                     onBrainLog?.invoke("⚠️ Quota 429 on [$model] -> Instant switch to next free model...")
                 }
                 404, 403, 400 -> {
@@ -270,7 +262,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 1. Interactive Chat, Detailed Task Planner & Chat-Based Upload Time Scheduler
+     * 1. Interactive Chat, Detailed Task Planner, Idle Mode & Chat-Based Upload Scheduler
      */
     suspend fun chatAndBuildDetailedPlan(
         userMessage: String,
@@ -278,7 +270,7 @@ class GeminiBrain(private var apiKey: String) {
         userProfileRules: String
     ): JSONObject {
         val sysPrompt = """
-            You are AuraDroid OS, an intelligent friendly AI Assistant, Phone Automation Planner & Upload Scheduler.
+            You are AuraDroid OS, an intelligent friendly Hinglish AI Companion, Phone Automation Planner & Multi-Platform Scheduler.
             Speak in natural Hinglish/Hindi.
             User's saved profile/rules: $userProfileRules
             Recent conversation:
@@ -287,26 +279,30 @@ class GeminiBrain(private var apiKey: String) {
             User just said: "$userMessage"
             
             SPECIAL MODES YOU CAN SET IN "executionMode":
-            1. If the user wants to set/change daily YouTube upload time (e.g., "upload time 8:30 PM set kar do", "roz 7 baje video upload karo"):
-               - Set "executionMode": "SCHEDULE_YT_HH:mm" (replace HH:mm with 24-hour time like "SCHEDULE_YT_20:30" or "SCHEDULE_YT_19:00").
-               - Set "readyToExecute": true, and add 1 step in "steps": ["Activate 24/7 Daily YouTube Scheduler at HH:mm"].
-            2. If the user wants to upload a video from Folder to YouTube Shorts right now:
+            1. If the user wants to set/change daily YouTube/Flow upload time (e.g., "upload time 7:00 PM set kar do", "roz 8 baje video upload karo"):
+               - Set "executionMode": "SCHEDULE_YT_HH:mm" (replace HH:mm with 24-hour time like "SCHEDULE_YT_19:00" or "SCHEDULE_YT_20:00").
+               - Set "readyToExecute": true, and add 1 step in "steps": ["Activate 24/7 Daily Scheduler at HH:mm"].
+            2. If the user asks to run the task ONLY when they are NOT using their phone / when phone is free/idle:
+               - Set "executionMode": "IDLE_PHONE_MODE", "readyToExecute": true.
+            3. If the user wants to upload a video from Folder to YouTube Shorts right now:
                - Set "executionMode": "YOUTUBE_FOLDER_UPLOAD", "readyToExecute": true.
-            3. If the user wants to generate an 8s Google Flow video and upload to YouTube right now:
+            4. If the user wants to generate an 8s Google Flow video and upload to YouTube right now:
                - Set "executionMode": "GOOGLE_FLOW_UPLOAD", "readyToExecute": true.
-            4. For normal phone automation (Instagram, WhatsApp, YouTube, Settings):
-               - Set "executionMode": "LIVE_PHONE" (or "BACKGROUND_WEB"), break into clear steps in "steps", and set "readyToExecute": true.
+            5. If the user wants silent background web execution without touching their screen:
+               - Set "executionMode": "BACKGROUND_WEB", "readyToExecute": true.
+            6. For normal phone automation (Instagram, WhatsApp, Gemini App, YouTube App, Settings):
+               - Set "executionMode": "LIVE_PHONE", break into clear steps in "steps", and set "readyToExecute": true.
+               - In "reply", also politely mention that they can run it Live now, or run it in Background / When Phone is Free (Idle), or set a Schedule Time!
             
             Return ONLY valid JSON:
             {
-              "reply": "Friendly Hinglish response explaining your understanding",
+              "reply": "Friendly Hinglish response explaining your understanding and options",
               "readyToExecute": true,
               "taskTitle": "Short title of task",
               "executionMode": "LIVE_PHONE",
               "steps": [
-                "Step 1: Open Instagram app directly",
-                "Step 2: Tap Search icon at bottom bar and type query",
-                "Step 3: Open first video reel, tap Like heart, comment, and share"
+                "Step 1: Open target app or workspace",
+                "Step 2: Complete requested actions step by step"
               ]
             }
         """.trimIndent()
@@ -735,20 +731,25 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 8. Safe Video Prompt + Viral YouTube Shorts Title Generator
+     * 8. Exact Topic Video Prompt + Viral YouTube Shorts Title Generator
+     * Stays 100% faithful to the user's exact prompt (e.g. "young Indian girl dancing" or Story mode) without adding forced sci-fi!
      */
     suspend fun generateFlowSafePromptAndTitle(topic: String): Pair<String, String> {
-        val safeRegex = Regex("(?i)\\b(boy|girl|child|kid|minor|baby|skin)\\b")
-        val sanitizedTopic = topic.replace(safeRegex, "cybernetic explorer")
+        val cleanTopic = topic.trim().ifEmpty { "Beautiful cinematic vertical video" }
 
         val prompt = """
-            Create:
-            1. A policy-safe, cinematic 8-second vertical 9:16 AI video generation prompt about: "$sanitizedTopic".
-            2. A viral YouTube Shorts title with emojis and #shorts #viral hashtags (under 75 chars).
+            The user wants to generate a vertical 9:16 video strictly about this exact topic: "$cleanTopic".
+            
+            IMPORTANT RULES:
+            1. Stay 100% faithful to the user's exact topic "$cleanTopic"!
+            2. Do NOT change the subject to sci-fi, futuristic, or alien themes unless the user explicitly asked for them!
+            3. Create:
+               - "videoPrompt": A vivid, high-resolution, natural cinematic 8-second vertical 9:16 video generation prompt accurately depicting "$cleanTopic".
+               - "youtubeTitle": A catchy viral YouTube Shorts title matching "$cleanTopic" with emojis and #shorts #viral hashtags (under 75 chars).
             
             Return ONLY JSON:
             {
-              "videoPrompt": "Cinematic 8k vertical video of...",
+              "videoPrompt": "Cinematic 8k vertical 9:16 video of...",
               "youtubeTitle": "Amazing Title! #shorts #viral"
             }
         """.trimIndent()
@@ -757,13 +758,13 @@ class GeminiBrain(private var apiKey: String) {
         return try {
             val j = parseCleanJson(raw)
             Pair(
-                j.optString("videoPrompt", "Cinematic 8k vertical sci-fi scene of $sanitizedTopic, dramatic lighting, ultra detailed"),
-                j.optString("youtubeTitle", "$sanitizedTopic #shorts #viral")
+                j.optString("videoPrompt", "Cinematic 8k vertical 9:16 video of $cleanTopic, natural lighting, expressive motion, ultra detailed"),
+                j.optString("youtubeTitle", "${cleanTopic.take(45)} ✨ #shorts #viral")
             )
         } catch (_: Exception) {
             Pair(
-                "Cinematic 8k vertical sci-fi scene of $sanitizedTopic, unreal engine 5, hyper-realistic lighting",
-                "$sanitizedTopic #shorts #viral"
+                "Cinematic 8k vertical 9:16 video of $cleanTopic, natural lighting, smooth camera movement, ultra detailed",
+                "${cleanTopic.take(45)} ✨ #shorts #viral"
             )
         }
     }
