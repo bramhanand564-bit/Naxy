@@ -26,7 +26,6 @@ import android.provider.Settings
 import android.speech.RecognizerIntent
 import android.util.TypedValue
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.LinearInterpolator
@@ -39,7 +38,6 @@ import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -637,7 +635,6 @@ class MainActivity : AppCompatActivity() {
         }
         val defaultDownloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
 
-        // TASK #1: GOOGLE FLOW
         val flowCard = createSectionCard("1️⃣ #1 Task: Google Flow AI Video Studio")
         var flowExecMode = prefs.getString("flow_execution_mode", "BACKGROUND") ?: "BACKGROUND"
         val flowModeSwitchBtn = createPrimaryButton(
@@ -712,7 +709,6 @@ class MainActivity : AppCompatActivity() {
         flowCard.addView(spacer(dp(10)))
         flowCard.addView(runFlowNowBtn)
 
-        // TASK #2: MULTI-WEBSITE FREE VIDEO HUB
         val freeHubCard = createSectionCard("2️⃣ #2 Task: Multi-Website Free AI Video Hub")
         val freeSiteInput = createCleanInput(prefs.getString("free_hub_site", "https://gemini.google.com") ?: "https://gemini.google.com", "Free AI Website URL or App")
 
@@ -804,7 +800,6 @@ class MainActivity : AppCompatActivity() {
         freeHubCard.addView(spacer(dp(10)))
         freeHubCard.addView(runFreeHubBtn)
 
-        // TASK #3: LOCAL FOLDER UPLOADER
         val ytCard = createSectionCard("3️⃣ #3 Task: Folder Video ➔ YouTube & Instagram Uploader")
         var folderUploadBgMode = prefs.getBoolean("bg_youtube_upload", true)
         val folderModeSwitchBtn = createPrimaryButton(
@@ -862,7 +857,6 @@ class MainActivity : AppCompatActivity() {
         ytCard.addView(spacer(dp(8)))
         ytCard.addView(pickSingleVideoBtn)
 
-        // SCHEDULER + IDLE MODE + SKIP 10M
         val schedCard = createSectionCard("⏰ 24/7 Smart Scheduler + Idle Phone & Skip Control")
         val timeInput = createCleanInput(prefs.getString("schedule_time_hm", "19:00") ?: "19:00", "24-Hour Time (19:00 = 7:00 PM)")
 
@@ -899,8 +893,23 @@ class MainActivity : AppCompatActivity() {
         }.apply { layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) } })
 
         snoozeRow.addView(createPrimaryButton("🔔 Test Popup", Color.parseColor("#334155")) {
-            AutoTouchService.instance?.hud?.showPreRunChoicePrompt("7:00 PM Daily Video Task")
-                ?: Toast.makeText(this, "पहले Accessibility ऑन करें!", Toast.LENGTH_SHORT).show()
+            AutoTouchService.instance?.hud?.showHud()
+            AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+                .setTitle("🤖 7:00 PM Smart Task Prompt")
+                .setMessage("भाई, अभी आपका डेली ऑटोमेशन का समय हो गया है। आप क्या करना चाहते हैं?")
+                .setPositiveButton("🌐 Run in Background") { _, _ ->
+                    prefs.edit().putBoolean("bg_youtube_upload", true).apply()
+                    Toast.makeText(this, "🌐 बैकग्राउंड मोड चुन लिया गया!", Toast.LENGTH_SHORT).show()
+                }
+                .setNeutralButton("🌙 When Phone Free") { _, _ ->
+                    prefs.edit().putBoolean("run_only_when_idle", true).apply()
+                    Toast.makeText(this, "🌙 जब फोन फ्री होगा तब चलेगा!", Toast.LENGTH_SHORT).show()
+                }
+                .setNegativeButton("⏳ Skip 10 Min") { _, _ ->
+                    prefs.edit().putLong("snooze_until_ms", System.currentTimeMillis() + 10 * 60_000L).apply()
+                    Toast.makeText(this, "⏳ 10 मिनट के लिए Skip कर दिया गया!", Toast.LENGTH_SHORT).show()
+                }
+                .show()
         }.apply { layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) })
 
         var schedEnabled = prefs.getBoolean("scheduler_enabled", false)
@@ -1267,7 +1276,15 @@ class MainActivity : AppCompatActivity() {
                 val imgs = vault.loadSavedImagesAsBase64(runRecord.screenshotPaths, 6)
                 val rep = brain.chatAboutAutomationRunWith38Flash(runRecord, userText, imgs)
                 vault.appendChatToAutomationRun(runRecord.runId, "Gemini 3.8", rep.replyText)
-                vault.saveStuckOrHumanFix(runRecord.appCategory, "run_${runRecord.runId}", rep.extractedProblem, rep.extractedSolutionRule, rep.tapXRatio, rep.tapYRatio, "RUN_CHAT")
+                vault.saveStuckOrHumanFix(
+                    category = runRecord.appCategory,
+                    screenSignature = "run_${runRecord.runId}",
+                    problemDescription = rep.extractedProblem,
+                    solutionRule = rep.extractedSolutionRule,
+                    tapXRatio = rep.tapXRatio,
+                    tapYRatio = rep.tapYRatio,
+                    sourceType = "RUN_CHAT"
+                )
                 withContext(Dispatchers.Main) {
                     btn.isEnabled = true
                     appendMsg("Gemini 3.8", rep.replyText)
@@ -1352,7 +1369,15 @@ class MainActivity : AppCompatActivity() {
                 val frames = vault.loadSavedImagesAsBase64(session.framePaths, 10)
                 val rep = brain.chatAboutTrainingVideoWith38Flash(session, userText, frames)
                 vault.appendChatToVideoSession(session.sessionId, "Gemini 3.8", rep.replyText, rep.extractedSolutionRule)
-                vault.saveStuckOrHumanFix(session.appCategory, "vid_${session.sessionId}", rep.extractedProblem, rep.extractedSolutionRule, rep.tapXRatio, rep.tapYRatio, "VIDEO_CHAT")
+                vault.saveStuckOrHumanFix(
+                    category = session.appCategory,
+                    screenSignature = "vid_${session.sessionId}",
+                    problemDescription = rep.extractedProblem,
+                    solutionRule = rep.extractedSolutionRule,
+                    tapXRatio = rep.tapXRatio,
+                    tapYRatio = rep.tapYRatio,
+                    sourceType = "VIDEO_CHAT"
+                )
                 withContext(Dispatchers.Main) {
                     btn.isEnabled = true
                     appendMsg("Gemini 3.8", rep.replyText)
@@ -1433,7 +1458,7 @@ class MainActivity : AppCompatActivity() {
             val svc = AutoTouchService.instance
             if (svc != null) {
                 svc.hud.showHud()
-                svc.hud.triggerFriendlyGreeting("☀️ Good Morning भाई! Have a good luck day!")
+                Toast.makeText(this, "☀️ Good Morning भाई! Have a good luck day!", Toast.LENGTH_LONG).show()
             } else {
                 Toast.makeText(this, "पहले Accessibility ऑन करें!", Toast.LENGTH_SHORT).show()
             }
@@ -1622,7 +1647,15 @@ class MainActivity : AppCompatActivity() {
                     val (session, framesB64) = vault.createVideoTrainingSession(selectedTrainingCategory, selectedTrainingNote, videoUri, 12)
                     val rules = brain.analyzeTrainingVideoFrames(selectedTrainingCategory, selectedTrainingNote, framesB64)
                     for (r in rules) {
-                        vault.saveStuckOrHumanFix(selectedTrainingCategory, r.screenSignature, r.problemDescription, r.solutionRule, r.tapXRatio, r.tapYRatio, r.sourceType)
+                        vault.saveStuckOrHumanFix(
+                            category = selectedTrainingCategory,
+                            screenSignature = r.screenSignature,
+                            problemDescription = r.problemDescription,
+                            solutionRule = r.solutionRule,
+                            tapXRatio = r.tapXRatio,
+                            tapYRatio = r.tapYRatio,
+                            sourceType = r.sourceType
+                        )
                         vault.appendChatToVideoSession(session.sessionId, "Gemini 3.8", "Learned: ${r.solutionRule}", r.solutionRule)
                     }
                     withContext(Dispatchers.Main) {
