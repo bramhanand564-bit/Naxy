@@ -118,7 +118,6 @@ class AiOverlayHud(
                 baymaxFaceView?.setMood(if (hour >= 23 || hour < 5) BotMood.SLEEPY else BotMood.IDLE)
                 dockBotToNearestCornerEdge()
             } else {
-                // Even while task is running in background, apply user's subtle transparency after collapsing text bar
                 applyUserTransparencyAndStealthSettings()
             }
         }
@@ -143,6 +142,7 @@ class AiOverlayHud(
     }
 
     private fun addViewWithFallback(view: View, params: WindowManager.LayoutParams) {
+        params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
         try {
             windowManager.addView(view, params)
         } catch (_: Exception) {
@@ -156,6 +156,23 @@ class AiOverlayHud(
         }
     }
 
+    /**
+     * Strictly enforces FLAG_NOT_FOCUSABLE on the overlay window so the phone's Soft Keyboard (Gboard)
+     * ALWAYS opens normally in Instagram, WhatsApp, Chrome, and AuraDroid!
+     */
+    fun enforceKeyboardFriendlyFocusFlags() {
+        mainHandler.post {
+            val params = podParams ?: return@post
+            val root = podRootLayout ?: return@post
+            params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            try {
+                if (isAdded) windowManager.updateViewLayout(root, params)
+            } catch (_: Exception) {}
+        }
+    }
+
     fun showHud() {
         mainHandler.post {
             if (!isAdded) {
@@ -165,6 +182,7 @@ class AiOverlayHud(
                     isAdded = true
                 } catch (_: Exception) {}
             }
+            enforceKeyboardFriendlyFocusFlags()
             applyUserTransparencyAndStealthSettings()
             triggerGreetingPeekIfAllowed()
         }
@@ -188,26 +206,35 @@ class AiOverlayHud(
 
     /**
      * Applies user's Stealth Mode (Hide Bot while background tasks still run) and Custom Opacity/Transparency!
+     * Supports both MainActivity and internal preference keys.
      */
     fun applyUserTransparencyAndStealthSettings() {
         mainHandler.post {
-            val stealthHideBot = prefs.getBoolean("stealth_hide_bot", false) || !prefs.getBoolean("show_bot_hud", true)
-            val idleAlphaPercent = prefs.getInt("hud_idle_alpha_percent", 38).coerceIn(10, 100)
-            val targetAlpha = if (isNotchExpandedByUser) 1.0f else (idleAlphaPercent / 100f)
+            val stealthHideBot = prefs.getBoolean("hud_stealth_mode", false) ||
+                prefs.getBoolean("stealth_hide_bot", false) ||
+                !prefs.getBoolean("show_bot_hud", true)
+
+            val idleAlphaFloat = if (prefs.contains("hud_idle_alpha")) {
+                prefs.getFloat("hud_idle_alpha", 0.38f).coerceIn(0.05f, 1.0f)
+            } else {
+                (prefs.getInt("hud_idle_alpha_percent", 38).coerceIn(5, 100)) / 100f
+            }
+
+            val targetAlpha = if (isNotchExpandedByUser) 1.0f else idleAlphaFloat
 
             if (stealthHideBot) {
                 baymaxFaceView?.visibility = View.GONE
                 notchCapsuleContainer?.visibility = View.GONE
             } else {
                 baymaxFaceView?.visibility = View.VISIBLE
-                baymaxFaceView?.alpha = if (isDockedAtEdge) targetAlpha else 0.95f
+                baymaxFaceView?.alpha = targetAlpha
             }
+            enforceKeyboardFriendlyFocusFlags()
         }
     }
 
     /**
      * Smoothly docks the bot into the left or right screen corner so only a subtle edge peeks out!
-     * User can slide/pull it out anytime!
      */
     private fun dockBotToNearestCornerEdge() {
         val params = podParams ?: return
@@ -220,6 +247,10 @@ class AiOverlayHud(
         val targetX = if (params.x < screenW / 2) -hideOffset else (screenW - dp(26))
 
         isDockedAtEdge = true
+        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+
         val startX = params.x
         ValueAnimator.ofInt(startX, targetX).apply {
             duration = 380L
@@ -244,6 +275,9 @@ class AiOverlayHud(
         val screenW = dm.widthPixels
         isDockedAtEdge = false
         baymaxFaceView?.alpha = 1.0f
+        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
 
         val targetX = if (params.x < screenW / 2) dp(10) else (screenW - dp(68)).coerceAtLeast(dp(10))
         if (params.x < 0 || params.x > screenW - dp(56)) {
@@ -259,8 +293,11 @@ class AiOverlayHud(
      */
     fun triggerGreetingPeekIfAllowed(customGreeting: String? = null) {
         mainHandler.post {
-            val stealth = prefs.getBoolean("stealth_hide_bot", false) || !prefs.getBoolean("show_bot_hud", true)
-            val greetingsOn = prefs.getBoolean("bot_greetings_enabled", true)
+            val stealth = prefs.getBoolean("hud_stealth_mode", false) ||
+                prefs.getBoolean("stealth_hide_bot", false) ||
+                !prefs.getBoolean("show_bot_hud", true)
+            val greetingsOn = prefs.getBoolean("hud_greetings_enabled", true) &&
+                prefs.getBoolean("bot_greetings_enabled", true)
             if (stealth || !greetingsOn) return@post
 
             val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
@@ -291,10 +328,6 @@ class AiOverlayHud(
         }
     }
 
-    /**
-     * Shows the non-intrusive pre-run banner when a scheduled task triggers while user is using the phone!
-     * Gives user 1-tap options: [ Skip 10m ] | [ When Free ] | [ Background ] | [ Run Now ]
-     */
     fun showScheduledTaskConfirmBanner(
         taskTitle: String,
         onRunNow: () -> Unit,
@@ -342,6 +375,7 @@ class AiOverlayHud(
 
             notchCapsuleContainer?.visibility = View.VISIBLE
             notchDetailsSection?.visibility = View.VISIBLE
+            enforceKeyboardFriendlyFocusFlags()
         }
     }
 
@@ -426,8 +460,11 @@ class AiOverlayHud(
             baymaxFaceView?.setMood(smartMood)
             statusTextView?.text = statusText
             updateNotchTelemetryFromStatus(statusText, taskRunning)
+            enforceKeyboardFriendlyFocusFlags()
 
-            val stealth = prefs.getBoolean("stealth_hide_bot", false) || !prefs.getBoolean("show_bot_hud", true)
+            val stealth = prefs.getBoolean("hud_stealth_mode", false) ||
+                prefs.getBoolean("stealth_hide_bot", false) ||
+                !prefs.getBoolean("show_bot_hud", true)
             if (stealth) {
                 baymaxFaceView?.visibility = View.GONE
                 notchCapsuleContainer?.visibility = View.GONE
@@ -452,14 +489,14 @@ class AiOverlayHud(
 
     fun animateHandTap(centerX: Float, centerY: Float) {
         mainHandler.post {
-            val stealth = prefs.getBoolean("stealth_hide_bot", false)
+            val stealth = prefs.getBoolean("hud_stealth_mode", false) || prefs.getBoolean("stealth_hide_bot", false)
             if (!stealth) handOverlayView?.triggerPlumpHandTap(centerX, centerY)
         }
     }
 
     fun animateHandSwipe(startX: Float, startY: Float, endX: Float, endY: Float) {
         mainHandler.post {
-            val stealth = prefs.getBoolean("stealth_hide_bot", false)
+            val stealth = prefs.getBoolean("hud_stealth_mode", false) || prefs.getBoolean("stealth_hide_bot", false)
             if (!stealth) handOverlayView?.triggerPlumpHandSwipe(startX, startY, endX, endY)
         }
     }
@@ -468,6 +505,7 @@ class AiOverlayHud(
         if (backgroundWebView == null && !isAdded) {
             showHud()
         }
+        enforceKeyboardFriendlyFocusFlags()
         return backgroundWebView
     }
 
@@ -497,6 +535,7 @@ class AiOverlayHud(
     private fun createHandCursorOverlay() {
         handOverlayView = BaymaxHandOverlayView(context).apply {
             alpha = 0f
+            isFocusable = false
         }
         val overlayType = resolveBestOverlayType()
 
@@ -534,22 +573,29 @@ class AiOverlayHud(
             y = dp(95)
         }
 
+        // CRITICAL KEYBOARD FIX: Block descendant focus so no child view in the overlay ever steals Gboard!
         podRootLayout = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
+            isFocusable = false
+            isFocusableInTouchMode = false
+            descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
         }
 
         val topRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            isFocusable = false
         }
 
         baymaxFaceView = BaymaxFaceView(context).apply {
             layoutParams = LinearLayout.LayoutParams(dp(56), dp(56))
+            isFocusable = false
         }
 
         notchCapsuleContainer = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
+            isFocusable = false
             setPadding(dp(12), dp(8), dp(12), dp(8))
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#EB111318"))
@@ -632,7 +678,6 @@ class AiOverlayHud(
             setPadding(0, 0, 0, dp(4))
         }
 
-        // Quick Snooze / Background / Idle Control Row inside Notch Capsule
         quickSnoozeRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -694,6 +739,7 @@ class AiOverlayHud(
         webCardContainer = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
+            isFocusable = false
             setPadding(dp(8), dp(8), dp(8), dp(8))
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#121316"))
@@ -736,6 +782,7 @@ class AiOverlayHud(
                     text = "[ ⛶ Full ]"
                 }
                 webCardContainer?.layoutParams = lp
+                enforceKeyboardFriendlyFocusFlags()
             }
         }
 
@@ -753,14 +800,19 @@ class AiOverlayHud(
         webHeader.addView(expandBtn)
         webHeader.addView(hideBtn)
 
-        backgroundWebView = WebView(context).apply {
+        // CRITICAL KEYBOARD FIX: Override onCheckIsTextEditor & requestFocus so backgroundWebView
+        // never steals Android's InputMethodManager (Soft Keyboard) from Instagram, Chrome, or AuraDroid!
+        backgroundWebView = object : WebView(context) {
+            override fun onCheckIsTextEditor(): Boolean = false
+            override fun requestFocus(direction: Int, previouslyFocusedRect: Rect?): Boolean = false
+        }.apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
                 1f
             )
-            isFocusable = true
-            isFocusableInTouchMode = true
+            isFocusable = false
+            isFocusableInTouchMode = false
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.databaseEnabled = true
@@ -775,7 +827,6 @@ class AiOverlayHud(
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
             webViewClient = WebViewClient()
             webChromeClient = object : WebChromeClient() {
-                // Silent Background File Chooser Injection for Background YouTube / Instagram Web Uploads!
                 override fun onShowFileChooser(
                     webView: WebView?,
                     filePathCallback: ValueCallback<Array<Uri>>?,
@@ -814,17 +865,8 @@ class AiOverlayHud(
 
     private fun setWebCardVisibility(show: Boolean) {
         webCardContainer?.visibility = if (show) View.VISIBLE else View.GONE
-        val params = podParams ?: return
-        val root = podRootLayout ?: return
-        if (show) {
-            params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
-            params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
-        } else {
-            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-        }
-        try {
-            if (isAdded) windowManager.updateViewLayout(root, params)
-        } catch (_: Exception) {}
+        // CRITICAL KEYBOARD FIX: Always keep FLAG_NOT_FOCUSABLE even when Web Card is visible!
+        enforceKeyboardFriendlyFocusFlags()
     }
 
     private fun toggleWebCardVisibility() {
@@ -864,6 +906,9 @@ class AiOverlayHud(
                         isDockedAtEdge = false
                         params.x = (startX + dx).coerceIn(-dp(32), maxX)
                         params.y = (startY + dy).coerceIn(0, maxY)
+                        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                         try {
                             windowManager.updateViewLayout(podRootLayout, params)
                         } catch (_: Exception) {}
@@ -874,7 +919,6 @@ class AiOverlayHud(
                     if (!isDragging) {
                         onBaymaxFaceTapped()
                     } else {
-                        // If dragged near edge and released, schedule auto-dock after 4s
                         mainHandler.postDelayed(autoCollapseAndDockRunnable, 4000L)
                     }
                     true
@@ -907,6 +951,7 @@ class AiOverlayHud(
             updateNotchTelemetryFromStatus(statusTextView?.text?.toString() ?: "Ready", isTaskActivelyRunning)
             notchCapsuleContainer?.visibility = View.VISIBLE
             notchDetailsSection?.visibility = View.VISIBLE
+            enforceKeyboardFriendlyFocusFlags()
             mainHandler.postDelayed({
                 isNotchExpandedByUser = false
                 notchDetailsSection?.visibility = View.GONE
@@ -917,7 +962,7 @@ class AiOverlayHud(
     }
 
     /**
-     * Chanchal (Playful) 2x-Eye Baymax Face with a Tiny Cute Mouth! (Zero Pink, Zero Blush!)
+     * Chanchal (Playful) 2x-Eye Baymax Face with a Tiny Cute Mouth!
      */
     private inner class BaymaxFaceView(context: Context) : View(context) {
         private var currentMood = BotMood.IDLE
@@ -984,7 +1029,6 @@ class AiOverlayHud(
                     start()
                 }
 
-                // Chanchal (Playful) eye movement so the bot feels alive & attentive!
                 when (currentMood) {
                     BotMood.IDLE -> {
                         gazeOffsetX = when (chanchalTick % 4) {
@@ -1014,6 +1058,7 @@ class AiOverlayHud(
 
         init {
             setLayerType(LAYER_TYPE_SOFTWARE, null)
+            isFocusable = false
         }
 
         override fun onAttachedToWindow() {
@@ -1156,32 +1201,26 @@ class AiOverlayHud(
                 }
             }
 
-            // 3. Draw Tiny Cute Expressive Mouth below the eyes!
             drawTinyCuteMouth(canvas, cx + gazeOffsetX * 0.5f, cy + headRadius * 0.42f, headRadius * 0.22f)
         }
 
         private fun drawTinyCuteMouth(canvas: Canvas, mx: Float, my: Float, mw: Float) {
             when (currentMood) {
                 BotMood.HAPPY, BotMood.CELEBRATE, BotMood.WINK, BotMood.STAR_EYES, BotMood.HEART_EYES -> {
-                    // Cute tiny happy smile arc
                     val mRect = RectF(mx - mw, my - mw * 0.7f, mx + mw, my + mw * 0.7f)
                     canvas.drawArc(mRect, 15f, 150f, false, mouthPaint)
                 }
                 BotMood.THINKING, BotMood.QUESTION, BotMood.SCANNING, BotMood.SURPRISED -> {
-                    // Cute tiny 'o' mouth
                     canvas.drawCircle(mx, my, mw * 0.45f, mouthPaint)
                 }
                 BotMood.ERROR, BotMood.DIZZY -> {
-                    // Tiny sad curve
                     val mRect = RectF(mx - mw * 0.85f, my - mw * 0.3f, mx + mw * 0.85f, my + mw * 0.9f)
                     canvas.drawArc(mRect, 200f, 140f, false, mouthPaint)
                 }
                 BotMood.SLEEPY -> {
-                    // Tiny sleeping breathing dot
                     canvas.drawCircle(mx, my, mw * 0.32f, eyeFillPaint)
                 }
                 else -> {
-                    // Subtle tiny friendly smile
                     val mRect = RectF(mx - mw * 0.75f, my - mw * 0.5f, mx + mw * 0.75f, my + mw * 0.5f)
                     canvas.drawArc(mRect, 20f, 140f, false, mouthPaint)
                 }
@@ -1283,6 +1322,7 @@ class AiOverlayHud(
 
         init {
             setLayerType(LAYER_TYPE_SOFTWARE, null)
+            isFocusable = false
         }
 
         fun stopAnimations() {
