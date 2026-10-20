@@ -1,3 +1,4 @@
+```kotlin
 package com.auradroid.os
 
 import android.accessibilityservice.AccessibilityService
@@ -101,6 +102,7 @@ class AutoTouchService : AccessibilityService() {
     private var currentAppCategory = "General"
     private var lastStepScreenshot: Bitmap? = null
     private var lastAgentTapTimestamp = 0L
+    private var lastUserScreenInteractionTimeMs = System.currentTimeMillis()
     private var lastScreenshotTimestamp = 0L
     private var lastAiCallTimestamp = 0L
     private var consecutiveSameScreenCount = 0
@@ -233,12 +235,34 @@ class AutoTouchService : AccessibilityService() {
         )
     }
 
+    /**
+     * Checks if the user is currently NOT actively touching/using the phone (Idle for >= 90 seconds or screen off)
+     */
+    fun isPhoneCurrentlyIdleOrFree(): Boolean {
+        return try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (!pm.isInteractive) return true
+            val idleMs = System.currentTimeMillis() - lastUserScreenInteractionTimeMs
+            idleMs >= 90_000L
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
         val teachEnabled = prefs.getBoolean("passive_teach_mode", true)
 
         val timeSinceAgentTap = System.currentTimeMillis() - lastAgentTapTimestamp
+        if (timeSinceAgentTap > 1400L &&
+            (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED ||
+                event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED ||
+                event.eventType == AccessibilityEvent.TYPE_TOUCH_INTERACTION_START)
+        ) {
+            lastUserScreenInteractionTimeMs = System.currentTimeMillis()
+        }
+
         if (teachEnabled && isAgentRunning && timeSinceAgentTap > 1400L &&
             event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED
         ) {
@@ -371,6 +395,9 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
+    /**
+     * Universal Autonomous Goal-Based Executor + Idle Mode + Chat Scheduler & Multi-Platform Trigger
+     */
     fun startUniversalTask(
         goal: String,
         plannedSteps: List<String> = emptyList(),
@@ -391,7 +418,17 @@ class AutoTouchService : AccessibilityService() {
                 .putString("scheduled_pipeline_type", pipeType)
                 .apply()
             hud.updateStatus("⏰ Daily Upload Set: $timeHm", BotMood.HAPPY, taskRunning = false)
-            log("⏰ Chat Activated 24/7 Daily YouTube Scheduler at $timeHm [$pipeType]!")
+            log("⏰ Chat Activated 24/7 Daily Scheduler at $timeHm [$pipeType]!")
+            return
+        }
+
+        if (execMode == "IDLE_PHONE_MODE") {
+            prefs.edit()
+                .putBoolean("run_only_when_idle", true)
+                .putString("pending_idle_goal", goal)
+                .apply()
+            hud.updateStatus("🌙 फोन खाली होने पर चलेगा!", BotMood.HAPPY, taskRunning = false)
+            log("🌙 Queued Task for Idle Phone Mode: $goal")
             return
         }
 
@@ -404,6 +441,7 @@ class AutoTouchService : AccessibilityService() {
             startYouTubeFolderAutoUpload(folder, pickOldest)
             return
         }
+
         if (execMode == "GOOGLE_FLOW_UPLOAD") {
             val topic = prefs.getString("flow_topic", goal.take(40)) ?: goal.take(40)
             val count = prefs.getInt("flow_daily_videos", 1)
@@ -450,6 +488,7 @@ class AutoTouchService : AccessibilityService() {
                     lowerGoal.contains("instagram") || lowerGoal.contains("इंस्टाग्राम") || lowerGoal.contains("insta") -> "instagram"
                     lowerGoal.contains("whatsapp") || lowerGoal.contains("व्हाट्सएप") -> "whatsapp"
                     lowerGoal.contains("youtube") || lowerGoal.contains("यूट्यूब") -> "youtube"
+                    lowerGoal.contains("gemini") || lowerGoal.contains("जेमिनी") -> "com.google.android.apps.bard"
                     lowerGoal.contains("chrome") || lowerGoal.contains("क्रोम") -> "chrome"
                     lowerGoal.contains("setting") || lowerGoal.contains("सेटिंग") -> "settings"
                     else -> null
@@ -735,7 +774,7 @@ class AutoTouchService : AccessibilityService() {
                 val cleanTopic = rawDisplayName.substringBeforeLast(".").replace("_", " ").ifBlank { "Amazing Viral Short Video" }
                 val (_, viralTitle) = geminiBrain.generateFlowSafePromptAndTitle(cleanTopic)
                 log("✨ Generated Viral Title: $viralTitle")
-                uploadVideoUriToYouTubeShorts(videoUri, viralTitle)
+                dispatchVideoToLinkedPlatforms(videoUri, viralTitle)
                 finalizeRunAndTriggerAutoReflection("SUCCESS")
             } catch (_: CancellationException) {
                 finalizeRunAndTriggerAutoReflection("STOPPED")
@@ -784,7 +823,7 @@ class AutoTouchService : AccessibilityService() {
                         log("🎬 Found Video via MediaStore: $name")
                         hud.updateStatus("Generating Viral Title...", BotMood.THINKING, taskRunning = true)
                         val (_, viralTitle) = geminiBrain.generateFlowSafePromptAndTitle(name.substringBeforeLast("."))
-                        uploadVideoUriToYouTubeShorts(uri, viralTitle)
+                        dispatchVideoToLinkedPlatforms(uri, viralTitle)
                         uploadedSet.add(uri.toString())
                         prefs.edit().putStringSet("uploaded_videos_set", uploadedSet).apply()
                         finalizeRunAndTriggerAutoReflection("SUCCESS")
@@ -811,7 +850,7 @@ class AutoTouchService : AccessibilityService() {
                 )
                 log("✨ AI Viral Title: $viralTitle")
 
-                uploadVideoUriToYouTubeShorts(Uri.fromFile(chosenVideo), viralTitle)
+                dispatchVideoToLinkedPlatforms(Uri.fromFile(chosenVideo), viralTitle)
 
                 uploadedSet.add(chosenVideo.absolutePath)
                 prefs.edit().putStringSet("uploaded_videos_set", uploadedSet).apply()
@@ -828,6 +867,184 @@ class AutoTouchService : AccessibilityService() {
                 releaseWakeLock()
             }
         }
+    }
+
+    /**
+     * Routes the video upload to YouTube (Background Web Studio OR Live App) AND Instagram Reels if linked!
+     */
+    private suspend fun dispatchVideoToLinkedPlatforms(videoUri: Uri, viralTitle: String) {
+        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+        val useBackgroundYtUpload = prefs.getBoolean("yt_upload_in_background", false)
+        val linkYoutube = prefs.getBoolean("link_platform_youtube", true)
+        val linkInstagram = prefs.getBoolean("link_platform_instagram", false)
+
+        if (linkYoutube) {
+            if (useBackgroundYtUpload) {
+                val bgOk = uploadVideoInBackgroundWebStudio(videoUri, viralTitle)
+                if (!bgOk && isAgentRunning) {
+                    log("🔄 Background Studio needs interactive session -> Completing via YouTube Shorts...")
+                    uploadVideoUriToYouTubeShorts(videoUri, viralTitle)
+                }
+            } else {
+                uploadVideoUriToYouTubeShorts(videoUri, viralTitle)
+            }
+        }
+
+        if (linkInstagram && isAgentRunning) {
+            delay(3000L)
+            uploadVideoUriToInstagramReels(videoUri, viralTitle)
+        }
+    }
+
+    /**
+     * Silent Background YouTube Studio Web Uploader using hud.pendingUploadFileUri + WebChromeClient.onShowFileChooser!
+     */
+    private suspend fun uploadVideoInBackgroundWebStudio(videoUri: Uri, viralTitle: String): Boolean {
+        val webView = hud.getOrCreateBackgroundWebView() ?: return false
+        hud.pendingUploadFileUri = videoUri
+        hud.updateStatus("🌐 BG Uploading to YouTube...", BotMood.UPLOAD_UP, taskRunning = true)
+        log("🌐 Starting Silent Background YouTube Studio Upload for: $viralTitle")
+
+        withContext(Dispatchers.Main) {
+            webView.settings.userAgentString =
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            webView.loadUrl("https://www.youtube.com/upload")
+        }
+        delay(6500L)
+
+        var fileInjected = false
+        for (step in 1..15) {
+            if (!isAgentRunning) return false
+            val jsRes = evaluateWebStudioUploadStep(webView, viralTitle)
+            log("🌐 BG YouTube Studio Step #$step -> $jsRes")
+            if (jsRes.contains("FILE_INPUT_TRIGGERED")) {
+                fileInjected = true
+            }
+            if (jsRes.contains("PUBLISHED_DONE")) {
+                hud.updateStatus("🎉 BG UPLOAD SUCCESS!", BotMood.HAPPY, taskRunning = false)
+                log("🎉 Background YouTube Upload Completed: $viralTitle")
+                hud.pendingUploadFileUri = null
+                return true
+            }
+            delay(3500L)
+        }
+
+        hud.pendingUploadFileUri = null
+        return fileInjected
+    }
+
+    private suspend fun evaluateWebStudioUploadStep(webView: WebView, viralTitle: String): String =
+        suspendCancellableCoroutine { cont ->
+            val js = """
+                (function() {
+                    const fileInput = document.querySelector('input[type="file"]');
+                    if (fileInput && !window.__auraFileInjected) {
+                        window.__auraFileInjected = true;
+                        fileInput.click();
+                        return 'FILE_INPUT_TRIGGERED';
+                    }
+                    const selectBtn = document.querySelector('#select-files-button, ytcp-button#select-files-button');
+                    if (selectBtn && !window.__auraFileInjected) {
+                        selectBtn.click();
+                        return 'CLICKED_SELECT_FILES';
+                    }
+                    const titleBox = document.querySelector('#textbox[aria-label*="title" i], #title-textarea #textbox');
+                    if (titleBox && (!titleBox.innerText || titleBox.innerText.length < 5)) {
+                        titleBox.focus();
+                        titleBox.innerText = ${JSONObject.quote(viralTitle)};
+                        titleBox.dispatchEvent(new InputEvent('input', { bubbles: true }));
+                    }
+                    const notForKids = document.querySelector('tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], #audience tp-yt-paper-radio-button:nth-child(2)');
+                    if (notForKids) notForKids.click();
+
+                    const doneBtn = document.querySelector('#done-button, ytcp-button#done-button');
+                    if (doneBtn && !doneBtn.disabled && doneBtn.getBoundingClientRect().width > 10) {
+                        const publicRadio = document.querySelector('tp-yt-paper-radio-button[name="PUBLIC"]');
+                        if (publicRadio) publicRadio.click();
+                        setTimeout(() => { doneBtn.click(); }, 400);
+                        return 'PUBLISHED_DONE';
+                    }
+                    const nextBtn = document.querySelector('#next-button, ytcp-button#next-button');
+                    if (nextBtn && !nextBtn.disabled && nextBtn.getBoundingClientRect().width > 10) {
+                        nextBtn.click();
+                        return 'CLICKED_STUDIO_NEXT';
+                    }
+                    return 'WAITING_STUDIO';
+                })();
+            """.trimIndent()
+            withContextOrMain(webView, js) { res ->
+                cont.resume(res)
+            }
+        }
+
+    /**
+     * Multi-Platform Linker: Auto-Uploads the same video to Instagram Reels!
+     */
+    suspend fun uploadVideoUriToInstagramReels(videoUri: Uri, caption: String) {
+        hideWebPreviewCardIfOpen()
+        val specs = getCalibratedDeviceBodySpecs()
+        log("📸 Multi-Platform Link: Sharing Video to Instagram Reels...")
+        hud.updateStatus("📸 Sharing to Instagram Reels...", BotMood.WORKING, taskRunning = true)
+
+        withContext(Dispatchers.Main) {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("aura_ig_caption", caption))
+
+            StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "video/*"
+                setPackage("com.instagram.android")
+                putExtra(Intent.EXTRA_STREAM, videoUri)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            try {
+                startActivity(intent)
+            } catch (_: Exception) {
+                log("⚠️ Instagram app not installed.")
+                return@withContext
+            }
+        }
+
+        delay(4500L)
+        for (step in 1..4) {
+            if (!isAgentRunning) return
+            val els = scanScreenInteractiveElements(specs)
+            val reelOrNext = els.find {
+                it.label.equals("Reels", true) ||
+                    it.label.equals("Next", true) ||
+                    it.label.equals("आगे बढ़ें", true)
+            }
+            if (reelOrNext != null) {
+                tapElementSmartly(reelOrNext, forceAccessibilityClick = false)
+                delay(3200L)
+            }
+            val captionBox = els.find {
+                it.label.contains("Write a caption", true) ||
+                    it.label.contains("Add a caption", true) ||
+                    it.className.contains("EditText", true)
+            }
+            if (captionBox != null) {
+                tapElementSmartly(captionBox, forceAccessibilityClick = false)
+                delay(900L)
+                typeAndPasteTextReliably(caption, captionBox.node)
+                delay(1000L)
+                closeKeyboardCompletely()
+                break
+            }
+        }
+
+        val finalEls = scanScreenInteractiveElements(specs)
+        val shareBtn = finalEls.find {
+            it.label.equals("Share", true) || it.label.equals("शेयर करें", true)
+        }
+        if (shareBtn != null) {
+            tapElementSmartly(shareBtn, forceAccessibilityClick = false)
+        } else {
+            performPhysicalTap((specs.screenWidth * 0.72f).toInt(), (specs.screenHeight * 0.94f).toInt())
+        }
+        delay(3500L)
+        hud.updateStatus("🎉 Insta Reel Shared!", BotMood.HAPPY, taskRunning = false)
+        log("🎉 Multi-Platform: Instagram Reel Shared Successfully!")
     }
 
     private fun resolveSmartFolderPath(rawInput: String): File {
@@ -1209,6 +1426,47 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
+    /**
+     * Automatically closes the big Google Flow video player card (0:00 / 0:10) right after download
+     * and before starting a new Flow run so it never gets stuck on the open video card!
+     */
+    private suspend fun closeFlowVideoPlayerCardIfOpen(webView: WebView) {
+        val jsClose = """
+            (function() {
+                const bodyTxt = document.body ? (document.body.innerText || '') : '';
+                const hasVideoTag = document.querySelectorAll('video').length > 0;
+                if (bodyTxt.includes('0:00 /') || hasVideoTag) {
+                    const btns = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                    const backBtn = btns.find(b => {
+                        const r = b.getBoundingClientRect();
+                        const t = (b.innerText || b.getAttribute('aria-label') || '').toLowerCase();
+                        return r.top >= 0 && r.top < 95 && r.left >= 0 && r.left < 95 && r.width > 10 &&
+                            (t.includes('back') || t.includes('close') || b.querySelector('svg') || t.includes('arrow'));
+                    });
+                    if (backBtn) {
+                        backBtn.click();
+                        return 'CLICKED_BACK_BTN';
+                    }
+                    window.history.back();
+                    return 'HISTORY_BACK';
+                }
+                return 'NOT_IN_PLAYER';
+            })();
+        """.trimIndent()
+
+        var res = ""
+        suspendCancellableCoroutine<Unit> { cont ->
+            withContextOrMain(webView, jsClose) { r ->
+                res = r
+                cont.resume(Unit)
+            }
+        }
+        if (res == "CLICKED_BACK_BTN" || res == "HISTORY_BACK") {
+            log("🔙 Auto-closed big Flow Video Card ($res) to return to prompt composer!")
+            delay(1800L)
+        }
+    }
+
     fun startGoogleFlowToYouTubePipeline(topic: String, maxVideosToCreate: Int = 1) {
         currentTaskJob?.cancel()
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -1220,12 +1478,19 @@ class AutoTouchService : AccessibilityService() {
                 acquireWakeLock()
                 val targetUrl = prefs.getString("saved_flow_url", "https://flow.google.com")
                     ?: "https://flow.google.com"
+                val isStoryMode = prefs.getBoolean("flow_story_mode", false)
 
                 for (vidIndex in 1..maxVideosToCreate.coerceIn(1, 3)) {
                     if (!isAgentRunning) break
                     hud.updateStatus("Flow #$vidIndex: Creating Prompt...", BotMood.THINKING, taskRunning = true)
-                    val (safePrompt, viralTitle) = geminiBrain.generateFlowSafePromptAndTitle(topic)
-                    log("🎬 Flow Safe Prompt: $safePrompt")
+
+                    val effectiveTopic = if (isStoryMode && maxVideosToCreate > 1) {
+                        "$topic (Story Part $vidIndex of $maxVideosToCreate, continuous cinematic scene)"
+                    } else {
+                        topic
+                    }
+                    val (safePrompt, viralTitle) = geminiBrain.generateFlowSafePromptAndTitle(effectiveTopic)
+                    log("🎬 Flow Prompt: $safePrompt")
 
                     val webView = hud.getOrCreateBackgroundWebView()
                     if (webView == null) {
@@ -1233,6 +1498,8 @@ class AutoTouchService : AccessibilityService() {
                         break
                     }
 
+                    // Fix 1: If the big video card was left open from a previous run, close it immediately!
+                    closeFlowVideoPlayerCardIfOpen(webView)
                     val initialVideoUrl = extractExistingVideoUrlOnly(webView)
 
                     withContext(Dispatchers.Main) {
@@ -1241,7 +1508,7 @@ class AutoTouchService : AccessibilityService() {
                             webView.loadUrl(targetUrl)
                         }
                     }
-                    delay(4000L)
+                    delay(3800L)
 
                     for (prepTick in 1..18) {
                         if (!isAgentRunning) break
@@ -1249,6 +1516,10 @@ class AutoTouchService : AccessibilityService() {
                         log("🌐 Flow Background Step #$prepTick -> $stepResult")
 
                         when {
+                            stepResult == "BACK_FROM_PLAYER" -> {
+                                dispatchInternalWebViewTouch(webView, 32f, 42f)
+                                delay(2200L)
+                            }
                             stepResult.startsWith("CLICKED_NEW_PROJECT:") -> {
                                 hud.updateStatus("Flow: Opening + New Project...", BotMood.WORKING, taskRunning = true)
                                 val coords = stepResult.substringAfter(":").split(",")
@@ -1315,7 +1586,11 @@ class AutoTouchService : AccessibilityService() {
                                 hud.updateStatus("📥 Downloading 8s MP4...", BotMood.WORKING, taskRunning = true)
                                 log("📥 Found Generated MP4 Stream: ${videoUrl.take(70)}...")
                                 downloadedVideoFile = downloadVideoFromUrlToStorage(videoUrl, "flow_${System.currentTimeMillis()}.mp4")
-                                if (downloadedVideoFile != null) break
+                                if (downloadedVideoFile != null) {
+                                    // Immediately close the open big video card so the next run never gets stuck!
+                                    closeFlowVideoPlayerCardIfOpen(webView)
+                                    break
+                                }
                             }
                             pollRes.startsWith("PROGRESS:") -> {
                                 val pct = pollRes.removePrefix("PROGRESS:")
@@ -1347,7 +1622,7 @@ class AutoTouchService : AccessibilityService() {
                     if (downloadedVideoFile != null && downloadedVideoFile.exists()) {
                         log("✅ Downloaded 8s Video: ${downloadedVideoFile.absolutePath}")
                         hideWebPreviewCardIfOpen()
-                        uploadVideoUriToYouTubeShorts(Uri.fromFile(downloadedVideoFile), viralTitle)
+                        dispatchVideoToLinkedPlatforms(Uri.fromFile(downloadedVideoFile), viralTitle)
                     } else {
                         log("⚠️ Could not auto-catch MP4 stream; check Google Flow login or Video mode.")
                         hud.updateStatus("Check Flow Login/Video Mode", BotMood.ERROR, taskRunning = false)
@@ -1372,17 +1647,23 @@ class AutoTouchService : AccessibilityService() {
                         return r.width > 10 && r.height > 10 && r.top >= 0;
                     }
 
-                    if (document.body.innerText.includes('0:00 /')) {
-                        const backBtns = Array.from(document.querySelectorAll('button, [role="button"]')).filter(isVisible);
+                    // If big video player card ('0:00 /' or video player view without prompt box) is open, click Back!
+                    const allInputs = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"]')).filter(isVisible);
+                    const promptBox = allInputs.find(el => {
+                        const ph = (el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.innerText || '').toLowerCase();
+                        const r = el.getBoundingClientRect();
+                        return ph.includes('create') || ph.includes('prompt') || ph.includes('describe') || (r.top > window.innerHeight * 0.45 && !ph.includes('search'));
+                    });
+
+                    if (!promptBox && (document.body.innerText.includes('0:00 /') || document.querySelectorAll('video').length > 0)) {
+                        const backBtns = Array.from(document.querySelectorAll('button, [role="button"], a')).filter(isVisible);
                         const backBtn = backBtns.find(b => {
                             const r = b.getBoundingClientRect();
-                            const t = (b.innerText || b.getAttribute('aria-label') || '').toLowerCase();
-                            return r.top < 90 && r.left < 90 && (t.includes('back') || t.includes('arrow_back') || b.querySelector('svg'));
+                            return r.top < 95 && r.left < 95;
                         });
-                        if (backBtn) {
-                            backBtn.click();
-                            return 'BACK_FROM_PLAYER';
-                        }
+                        if (backBtn) backBtn.click();
+                        window.history.back();
+                        return 'BACK_FROM_PLAYER';
                     }
 
                     const allBtns = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], div, span')).filter(isVisible);
@@ -1400,13 +1681,6 @@ class AutoTouchService : AccessibilityService() {
                         const btnX1 = allBtns.find(el => (el.innerText || '').trim() === 'x1');
                         if (btnX1) btnX1.click();
                     }
-
-                    const allInputs = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"]')).filter(isVisible);
-                    const promptBox = allInputs.find(el => {
-                        const ph = (el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.innerText || '').toLowerCase();
-                        const r = el.getBoundingClientRect();
-                        return ph.includes('create') || ph.includes('prompt') || ph.includes('describe') || (r.top > window.innerHeight * 0.45 && !ph.includes('search'));
-                    });
 
                     if (promptBox) {
                         const nanoPill = allBtns.find(el => {
@@ -1710,13 +1984,22 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
+    /**
+     * Downloads video to user's custom chosen folder path (or /Download/AutoVideos by default)
+     */
     private suspend fun downloadVideoFromUrlToStorage(videoUrl: String, fileName: String): File? =
         withContext(Dispatchers.IO) {
             try {
-                val outDir = File(
-                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                    "AutoVideos"
-                ).apply { if (!exists()) mkdirs() }
+                val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+                val customPath = prefs.getString("custom_download_folder", "")?.trim() ?: ""
+                val outDir = if (customPath.isNotEmpty()) {
+                    resolveSmartFolderPath(customPath).apply { if (!exists()) mkdirs() }
+                } else {
+                    File(
+                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                        "AutoVideos"
+                    ).apply { if (!exists()) mkdirs() }
+                }
                 val outFile = File(outDir, fileName)
                 URL(videoUrl).openStream().use { input ->
                     FileOutputStream(outFile).use { output ->
@@ -1729,33 +2012,95 @@ class AutoTouchService : AccessibilityService() {
             }
         }
 
+    /**
+     * 24/7 Scheduler Loop with:
+     * - 10-minute Snooze check ('snooze_until_ms')
+     * - Idle Phone Mode check ('run_only_when_idle')
+     * - Smart Pre-Run Confirmation Banner when user is actively using phone
+     * - 10:00 PM Nightly Daily Summary Report!
+     */
     private fun startDailySchedulerLoop() {
         schedulerJob?.cancel()
         schedulerJob = serviceScope.launch {
             var lastTriggeredMinute = ""
+            var lastNightReportDay = ""
             while (isActive) {
                 delay(20000L)
                 val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
-                if (!prefs.getBoolean("scheduler_enabled", false) || isAgentRunning) continue
+                if (isAgentRunning) continue
+
+                val nowMs = System.currentTimeMillis()
+                val snoozeUntil = prefs.getLong("snooze_until_ms", 0L)
+                if (nowMs < snoozeUntil) continue
+
+                // 1. Check if there is a Pending Idle-Phone Task waiting for the user to put down the phone!
+                val pendingIdleGoal = prefs.getString("pending_idle_goal", "") ?: ""
+                if (pendingIdleGoal.isNotBlank() && isPhoneCurrentlyIdleOrFree()) {
+                    prefs.edit().remove("pending_idle_goal").apply()
+                    log("🌙 Phone is now Free/Idle -> Auto-starting queued task: $pendingIdleGoal")
+                    startUniversalTask(pendingIdleGoal, emptyList(), "LIVE_PHONE")
+                    continue
+                }
 
                 val nowHm = java.text.SimpleDateFormat("HH:mm", Locale.getDefault()).format(java.util.Date())
+                val todayStr = java.text.SimpleDateFormat("dd MMM", Locale.getDefault()).format(java.util.Date())
+
+                // 2. 10:00 PM (22:00) Nightly Friendly Summary Report
+                if (nowHm == "22:00" && lastNightReportDay != todayStr) {
+                    lastNightReportDay = todayStr
+                    val dailyStatus = prefs.getString("last_daily_action_log", "आज के सभी सिस्टम रेडी हैं!")
+                    hud.triggerGreetingPeekIfAllowed("🌙 सर, 10 बज गए! आज की रिपोर्ट: $dailyStatus")
+                }
+
+                if (!prefs.getBoolean("scheduler_enabled", false)) continue
                 val targetHm = prefs.getString("schedule_time_hm", "19:00") ?: "19:00"
 
                 if (nowHm == targetHm && lastTriggeredMinute != nowHm) {
                     lastTriggeredMinute = nowHm
                     val mode = prefs.getString("scheduled_pipeline_type", "FLOW_YT") ?: "FLOW_YT"
-                    log("⏰ 24/7 Scheduler Triggered at $nowHm -> $mode")
-                    if (mode == "FLOW_YT") {
-                        val topic = prefs.getString("flow_topic", "Futuristic Sci-Fi World") ?: "Futuristic Sci-Fi World"
-                        val credits = prefs.getInt("flow_daily_videos", 1)
-                        startGoogleFlowToYouTubePipeline(topic, credits)
+                    val topic = prefs.getString("flow_topic", "Futuristic Sci-Fi World") ?: "Futuristic Sci-Fi World"
+                    val credits = prefs.getInt("flow_daily_videos", 1)
+                    val folder = prefs.getString(
+                        "yt_folder_path",
+                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
+                    ) ?: ""
+                    val oldest = prefs.getBoolean("yt_pick_oldest", true)
+
+                    val runWhenIdleOnly = prefs.getBoolean("run_only_when_idle", false)
+                    if (runWhenIdleOnly && !isPhoneCurrentlyIdleOrFree()) {
+                        // User is actively using the phone right now -> Show non-intrusive Skip 10m / When Free / Background banner!
+                        log("⏰ Scheduled time $nowHm reached while phone is in use -> Showing Smart Skip/Idle banner!")
+                        hud.showScheduledTaskConfirmBanner(
+                            taskTitle = if (mode == "FLOW_YT") "Flow AI Video" else "YouTube Upload",
+                            onRunNow = {
+                                if (mode == "FLOW_YT") startGoogleFlowToYouTubePipeline(topic, credits)
+                                else startYouTubeFolderAutoUpload(folder, oldest)
+                            },
+                            onSkip10Min = {
+                                prefs.edit().putLong("snooze_until_ms", System.currentTimeMillis() + 600_000L).apply()
+                                lastTriggeredMinute = ""
+                                log("⏳ User snoozed scheduled task for 10 minutes.")
+                            },
+                            onRunWhenIdle = {
+                                prefs.edit().putString(
+                                    "pending_idle_goal",
+                                    if (mode == "FLOW_YT") "Google Flow video upload" else "YouTube folder upload"
+                                ).apply()
+                                log("🌙 Queued scheduled task to run when phone becomes idle.")
+                            },
+                            onRunBackground = {
+                                prefs.edit().putBoolean("yt_upload_in_background", true).apply()
+                                if (mode == "FLOW_YT") startGoogleFlowToYouTubePipeline(topic, credits)
+                                else startYouTubeFolderAutoUpload(folder, oldest)
+                            }
+                        )
                     } else {
-                        val folder = prefs.getString(
-                            "yt_folder_path",
-                            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
-                        ) ?: ""
-                        val oldest = prefs.getBoolean("yt_pick_oldest", true)
-                        startYouTubeFolderAutoUpload(folder, oldest)
+                        log("⏰ 24/7 Scheduler Triggered at $nowHm -> $mode")
+                        if (mode == "FLOW_YT") {
+                            startGoogleFlowToYouTubePipeline(topic, credits)
+                        } else {
+                            startYouTubeFolderAutoUpload(folder, oldest)
+                        }
                     }
                 }
             }
@@ -2127,6 +2472,7 @@ class AutoTouchService : AccessibilityService() {
             "insta" to "com.instagram.android",
             "youtube" to "com.google.android.youtube",
             "whatsapp" to "com.whatsapp",
+            "gemini" to "com.google.android.apps.bard",
             "chrome" to "com.android.chrome",
             "yt studio" to "com.google.android.apps.youtube.creator",
             "settings" to "com.android.settings"
@@ -2172,3 +2518,4 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 }
+```
