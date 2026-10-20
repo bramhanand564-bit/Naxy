@@ -1,4 +1,3 @@
-```kotlin
 package com.auradroid.os
 
 import android.accessibilityservice.AccessibilityService
@@ -2518,4 +2517,3 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 }
-```
