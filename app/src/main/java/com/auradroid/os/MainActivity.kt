@@ -8,8 +8,11 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
@@ -26,6 +29,7 @@ import android.provider.Settings
 import android.speech.RecognizerIntent
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.LinearInterpolator
@@ -38,6 +42,7 @@ import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -58,6 +63,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.io.File
 import java.util.Calendar
+import java.util.Locale
 import kotlin.math.sin
 
 @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
@@ -85,6 +91,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var homeBotStatusTitle: TextView
     private lateinit var homeBotReportSubtitle: TextView
     private lateinit var chatMessagesLayout: LinearLayout
+    private lateinit var chatScrollView: ScrollView
     private lateinit var chatInputBox: EditText
     private lateinit var planSendBtn: TextView
     private val chatHistoryBuilder = StringBuilder()
@@ -119,6 +126,8 @@ class MainActivity : AppCompatActivity() {
         private const val REQ_PICK_SINGLE_VIDEO_FOR_YT = 204
         private const val REQ_PICK_FLOW_SAVE_FOLDER = 205
         private const val REQ_PICK_FREEWEB_SAVE_FOLDER = 206
+        private const val REQ_CHAT_PICK_IMAGE = 207
+        private const val REQ_CHAT_PICK_VIDEO = 208
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -319,7 +328,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         homeBotView = FullBodyChanchalBotView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(92), dp(112)).apply { marginEnd = dp(12) }
+            layoutParams = LinearLayout.LayoutParams(dp(86), dp(106)).apply { marginEnd = dp(10) }
             setOnClickListener {
                 triggerPlayfulJumpAndWave()
                 val hr = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
@@ -341,38 +350,38 @@ class MainActivity : AppCompatActivity() {
         homeBotStatusTitle = TextView(this).apply {
             text = "🤖 Chanchal AI Buddy (Active)"
             setTextColor(textPureWhite)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
             typeface = Typeface.DEFAULT_BOLD
         }
 
         homeBotReportSubtitle = TextView(this).apply {
-            text = "सर, आपके आज के सारे ऑटोमेशन ट्रैक हो रहे हैं। रात 10:00 बजे मैं आपको पूरी डेली रिपोर्ट दूँगा!"
+            text = "सर, नीचे चैट में '📎' दबाकर स्क्रीनशॉट (1-2-3 पॉइंट लगाकर) या वीडियो सीधे यहीं भेजें!"
             setTextColor(Color.parseColor("#CBD5E1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setPadding(0, dp(4), 0, dp(8))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, dp(3), 0, dp(6))
         }
 
         val actionPillsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
 
         val dailyReportBtn = TextView(this).apply {
-            text = "📊 Daily Report"
+            text = "📊 Report"
             setTextColor(textPureWhite)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setPadding(dp(9), dp(6), dp(9), dp(6))
             background = roundedBox(accentEmerald, dp(8))
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) }
             setOnClickListener { showFriendlyDailyReportDialog() }
         }
 
         val diagnoseBtn = TextView(this).apply {
-            text = "🛠️ गलती सुधारें (AI Fix)"
+            text = "🛠️ 1-2-3 स्क्रीनशॉट Fix"
             setTextColor(textPureWhite)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setPadding(dp(9), dp(6), dp(9), dp(6))
             background = roundedBox(accentPurple, dp(8))
-            setOnClickListener { diagnoseLastFailedTaskWithAi() }
+            setOnClickListener { openLastRunScreenshotsPickerForChat() }
         }
 
         actionPillsRow.addView(dailyReportBtn)
@@ -383,37 +392,46 @@ class MainActivity : AppCompatActivity() {
         companionCard.addView(homeBotView)
         companionCard.addView(rightStatusCol)
 
-        val scroll = ScrollView(this).apply {
+        chatScrollView = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
         chatMessagesLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        scroll.addView(chatMessagesLayout)
+        chatScrollView.addView(chatMessagesLayout)
 
         addChatBubble(
             "AuraDroid Chanchal Bot",
-            "नमस्ते भाई! मैं आपका फुल-बॉडी चंचल AI दोस्त हूँ!\n• ऊपर मुझ पर टैप करेंगे तो मैं हाथ हिलाकर विश करूँगा!\n• रोज़ रात 10 बजे मैं खुद बताऊँगा कि आपके सारे टास्क पूरे हो गए हैं और किसी काम में रुकावट आई तो उसे ठीक करने में मदद करूँगा।",
+            "नमस्ते भाई! अब आप सीधे इसी चैट में सब कुछ कर सकते हैं:\n" +
+                "• नीचे **`📎` बटन** दबाकर स्क्रीनशॉट चुनें ➔ उस पर उंगली से **`1`**, **`2`**, **`3`** पॉइंट लगाएं और लिख दें कि कहाँ टाइप/टैप करना है!\n" +
+                "• या **`📎` बटन** से सीधे यहीं **वीडियो (Screen Recording)** भेजें — मैं पुराना नियम बदलकर पक्का कोडेड कानून (`LIVE_CODE_RULE`) बना दूँगा!",
             isUser = false
         )
 
         val inputBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setPadding(dp(6), dp(6), dp(6), dp(6))
             background = roundedBox(cardSlate, dp(16), borderSubtle)
+        }
+
+        val attachMediaBtn = TextView(this).apply {
+            text = "📎"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            setPadding(dp(8), dp(6), dp(6), dp(6))
+            setOnClickListener { showChatMediaAttachMenu() }
         }
 
         val micBtn = TextView(this).apply {
             text = "🎙️"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
-            setPadding(dp(8), dp(6), dp(8), dp(6))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 19f)
+            setPadding(dp(6), dp(6), dp(8), dp(6))
             setOnClickListener { startVoiceInput() }
         }
 
         chatInputBox = EditText(this).apply {
-            hint = "यहाँ काम समझाएं या बॉट से बात करें..."
+            hint = "काम बोलें या 📎 से फोटो/वीडियो भेजें..."
             setHintTextColor(textMuted)
             setTextColor(textPureWhite)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
             background = null
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
@@ -423,9 +441,9 @@ class MainActivity : AppCompatActivity() {
             setTextColor(textPureWhite)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setPadding(dp(11), dp(10), dp(11), dp(10))
             background = roundedBox(accentEmerald, dp(12))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(5) }
             setOnClickListener {
                 val msg = chatInputBox.text.toString().trim()
                 if (msg.isNotEmpty()) {
@@ -445,29 +463,421 @@ class MainActivity : AppCompatActivity() {
         planSendBtn = TextView(this).apply {
             text = "Plan ➔"
             setTextColor(textPureWhite)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(14), dp(10), dp(14), dp(10))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             background = roundedBox(accentRoyalBlue, dp(12))
             setOnClickListener {
                 val msg = chatInputBox.text.toString().trim()
                 if (msg.isNotEmpty()) {
                     chatInputBox.setText("")
-                    handleUserChatMessage(msg, scroll)
+                    handleUserChatMessage(msg, chatScrollView)
                 }
             }
         }
 
+        inputBar.addView(attachMediaBtn)
         inputBar.addView(micBtn)
         inputBar.addView(chatInputBox)
         inputBar.addView(directRunBtn)
         inputBar.addView(planSendBtn)
 
         container.addView(companionCard)
-        container.addView(scroll)
+        container.addView(chatScrollView)
         container.addView(inputBar)
         refreshHomeDailyReportBanner()
         return container
+    }
+
+    private fun showChatMediaAttachMenu() {
+        val options = arrayOf(
+            "🖼️ गैलरी से स्क्रीनशॉट/फोटो भेजें (1-2-3 पॉइंट लगाएं)",
+            "📸 पिछले टास्क के स्क्रीनशॉट पर 1-2-3 पॉइंट लगाएं",
+            "🎥 चैट में वीडियो (Screen Recording) भेजें & सुधारें",
+            "🗑️ किसी ऐप का पुराना लाइव कोड रूल बदलें / साफ करें"
+        )
+        AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+            .setTitle("📎 चैट में स्क्रीनशॉट या वीडियो भेजें")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply { type = "image/*" }, REQ_CHAT_PICK_IMAGE)
+                    1 -> openLastRunScreenshotsPickerForChat()
+                    2 -> startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply { type = "video/*" }, REQ_CHAT_PICK_VIDEO)
+                    3 -> {
+                        val vault = getActiveVault()
+                        val cats = vault.getAllCategoriesSummary().keys.toTypedArray()
+                        if (cats.isEmpty()) {
+                            Toast.makeText(this, "अभी कोई पुराना नियम नहीं है!", Toast.LENGTH_SHORT).show()
+                        } else {
+                            AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+                                .setTitle("किस ऐप के पुराने नियम हटाकर नए बनाने हैं?")
+                                .setItems(cats) { _, idx ->
+                                    vault.clearCategoryMemory(cats[idx])
+                                    addChatBubble("⚙️ Live Rule Engine", "✅ `${cats[idx]}` के पुराने नियम हटा दिए गए हैं! अब नए 1-2-3 पॉइंट दें।", false)
+                                }
+                                .show()
+                        }
+                    }
+                }
+            }
+            .show()
+    }
+
+    private fun openLastRunScreenshotsPickerForChat() {
+        val vault = getActiveVault()
+        val runs = vault.getAllAutomationRuns().filter { it.screenshotPaths.isNotEmpty() }
+        if (runs.isEmpty()) {
+            Toast.makeText(this, "अभी पिछले रन का कोई स्क्रीनशॉट नहीं है! गैलरी से फोटो चुनें।", Toast.LENGTH_LONG).show()
+            startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply { type = "image/*" }, REQ_CHAT_PICK_IMAGE)
+            return
+        }
+
+        val run = runs.first()
+        val dialogLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            setBackgroundColor(bgMatteDark)
+        }
+        dialogLayout.addView(TextView(this).apply {
+            text = "📌 टास्क: ${run.title}\n👆 जिस स्क्रीनशॉट में समस्या थी उस पर टैप करें और **1, 2, 3 पॉइंट** लगाएं:"
+            setTextColor(textPureWhite)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            setPadding(0, 0, 0, dp(10))
+        })
+
+        val hScroll = HorizontalScrollView(this)
+        val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+
+        val pickerDialog = AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+            .setTitle("📸 स्क्रीनशॉट चुनें (${run.screenshotPaths.size})")
+            .setView(dialogLayout as View)
+            .setNegativeButton("बंद करें", null)
+            .create()
+
+        run.screenshotPaths.forEachIndexed { idx, path ->
+            val bmp = vault.loadBitmapFromPath(path) ?: return@forEachIndexed
+            val stepLabel = run.stepsSummary.getOrNull(idx) ?: "Step #${idx + 1}"
+            val img = ImageView(this).apply {
+                setImageBitmap(bmp)
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                background = roundedBox(cardSlate, dp(8), accentRoyalBlue)
+                setPadding(dp(3), dp(3), dp(3), dp(3))
+                layoutParams = LinearLayout.LayoutParams(dp(95), dp(165)).apply { marginEnd = dp(10) }
+                setOnClickListener {
+                    pickerDialog.dismiss()
+                    openMultiPointEditableScreenshotDialog(bmp, run.appCategory, "Step #${idx + 1}: $stepLabel")
+                }
+            }
+            strip.addView(img)
+        }
+        hScroll.addView(strip)
+        dialogLayout.addView(hScroll)
+        pickerDialog.show()
+    }
+
+    private fun openMultiPointEditableScreenshotDialog(
+        bmp: Bitmap,
+        defaultAppCategory: String = "Instagram",
+        initialTitle: String = "1-2-3 Multi-Point Rule Editor"
+    ) {
+        val pointsNormList = mutableListOf<Pair<Int, Int>>()
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bgMatteDark)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+
+        val pointsStatusTv = TextView(this).apply {
+            text = "👆 फोटो पर उंगली से टैप करके **1, 2, 3... पॉइंट्स** बनाएं:"
+            setTextColor(accentAmber)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, dp(6))
+        }
+
+        val multiPointCanvasView = object : View(this) {
+            private val bmpPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+            private val dstRect = RectF()
+            private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#38BDF8")
+                style = Paint.Style.STROKE
+                strokeWidth = dp(2).toFloat()
+                pathEffect = DashPathEffect(floatArrayOf(12f, 8f), 0f)
+            }
+            private val circleFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+            private val circleStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.STROKE
+                strokeWidth = dp(2).toFloat()
+            }
+            private val numTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                textSize = dp(13).toFloat()
+                typeface = Typeface.DEFAULT_BOLD
+                textAlign = Paint.Align.CENTER
+            }
+
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                dstRect.set(0f, 0f, width.toFloat(), height.toFloat())
+                canvas.drawBitmap(bmp, null, dstRect, bmpPaint)
+
+                for (i in 0 until pointsNormList.size - 1) {
+                    val p1 = pointsNormList[i]
+                    val p2 = pointsNormList[i + 1]
+                    canvas.drawLine(
+                        (p1.first / 1000f) * width,
+                        (p1.second / 1000f) * height,
+                        (p2.first / 1000f) * width,
+                        (p2.second / 1000f) * height,
+                        linePaint
+                    )
+                }
+
+                pointsNormList.forEachIndexed { idx, pt ->
+                    val px = (pt.first / 1000f) * width
+                    val py = (pt.second / 1000f) * height
+                    circleFillPaint.color = when (idx % 3) {
+                        0 -> Color.parseColor("#EF4444")
+                        1 -> Color.parseColor("#10B981")
+                        else -> Color.parseColor("#3B82F6")
+                    }
+                    canvas.drawCircle(px, py, dp(14).toFloat(), circleFillPaint)
+                    canvas.drawCircle(px, py, dp(14).toFloat(), circleStrokePaint)
+                    val textY = py - ((numTextPaint.descent() + numTextPaint.ascent()) / 2f)
+                    canvas.drawText("${idx + 1}", px, textY, numTextPaint)
+                }
+            }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(330))
+            setOnTouchListener { v, ev ->
+                if (ev.action == MotionEvent.ACTION_UP) {
+                    val nx = ((ev.x / v.width.coerceAtLeast(1)) * 1000).toInt().coerceIn(0, 1000)
+                    val ny = ((ev.y / v.height.coerceAtLeast(1)) * 1000).toInt().coerceIn(0, 1000)
+                    pointsNormList.add(Pair(nx, ny))
+                    val summary = pointsNormList.mapIndexed { i, p -> "[${i + 1}: (${p.first},${p.second})]" }.joinToString(" ➔ ")
+                    pointsStatusTv.text = "🎯 पॉइंट्स: $summary"
+                    v.invalidate()
+                }
+                true
+            }
+        }
+
+        val controlsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(6), 0, dp(6))
+        }
+
+        val appNameInput = createCleanInput(defaultAppCategory, "App (जैसे Instagram)").apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+        }
+
+        val undoBtn = createPrimaryButton("↩️ Undo", Color.parseColor("#475569")) {
+            if (pointsNormList.isNotEmpty()) {
+                pointsNormList.removeAt(pointsNormList.lastIndex)
+                val summary = pointsNormList.mapIndexed { i, p -> "[${i + 1}: (${p.first},${p.second})]" }.joinToString(" ➔ ")
+                pointsStatusTv.text = if (summary.isEmpty()) "👆 फोटो पर टैप करके 1, 2, 3 पॉइंट बनाएं:" else "🎯 पॉइंट्स: $summary"
+                multiPointCanvasView.invalidate()
+            }
+        }.apply { layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) } }
+
+        val clearPtsBtn = createPrimaryButton("🗑️ Clear", Color.parseColor("#7F1D1D")) {
+            pointsNormList.clear()
+            pointsStatusTv.text = "👆 फोटो पर टैप करके 1, 2, 3 पॉइंट बनाएं:"
+            multiPointCanvasView.invalidate()
+        }
+
+        controlsRow.addView(appNameInput)
+        controlsRow.addView(undoBtn)
+        controlsRow.addView(clearPtsBtn)
+
+        val instructionInput = createCleanInput(
+            chatInputBox.text.toString(),
+            "यहाँ लिखें: जैसे '1 पर टाइप करना है और 2 पर टैप करके सेंड करना है'..."
+        ).apply { minLines = 2 }
+
+        var replaceOldRules = false
+        val replaceToggleBtn = createPrimaryButton("🔄 मोड: पुराने नियमों के साथ जोड़ें (Add to Rules)", Color.parseColor("#262B36")) { btn ->
+            replaceOldRules = !replaceOldRules
+            btn.text = if (replaceOldRules) "⚡ मोड: पुराना गलत नियम बदलें/हटाएं (Replace Old Rules)"
+            else "🔄 मोड: पुराने नियमों के साथ जोड़ें (Add to Rules)"
+            btn.background = roundedBox(if (replaceOldRules) accentPurple else Color.parseColor("#262B36"), dp(10))
+        }
+
+        root.addView(pointsStatusTv)
+        root.addView(multiPointCanvasView)
+        root.addView(controlsRow)
+        root.addView(replaceToggleBtn)
+        root.addView(spacer(dp(6)))
+        root.addView(instructionInput)
+
+        AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+            .setTitle("🖼️ $initialTitle")
+            .setView(root as View)
+            .setPositiveButton("⚡ पक्का कानून (Live Rule) बनाएं") { d, _ ->
+                val appCat = appNameInput.text.toString().trim().ifEmpty { "Instagram" }
+                val userInstruction = instructionInput.text.toString().trim().ifEmpty { "Follow numbered points in order" }
+                chatInputBox.setText("")
+                d.dismiss()
+                compileMultiPointScreenshotIntoLiveRules(bmp, appCat, pointsNormList.toList(), userInstruction, replaceOldRules)
+            }
+            .setNegativeButton("रद्द करें", null)
+            .show()
+    }
+
+    private fun compileMultiPointScreenshotIntoLiveRules(
+        bmp: Bitmap,
+        appCategory: String,
+        points: List<Pair<Int, Int>>,
+        userInstruction: String,
+        replaceOld: Boolean
+    ) {
+        val vault = getActiveVault()
+        val brain = getActiveBrain()
+
+        val ptsText = if (points.isEmpty()) "Auto-detect from screenshot"
+        else points.mapIndexed { idx, p -> "Point ${idx + 1} Pin XY: (${p.first}, ${p.second})" }.joinToString(", ")
+
+        addChatBubble(
+            "You (📸 Screenshot + ${points.size} Points)",
+            "App: $appCategory\n🎯 Points: $ptsText\n💬 निर्देश: $userInstruction",
+            isUser = true
+        )
+
+        uiScope.launch(Dispatchers.IO) {
+            if (replaceOld) vault.clearCategoryMemory(appCategory)
+
+            val b64 = brain.bitmapToHdWebpBase64(bmp, maxHeight = 1024)
+            val syntheticRun = AutomationRunRecord(
+                runId = "chat_img_${System.currentTimeMillis()}",
+                title = "Chat Screenshot Rule ($appCategory)",
+                appCategory = appCategory,
+                status = "USER_EDITED",
+                timestamp = "Just Now",
+                stepsSummary = points.mapIndexed { i, p -> "Point ${i + 1} at XY(${p.first}, ${p.second})" },
+                screenshotPaths = emptyList(),
+                chatHistory = emptyList()
+            )
+
+            val combinedPrompt = "User marked ${points.size} numbered points on this screenshot: [$ptsText]. User instruction: '$userInstruction'. Create a mandatory reusable skill rule following these exact numbered points!"
+            val replyObj = brain.chatAboutAutomationRunWith38Flash(syntheticRun, combinedPrompt, listOf(b64))
+
+            if (points.isEmpty()) {
+                vault.saveStuckOrHumanFix(
+                    category = appCategory,
+                    screenSignature = "live_rule_${System.currentTimeMillis()}",
+                    problemDescription = replyObj.extractedProblem,
+                    solutionRule = "MANDATORY LIVE RULE: ${replyObj.extractedSolutionRule}",
+                    tapXRatio = replyObj.tapXRatio,
+                    tapYRatio = replyObj.tapYRatio,
+                    sourceType = "LIVE_CODE_RULE (${replyObj.modelUsed})"
+                )
+            } else {
+                points.forEachIndexed { idx, pt ->
+                    val ptNum = idx + 1
+                    vault.saveStuckOrHumanFix(
+                        category = appCategory,
+                        screenSignature = "live_pt_${System.currentTimeMillis()}_$ptNum",
+                        problemDescription = "[UNIVERSAL_SKILL] Point #$ptNum on ${replyObj.extractedProblem}",
+                        solutionRule = "MANDATORY LIVE RULE (Step Point #$ptNum): $userInstruction -> Execute at Point #$ptNum CLICK_XY(${pt.first}, ${pt.second}) [All Points: $ptsText]",
+                        tapXRatio = (pt.first / 1000f).coerceIn(0.01f, 0.99f),
+                        tapYRatio = (pt.second / 1000f).coerceIn(0.01f, 0.99f),
+                        sourceType = "LIVE_CODE_RULE_PT#$ptNum"
+                    )
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                addChatBubble(
+                    "⚖️ Live Code Rule Compiler (${replyObj.modelUsed})",
+                    "${replyObj.replyText}\n\n✅ **${points.size.coerceAtLeast(1)} पक्के कोडेड कानून (`LIVE_CODE_RULE`) `$appCategory` में लागू हो गए हैं!**\n• Points: `$ptsText`",
+                    isUser = false
+                )
+                chatScrollView.post { chatScrollView.fullScroll(View.FOCUS_DOWN) }
+            }
+        }
+    }
+
+    private fun handleChatDirectVideoUpload(videoUri: Uri) {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            setBackgroundColor(bgMatteDark)
+        }
+        val appInput = createCleanInput("Instagram", "किस ऐप का वीडियो है? (जैसे Instagram, YouTube)")
+        val noteInput = createCleanInput(
+            chatInputBox.text.toString().ifEmpty { "भाई इस वीडियो में देखो कहाँ समस्या थी और इसे सुधार कर नया पक्का रूल बना दो" },
+            "वीडियो में कहाँ समस्या थी या क्या सिखाना है?"
+        ).apply { minLines = 3 }
+
+        var replaceOld = false
+        val replaceBtn = createPrimaryButton("🔄 मोड: पुराने नियमों के साथ जोड़ें", Color.parseColor("#262B36")) { btn ->
+            replaceOld = !replaceOld
+            btn.text = if (replaceOld) "⚡ मोड: पुराना नियम हटाकर इस वीडियो का नया नियम लगाएं"
+            else "🔄 मोड: पुराने नियमों के साथ जोड़ें"
+            btn.background = roundedBox(if (replaceOld) accentPurple else Color.parseColor("#262B36"), dp(10))
+        }
+
+        root.addView(appInput)
+        root.addView(spacer(dp(8)))
+        root.addView(replaceBtn)
+        root.addView(spacer(dp(8)))
+        root.addView(noteInput)
+
+        AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+            .setTitle("🎥 चैट में वीडियो भेजकर नियम बनाएं")
+            .setView(root as View)
+            .setPositiveButton("🚀 वीडियो एनालाइज करें & रूल बनाएं") { _, _ ->
+                val appCat = appInput.text.toString().trim().ifEmpty { "Instagram" }
+                val note = noteInput.text.toString().trim()
+                chatInputBox.setText("")
+                addChatBubble("You (🎥 Video Uploaded in Chat)", "App: $appCat\n💬 निर्देश: $note", isUser = true)
+                addChatBubble("AuraDroid Video Coach", "⏳ भाई, वीडियो के फ्रेम्स निकालकर `3.1 Pro + Robotics` से सटीक नियम बनाए जा रहे हैं...", isUser = false)
+
+                val vault = getActiveVault()
+                val brain = getActiveBrain()
+                uiScope.launch(Dispatchers.IO) {
+                    if (replaceOld) vault.clearCategoryMemory(appCat)
+                    val (session, framesB64) = vault.createVideoTrainingSession(appCat, note, videoUri, 12)
+                    val rules = brain.analyzeTrainingVideoFrames(appCat, note, framesB64)
+                    for (r in rules) {
+                        vault.saveStuckOrHumanFix(
+                            category = appCat,
+                            screenSignature = r.screenSignature,
+                            problemDescription = r.problemDescription,
+                            solutionRule = "MANDATORY LIVE RULE: ${r.solutionRule}",
+                            tapXRatio = r.tapXRatio,
+                            tapYRatio = r.tapYRatio,
+                            sourceType = "CHAT_VIDEO_LAW"
+                        )
+                        vault.appendChatToVideoSession(session.sessionId, "AI", "Learned: ${r.solutionRule}", r.solutionRule)
+                    }
+                    withContext(Dispatchers.Main) {
+                        val rulesText = rules.take(5).mapIndexed { i, r ->
+                            "${i + 1}. ${r.problemDescription} ➔ ${r.solutionRule} (XY: ${(r.tapXRatio * 1000).toInt()}, ${(r.tapYRatio * 1000).toInt()})"
+                        }.joinToString("\n")
+                        addChatBubble(
+                            "✅ Video Live Rules Compiled ($appCat)",
+                            "भाई, आपके वीडियो से **${rules.size} पक्के कोडेड कानून (`CHAT_VIDEO_LAW`)** बनाकर `$appCat` में लागू कर दिए गए हैं:\n\n$rulesText",
+                            isUser = false
+                        )
+                        chatScrollView.post { chatScrollView.fullScroll(View.FOCUS_DOWN) }
+                    }
+                }
+            }
+            .setNegativeButton("रद्द करें", null)
+            .show()
+    }
+
+    private fun isDirectRuleOrCorrectionMessage(msg: String): Boolean {
+        val lower = msg.lowercase(Locale.ROOT)
+        val ruleTriggers = listOf(
+            "नियम", "niyam", "rule", "गलती", "galti", "सुधार", "sudhar", "याद रख", "yaad rakh",
+            "मत दबा", "mat daba", "मत टैप", "mat tap", "दोबारा मत", "dobara mat", "कन्फर्म", "confirm",
+            "नीला बटन", "neela button", "जब भी", "jab bhi", "ऐसा मत", "aisa mat", "fix karo", "ठीक करो", "बदल दो"
+        )
+        return ruleTriggers.any { lower.contains(it) }
     }
 
     private fun refreshHomeDailyReportBanner() {
@@ -484,7 +894,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (failedRun != null) {
             homeBotStatusTitle.text = "$greetingPrefix (1 टास्क में ध्यान दें)"
-            homeBotReportSubtitle.text = "आज $successCount टास्क पूरे हुए, लेकिन '${failedRun.title.take(22)}' में रुकावट आई। नीचे '🛠️ गलती सुधारें' दबाएं!"
+            homeBotReportSubtitle.text = "आज $successCount टास्क पूरे हुए, लेकिन '${failedRun.title.take(20)}' के ${failedRun.screenshotPaths.size} स्क्रीनशॉट सेव हैं। नीचे '🛠️ 1-2-3 स्क्रीनशॉट Fix' या '📎' दबाएं!"
             homeBotView.setBotMood(isHappy = false, isCurious = true)
         } else if (runs.isNotEmpty()) {
             homeBotStatusTitle.text = "$greetingPrefix सारे टास्क फिट हैं ✅"
@@ -492,7 +902,7 @@ class MainActivity : AppCompatActivity() {
             homeBotView.setBotMood(isHappy = true, isCurious = false)
         } else {
             homeBotStatusTitle.text = "$greetingPrefix Have a good luck day!"
-            homeBotReportSubtitle.text = "मैं 24/7 तैयार हूँ। Tasks टैब से अपना टाइम और YouTube + Instagram लिंक सेट करें!"
+            homeBotReportSubtitle.text = "नीचे चैट में '📎' दबाकर स्क्रीनशॉट (1-2-3 पॉइंट) या वीडियो से सीधा नियम सिखाएं!"
             homeBotView.setBotMood(isHappy = true, isCurious = false)
         }
     }
@@ -506,28 +916,18 @@ class MainActivity : AppCompatActivity() {
             sb.append("• अभी तक आज कोई टास्क रन नहीं हुआ है।")
         } else {
             runs.take(5).forEachIndexed { idx, r ->
-                sb.append("${idx + 1}. ${if (r.status == "SUCCESS") "✅" else "⚠️"} ${r.title} (${r.status}) - ${r.timestamp}\n")
+                sb.append("${idx + 1}. ${if (r.status == "SUCCESS") "✅" else "⚠️"} ${r.title} (${r.screenshotPaths.size} Screenshots) - ${r.timestamp}\n")
             }
         }
         AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
             .setTitle("🤖 10:00 PM Friendly Daily Update")
             .setMessage(sb.toString())
             .setPositiveButton("ठीक है!") { d, _ -> d.dismiss() }
-            .setNeutralButton("🛠️ AI से गलती ठीक करवाएं") { d, _ ->
+            .setNeutralButton("🛠️ 1-2-3 पॉइंट से सुधारें") { d, _ ->
                 d.dismiss()
-                diagnoseLastFailedTaskWithAi()
+                openLastRunScreenshotsPickerForChat()
             }
             .show()
-    }
-
-    private fun diagnoseLastFailedTaskWithAi() {
-        val runs = getActiveVault().getAllAutomationRuns()
-        val target = runs.firstOrNull { it.status != "SUCCESS" } ?: runs.firstOrNull()
-        if (target == null) {
-            Toast.makeText(this, "सर, अभी कोई भी फेल टास्क नहीं है!", Toast.LENGTH_LONG).show()
-        } else {
-            openAutomationRunChatDialog(target)
-        }
     }
 
     private fun handleUserChatMessage(userMsg: String, scroll: ScrollView) {
@@ -537,12 +937,66 @@ class MainActivity : AppCompatActivity() {
         planSendBtn.isEnabled = false
         planSendBtn.text = "⏳..."
 
+        val brain = getActiveBrain()
+        val vault = getActiveVault()
+
+        if (isDirectRuleOrCorrectionMessage(userMsg)) {
+            uiScope.launch(Dispatchers.IO) {
+                val lastRun = vault.getAllAutomationRuns().firstOrNull()
+                val targetCategory = lastRun?.appCategory ?: when {
+                    userMsg.contains("insta", true) || userMsg.contains("राहुल") || userMsg.contains("reel", true) -> "Instagram"
+                    userMsg.contains("youtube", true) || userMsg.contains("short", true) -> "YouTube"
+                    else -> "Instagram"
+                }
+                if (userMsg.contains("बदल") || userMsg.contains("हटा") || userMsg.contains("change", true)) {
+                    vault.clearCategoryMemory(targetCategory)
+                }
+                val imgs = if (lastRun != null) vault.loadSavedImagesAsBase64(lastRun.screenshotPaths, 6) else emptyList()
+                val syntheticRun = lastRun ?: AutomationRunRecord(
+                    runId = "live_${System.currentTimeMillis()}",
+                    title = "Live User Rule for $targetCategory",
+                    appCategory = targetCategory,
+                    status = "USER_TAUGHT",
+                    timestamp = "Just Now",
+                    stepsSummary = emptyList(),
+                    screenshotPaths = emptyList(),
+                    chatHistory = emptyList()
+                )
+                val replyObj = brain.chatAboutAutomationRunWith38Flash(syntheticRun, userMsg, imgs)
+                vault.saveStuckOrHumanFix(
+                    category = targetCategory,
+                    screenSignature = "live_chat_rule_${System.currentTimeMillis()}",
+                    problemDescription = replyObj.extractedProblem,
+                    solutionRule = "MANDATORY LIVE RULE: ${replyObj.extractedSolutionRule}",
+                    tapXRatio = replyObj.tapXRatio,
+                    tapYRatio = replyObj.tapYRatio,
+                    sourceType = "LIVE_CODE_RULE (${replyObj.modelUsed})"
+                )
+                val existingProfile = vault.getUserProfileRules()
+                vault.saveUserProfileRules((existingProfile + "\n• [$targetCategory Law]: ${replyObj.extractedSolutionRule}").trim().takeLast(2000))
+
+                withContext(Dispatchers.Main) {
+                    planSendBtn.isEnabled = true
+                    planSendBtn.text = "Plan ➔"
+                    val normX = (replyObj.tapXRatio * 1000).toInt()
+                    val normY = (replyObj.tapYRatio * 1000).toInt()
+                    addChatBubble(
+                        "⚖️ Live Rule Compiler (${replyObj.modelUsed})",
+                        "${replyObj.replyText}\n\n✅ **पक्का कानून (`LIVE_CODE_RULE`) लागू हो गया:**\n• App: `$targetCategory`\n• Action: `${replyObj.extractedSolutionRule}`\n• XY: `($normX, $normY)`",
+                        isUser = false
+                    )
+                    scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+                }
+            }
+            return
+        }
+
         uiScope.launch {
             try {
-                val planJson = getActiveBrain().chatAndBuildDetailedPlan(
+                val planJson = brain.chatAndBuildDetailedPlan(
                     userMessage = userMsg,
                     chatHistory = chatHistoryBuilder.toString().takeLast(1500),
-                    userProfileRules = getActiveVault().getUserProfileRules()
+                    userProfileRules = vault.getUserProfileRules()
                 )
                 val reply = planJson.optString("reply", "समझ गया भाई!")
                 val ready = planJson.optBoolean("readyToExecute", false)
@@ -584,7 +1038,7 @@ class MainActivity : AppCompatActivity() {
         bubble.addView(TextView(this).apply {
             text = message
             setTextColor(textPureWhite)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             setPadding(0, dp(4), 0, 0)
         })
         chatMessagesLayout.addView(bubble)
@@ -600,15 +1054,15 @@ class MainActivity : AppCompatActivity() {
         card.addView(TextView(this).apply {
             text = "📋 फाइनल एक्शन प्लान: $title ($mode)"
             setTextColor(textPureWhite)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             typeface = Typeface.DEFAULT_BOLD
         })
         steps.forEachIndexed { idx, stepText ->
             card.addView(TextView(this).apply {
                 text = "  ${idx + 1}. $stepText"
                 setTextColor(Color.parseColor("#E2E8F0"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
-                setPadding(0, dp(5), 0, 0)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setPadding(0, dp(4), 0, 0)
             })
         }
         card.addView(createPrimaryButton("▶ हाँ, काम शुरू करो (Start Execution)", accentEmerald) {
@@ -1124,7 +1578,7 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(24))
         }
-        val trainerCard = createSectionCard("📹 Frame-by-Frame Video Trainer (Gemini 3.8 Flash)")
+        val trainerCard = createSectionCard("📹 Frame-by-Frame Video Trainer (3.1 Pro + Robotics)")
         val catInput = createCleanInput("Instagram", "App Folder Name")
         val noteInput = createCleanInput(selectedTrainingNote, "निर्देश लिखें...")
         val pickVideoBtn = createPrimaryButton("📤 Upload Screen Recording Video & Train", accentRoyalBlue) {
@@ -1142,11 +1596,11 @@ class MainActivity : AppCompatActivity() {
         videoSessionsListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         videoSessionsCard.addView(videoSessionsListLayout)
 
-        val runsCard = createSectionCard("🔄 Automation Runs History")
+        val runsCard = createSectionCard("🖼️ Automation Runs History (1-2-3 Screenshot Editor)")
         automationRunsListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         runsCard.addView(automationRunsListLayout)
 
-        val foldersCard = createSectionCard("📁 App-Wise Learned Fixes")
+        val foldersCard = createSectionCard("📁 App-Wise Confirmed Laws (LIVE_CODE_RULEs)")
         memoryCategoriesLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         foldersCard.addView(memoryCategoriesLayout)
 
@@ -1193,14 +1647,27 @@ class MainActivity : AppCompatActivity() {
                 background = roundedBox(Color.parseColor("#262B36"), dp(10), borderSubtle)
                 layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) }
             }
-            row.addView(TextView(this).apply {
-                text = "📂 Memory/$cat/ ($count Rules)"
+            val topHeader = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            topHeader.addView(TextView(this).apply {
+                text = "📂 Memory/$cat/ ($count Laws)"
                 setTextColor(textPureWhite)
                 typeface = Typeface.DEFAULT_BOLD
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             })
-            vault.recallFixesForApp(cat).take(5).forEach { f ->
+            topHeader.addView(TextView(this).apply {
+                text = "🗑️ Clear"
+                setTextColor(Color.parseColor("#EF4444"))
+                setOnClickListener {
+                    vault.clearCategoryMemory(cat)
+                    refreshMemoryEverything()
+                }
+            })
+            row.addView(topHeader)
+            vault.recallFixesForApp(cat).take(8).forEach { f ->
+                val nx = (f.tapXRatio * 1000).toInt()
+                val ny = (f.tapYRatio * 1000).toInt()
                 row.addView(TextView(this).apply {
-                    text = " • ${f.problemDescription} ➔ ${f.solutionRule}"
+                    text = " • [${f.sourceType}] ${f.problemDescription} ➔ ${f.solutionRule} (XY: $nx, $ny)"
                     setTextColor(textMuted)
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
                 })
@@ -1212,7 +1679,8 @@ class MainActivity : AppCompatActivity() {
     private fun refreshAutomationRunsList() {
         if (!::automationRunsListLayout.isInitialized) return
         automationRunsListLayout.removeAllViews()
-        val runs = getActiveVault().getAllAutomationRuns()
+        val vault = getActiveVault()
+        val runs = vault.getAllAutomationRuns()
         if (runs.isEmpty()) {
             automationRunsListLayout.addView(TextView(this).apply {
                 text = "अभी कोई Automation Run सेव नहीं हुआ है।"
@@ -1228,11 +1696,36 @@ class MainActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) }
             }
             card.addView(TextView(this).apply {
-                text = "📌 ${run.title} [${run.status}] - ${run.timestamp}"
+                text = "📌 ${run.title} [${run.status}] (${run.screenshotPaths.size} Screenshots)"
                 setTextColor(if (run.status == "SUCCESS") accentEmerald else accentAmber)
                 typeface = Typeface.DEFAULT_BOLD
             })
-            card.addView(createPrimaryButton("💬 Gemini 3.8 चैट & स्क्रीनशॉट्स", accentRoyalBlue) {
+
+            if (run.screenshotPaths.isNotEmpty()) {
+                val hScroll = HorizontalScrollView(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(116)).apply { topMargin = dp(6) }
+                }
+                val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                run.screenshotPaths.forEachIndexed { idx, path ->
+                    val bmp = vault.loadBitmapFromPath(path) ?: return@forEachIndexed
+                    val stepDesc = run.stepsSummary.getOrNull(idx) ?: "Step #${idx + 1}"
+                    val img = ImageView(this).apply {
+                        setImageBitmap(bmp)
+                        scaleType = ImageView.ScaleType.CENTER_CROP
+                        background = roundedBox(bgMatteDark, dp(6), accentRoyalBlue)
+                        setPadding(dp(2), dp(2), dp(2), dp(2))
+                        layoutParams = LinearLayout.LayoutParams(dp(68), dp(110)).apply { marginEnd = dp(8) }
+                        setOnClickListener {
+                            openMultiPointEditableScreenshotDialog(bmp, run.appCategory, "Step #${idx + 1}: $stepDesc")
+                        }
+                    }
+                    strip.addView(img)
+                }
+                hScroll.addView(strip)
+                card.addView(hScroll)
+            }
+
+            card.addView(createPrimaryButton("💬 1-2-3 पॉइंट & चैट सुधार", accentRoyalBlue) {
                 openAutomationRunChatDialog(run)
             }.apply {
                 layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
@@ -1246,13 +1739,44 @@ class MainActivity : AppCompatActivity() {
         val brain = getActiveBrain()
         val dialogView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             setBackgroundColor(bgMatteDark)
         }
         val input = createCleanInput("", "भाई, यहाँ समझाओ क्या गलती हुई...")
+
+        if (runRecord.screenshotPaths.isNotEmpty()) {
+            dialogView.addView(TextView(this).apply {
+                text = "👆 किसी भी स्क्रीनशॉट पर टैप करके **1-2-3 Multi-Point Editor** खोलें:"
+                setTextColor(accentAmber)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(0, 0, 0, dp(4))
+            })
+            val hScroll = HorizontalScrollView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(122))
+            }
+            val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            runRecord.screenshotPaths.forEachIndexed { idx, path ->
+                val bmp = vault.loadBitmapFromPath(path) ?: return@forEachIndexed
+                val stepInfo = runRecord.stepsSummary.getOrNull(idx) ?: "Step #${idx + 1}"
+                val img = ImageView(this).apply {
+                    setImageBitmap(bmp)
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    background = roundedBox(cardSlate, dp(6), accentRoyalBlue)
+                    setPadding(dp(2), dp(2), dp(2), dp(2))
+                    layoutParams = LinearLayout.LayoutParams(dp(70), dp(116)).apply { marginEnd = dp(8) }
+                    setOnClickListener {
+                        openMultiPointEditableScreenshotDialog(bmp, runRecord.appCategory, "Step #${idx + 1}: $stepInfo")
+                    }
+                }
+                strip.addView(img)
+            }
+            hScroll.addView(strip)
+            dialogView.addView(hScroll)
+        }
+
         val msgListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val chatScroll = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(220), 1f)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(190), 1f)
             addView(msgListLayout)
         }
         fun appendMsg(s: String, m: String) {
@@ -1262,7 +1786,7 @@ class MainActivity : AppCompatActivity() {
                 setPadding(0, dp(4), 0, dp(4))
             })
         }
-        appendMsg("Gemini 3.8", "मैंने '${runRecord.title}' के स्क्रीनशॉट्स लोड कर लिए हैं। बताइए क्या सुधार करना है?")
+        appendMsg("3.1 Pro + Robotics", "मैंने '${runRecord.title}' के स्क्रीनशॉट्स लोड कर लिए हैं। फोटो पर टैप करके 1-2-3 पॉइंट लगाएं या नीचे नियम लिखें!")
         runRecord.chatHistory.forEach { appendMsg("History", it) }
 
         val sendBtn = createPrimaryButton("Send ➔", accentRoyalBlue) { btn ->
@@ -1280,10 +1804,10 @@ class MainActivity : AppCompatActivity() {
                     category = runRecord.appCategory,
                     screenSignature = "run_${runRecord.runId}",
                     problemDescription = rep.extractedProblem,
-                    solutionRule = rep.extractedSolutionRule,
+                    solutionRule = "MANDATORY LIVE RULE: ${rep.extractedSolutionRule}",
                     tapXRatio = rep.tapXRatio,
                     tapYRatio = rep.tapYRatio,
-                    sourceType = "RUN_CHAT"
+                    sourceType = "LIVE_CODE_RULE"
                 )
                 withContext(Dispatchers.Main) {
                     btn.isEnabled = true
@@ -1373,7 +1897,7 @@ class MainActivity : AppCompatActivity() {
                     category = session.appCategory,
                     screenSignature = "vid_${session.sessionId}",
                     problemDescription = rep.extractedProblem,
-                    solutionRule = rep.extractedSolutionRule,
+                    solutionRule = "MANDATORY LIVE RULE: ${rep.extractedSolutionRule}",
                     tapXRatio = rep.tapXRatio,
                     tapYRatio = rep.tapYRatio,
                     sourceType = "VIDEO_CHAT"
@@ -1413,7 +1937,7 @@ class MainActivity : AppCompatActivity() {
             if (isStealth) accentPurple else Color.parseColor("#334155")
         ) { btn ->
             isStealth = !isStealth
-            prefs.edit().putBoolean("hud_stealth_mode", isStealth).apply()
+            prefs.edit().putBoolean("hud_stealth_mode", isStealth).putBoolean("stealth_hide_bot", isStealth).apply()
             btn.text = if (isStealth) "👻 Stealth Mode (गायब मोड): ON (बॉट अदृश्य रहेगा, पर बैकग्राउंड काम चलते रहेंगे)"
             else "👀 Stealth Mode (गायब मोड): OFF (चंचल बॉट कोने में हल्का दिखेगा)"
             btn.background = roundedBox(if (isStealth) accentPurple else Color.parseColor("#334155"), dp(12))
@@ -1426,7 +1950,7 @@ class MainActivity : AppCompatActivity() {
             if (greetingsOn) accentEmerald else Color.parseColor("#475569")
         ) { btn ->
             greetingsOn = !greetingsOn
-            prefs.edit().putBoolean("hud_greetings_enabled", greetingsOn).apply()
+            prefs.edit().putBoolean("hud_greetings_enabled", greetingsOn).putBoolean("bot_greetings_enabled", greetingsOn).apply()
             btn.text = if (greetingsOn) "☀️ Good Morning / Good Night अपडेट्स: ON" else "🔕 Good Morning / Good Night अपडेट्स: OFF"
             btn.background = roundedBox(if (greetingsOn) accentEmerald else Color.parseColor("#475569"), dp(12))
         }
@@ -1446,7 +1970,7 @@ class MainActivity : AppCompatActivity() {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                     val pct = (progress + 5).coerceIn(5, 100)
                     alphaLabel.text = "🎚️ कोने में छुपने पर बॉट की पारदर्शिता (Edge Transparency): $pct%"
-                    prefs.edit().putFloat("hud_idle_alpha", pct / 100f).apply()
+                    prefs.edit().putFloat("hud_idle_alpha", pct / 100f).putInt("hud_idle_alpha_percent", pct).apply()
                     AutoTouchService.instance?.hud?.applyUserTransparencyAndStealthSettings()
                 }
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
@@ -1619,6 +2143,23 @@ class MainActivity : AppCompatActivity() {
                 val spoken = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull() ?: return
                 chatInputBox.setText(spoken)
                 chatInputBox.setSelection(spoken.length)
+            }
+            REQ_CHAT_PICK_IMAGE -> {
+                val imgUri = data.data ?: return
+                try {
+                    contentResolver.openInputStream(imgUri)?.use { stream ->
+                        val bmp = BitmapFactory.decodeStream(stream)
+                        if (bmp != null) {
+                            openMultiPointEditableScreenshotDialog(bmp, "Instagram", "1-2-3 Multi-Point Rule Editor")
+                        }
+                    }
+                } catch (_: Exception) {
+                    Toast.makeText(this, "फोटो लोड नहीं हो सका!", Toast.LENGTH_SHORT).show()
+                }
+            }
+            REQ_CHAT_PICK_VIDEO -> {
+                val vidUri = data.data ?: return
+                handleChatDirectVideoUpload(vidUri)
             }
             REQ_PICK_FOLDER_TREE -> {
                 val resolvedPath = resolveTreeUriToRealPath(data.data ?: return)
