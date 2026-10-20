@@ -8,6 +8,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -61,7 +62,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
-import java.io.File
 import java.util.Calendar
 import java.util.Locale
 import kotlin.math.sin
@@ -144,7 +144,10 @@ class MainActivity : AppCompatActivity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bgMatteDark)
-            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
         }
 
         val header = LinearLayout(this).apply {
@@ -168,7 +171,10 @@ class MainActivity : AppCompatActivity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setPadding(dp(10), dp(6), dp(10), dp(6))
             background = roundedBox(Color.parseColor("#262B36"), dp(14), borderSubtle)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(8) }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(8) }
             setOnClickListener {
                 switchTab(4)
                 refreshEngineTabDetails()
@@ -253,6 +259,10 @@ class MainActivity : AppCompatActivity() {
         super.onBackPressed()
     }
 
+    private fun darkDialogBuilder(): AlertDialog.Builder {
+        return AlertDialog.Builder(this)
+    }
+
     private fun getActiveBrain(): GeminiBrain {
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
         val savedKey = prefs.getString("gemini_api_key", "") ?: ""
@@ -274,7 +284,12 @@ class MainActivity : AppCompatActivity() {
             if (!Environment.isExternalStorageManager()) {
                 Toast.makeText(this, "कृपया 'All Files Access' ऑन करें!", Toast.LENGTH_LONG).show()
                 try {
-                    startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:$packageName")
+                        )
+                    )
                 } catch (_: Exception) {
                     startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
                 }
@@ -282,7 +297,11 @@ class MainActivity : AppCompatActivity() {
             }
             return true
         } else {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE), 101)
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE),
+                101
+            )
             return true
         }
     }
@@ -300,14 +319,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
         logAutoRefreshJob?.cancel()
-        if (index == 0) refreshHomeDailyReportBanner()
-        else if (index == 3) refreshMemoryEverything()
-        else if (index == 4) {
-            refreshEngineTabDetails()
-            logAutoRefreshJob = uiScope.launch {
-                while (isActive && currentTabIndex == 4) {
-                    delay(2500L)
-                    refreshEngineTabDetails()
+        when (index) {
+            0 -> refreshHomeDailyReportBanner()
+            3 -> refreshMemoryEverything()
+            4 -> {
+                refreshEngineTabDetails()
+                logAutoRefreshJob = uiScope.launch {
+                    while (isActive && currentTabIndex == 4) {
+                        delay(2500L)
+                        refreshEngineTabDetails()
+                    }
                 }
             }
         }
@@ -324,7 +345,10 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(10))
             background = roundedBox(Color.parseColor("#182032"), dp(16), accentRoyalBlue)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(10) }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(10) }
         }
 
         homeBotView = FullBodyChanchalBotView(this).apply {
@@ -370,7 +394,10 @@ class MainActivity : AppCompatActivity() {
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(9), dp(6), dp(9), dp(6))
             background = roundedBox(accentEmerald, dp(8))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(6) }
             setOnClickListener { showFriendlyDailyReportDialog() }
         }
 
@@ -443,7 +470,10 @@ class MainActivity : AppCompatActivity() {
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(11), dp(10), dp(11), dp(10))
             background = roundedBox(accentEmerald, dp(12))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(5) }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(5) }
             setOnClickListener {
                 val msg = chatInputBox.text.toString().trim()
                 if (msg.isNotEmpty()) {
@@ -496,7 +526,7 @@ class MainActivity : AppCompatActivity() {
             "🎥 चैट में वीडियो (Screen Recording) भेजें & सुधारें",
             "🗑️ किसी ऐप का पुराना लाइव कोड रूल बदलें / साफ करें"
         )
-        AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+        darkDialogBuilder()
             .setTitle("📎 चैट में स्क्रीनशॉट या वीडियो भेजें")
             .setItems(options) { _, which ->
                 when (which) {
@@ -509,7 +539,7 @@ class MainActivity : AppCompatActivity() {
                         if (cats.isEmpty()) {
                             Toast.makeText(this, "अभी कोई पुराना नियम नहीं है!", Toast.LENGTH_SHORT).show()
                         } else {
-                            AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+                            darkDialogBuilder()
                                 .setTitle("किस ऐप के पुराने नियम हटाकर नए बनाने हैं?")
                                 .setItems(cats) { _, idx ->
                                     vault.clearCategoryMemory(cats[idx])
@@ -548,9 +578,9 @@ class MainActivity : AppCompatActivity() {
         val hScroll = HorizontalScrollView(this)
         val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
 
-        val pickerDialog = AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+        val pickerDialog = darkDialogBuilder()
             .setTitle("📸 स्क्रीनशॉट चुनें (${run.screenshotPaths.size})")
-            .setView(dialogLayout as View)
+            .setView(dialogLayout)
             .setNegativeButton("बंद करें", null)
             .create()
 
@@ -680,7 +710,12 @@ class MainActivity : AppCompatActivity() {
                 pointsStatusTv.text = if (summary.isEmpty()) "👆 फोटो पर टैप करके 1, 2, 3 पॉइंट बनाएं:" else "🎯 पॉइंट्स: $summary"
                 multiPointCanvasView.invalidate()
             }
-        }.apply { layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) } }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(6) }
+        }
 
         val clearPtsBtn = createPrimaryButton("🗑️ Clear", Color.parseColor("#7F1D1D")) {
             pointsNormList.clear()
@@ -712,9 +747,9 @@ class MainActivity : AppCompatActivity() {
         root.addView(spacer(dp(6)))
         root.addView(instructionInput)
 
-        AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+        darkDialogBuilder()
             .setTitle("🖼️ $initialTitle")
-            .setView(root as View)
+            .setView(root)
             .setPositiveButton("⚡ पक्का कानून (Live Rule) बनाएं") { d, _ ->
                 val appCat = appNameInput.text.toString().trim().ifEmpty { "Instagram" }
                 val userInstruction = instructionInput.text.toString().trim().ifEmpty { "Follow numbered points in order" }
@@ -825,9 +860,9 @@ class MainActivity : AppCompatActivity() {
         root.addView(spacer(dp(8)))
         root.addView(noteInput)
 
-        AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+        darkDialogBuilder()
             .setTitle("🎥 चैट में वीडियो भेजकर नियम बनाएं")
-            .setView(root as View)
+            .setView(root)
             .setPositiveButton("🚀 वीडियो एनालाइज करें & रूल बनाएं") { _, _ ->
                 val appCat = appInput.text.toString().trim().ifEmpty { "Instagram" }
                 val note = noteInput.text.toString().trim()
@@ -919,7 +954,7 @@ class MainActivity : AppCompatActivity() {
                 sb.append("${idx + 1}. ${if (r.status == "SUCCESS") "✅" else "⚠️"} ${r.title} (${r.screenshotPaths.size} Screenshots) - ${r.timestamp}\n")
             }
         }
-        AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+        darkDialogBuilder()
             .setTitle("🤖 10:00 PM Friendly Daily Update")
             .setMessage(sb.toString())
             .setPositiveButton("ठीक है!") { d, _ -> d.dismiss() }
@@ -1024,7 +1059,10 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(12), dp(14), dp(12))
             background = roundedBox(if (isUser) Color.parseColor("#1E3A8A") else cardSlate, dp(14), borderSubtle)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
                 bottomMargin = dp(10)
                 if (isUser) marginStart = dp(40) else marginEnd = dp(24)
             }
@@ -1049,7 +1087,10 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(14))
             background = roundedBox(Color.parseColor("#172554"), dp(16), accentRoyalBlue)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(14) }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(14) }
         }
         card.addView(TextView(this).apply {
             text = "📋 फाइनल एक्शन प्लान: $title ($mode)"
@@ -1075,7 +1116,10 @@ class MainActivity : AppCompatActivity() {
                 svc.startUniversalTask(rawGoal, steps, mode)
             }
         }.apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(12) }
         })
         chatMessagesLayout.addView(card)
     }
@@ -1185,7 +1229,10 @@ class MainActivity : AppCompatActivity() {
                 typeface = Typeface.DEFAULT_BOLD
                 setPadding(dp(12), dp(8), dp(12), dp(8))
                 background = roundedBox(Color.parseColor("#262B36"), dp(8), borderSubtle)
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) }
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { marginEnd = dp(6) }
                 setOnClickListener {
                     freeSiteInput.setText(url)
                     prefs.edit().putString("free_hub_site", url).apply()
@@ -1348,7 +1395,7 @@ class MainActivity : AppCompatActivity() {
 
         snoozeRow.addView(createPrimaryButton("🔔 Test Popup", Color.parseColor("#334155")) {
             AutoTouchService.instance?.hud?.showHud()
-            AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+            darkDialogBuilder()
                 .setTitle("🤖 7:00 PM Smart Task Prompt")
                 .setMessage("भाई, अभी आपका डेली ऑटोमेशन का समय हो गया है। आप क्या करना चाहते हैं?")
                 .setPositiveButton("🌐 Run in Background") { _, _ ->
@@ -1394,7 +1441,7 @@ class MainActivity : AppCompatActivity() {
         return scroll
     }
 
-    private fun buildMultiPlatformLinkerBox(prefs: android.content.SharedPreferences): View {
+    private fun buildMultiPlatformLinkerBox(prefs: SharedPreferences): View {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(10))
@@ -1440,10 +1487,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         val addCustomBtn = createPrimaryButton("➕ Add", accentRoyalBlue) {
+            val wrapper = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(14), dp(10), dp(14), dp(10))
+            }
             val input = createCleanInput(prefs.getString("custom_linked_platforms", "Facebook Reels") ?: "", "नए ऐप/वेबसाइट का नाम")
-            AlertDialog.Builder(this@MainActivity, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+            wrapper.addView(input)
+            darkDialogBuilder()
                 .setTitle("➕ नया अपलोड प्लेटफॉर्म लिंक करें")
-                .setView(input as View)
+                .setView(wrapper)
                 .setPositiveButton("Save") { _, _ ->
                     val v = input.text.toString().trim()
                     prefs.edit().putString("custom_linked_platforms", v).apply()
@@ -1463,10 +1515,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun showMiniTaskAiAssistantDialog(topicField: EditText, countField: EditText) {
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+        val wrapper = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
         val input = createCleanInput("", "जैसे: 'रोज़ शाम 7:30 बजे 2 पार्ट में स्टोरी वीडियो बनाकर YouTube और Insta पर डालो'").apply { minLines = 3 }
-        AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+        wrapper.addView(input)
+        darkDialogBuilder()
             .setTitle("🤖 Mini Task AI Configurator")
-            .setView(input as View)
+            .setView(wrapper)
             .setPositiveButton("⚡ ऑटो-सेट करें") { _, _ ->
                 val userWish = input.text.toString().trim()
                 if (userWish.isEmpty()) return@setPositiveButton
@@ -1645,7 +1702,10 @@ class MainActivity : AppCompatActivity() {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(12), dp(10), dp(12), dp(10))
                 background = roundedBox(Color.parseColor("#262B36"), dp(10), borderSubtle)
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) }
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(8) }
             }
             val topHeader = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             topHeader.addView(TextView(this).apply {
@@ -1693,7 +1753,10 @@ class MainActivity : AppCompatActivity() {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(12), dp(10), dp(12), dp(10))
                 background = roundedBox(cardSlate, dp(10), borderSubtle)
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) }
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(8) }
             }
             card.addView(TextView(this).apply {
                 text = "📌 ${run.title} [${run.status}] (${run.screenshotPaths.size} Screenshots)"
@@ -1728,7 +1791,10 @@ class MainActivity : AppCompatActivity() {
             card.addView(createPrimaryButton("💬 1-2-3 पॉइंट & चैट सुधार", accentRoyalBlue) {
                 openAutomationRunChatDialog(run)
             }.apply {
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(6) }
             })
             automationRunsListLayout.addView(card)
         }
@@ -1821,9 +1887,9 @@ class MainActivity : AppCompatActivity() {
         dialogView.addView(spacer(dp(6)))
         dialogView.addView(sendBtn)
 
-        AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+        darkDialogBuilder()
             .setTitle("💬 Fix Run: ${runRecord.title}")
-            .setView(dialogView as View)
+            .setView(dialogView)
             .setPositiveButton("बंद करें", null)
             .show()
     }
@@ -1844,7 +1910,10 @@ class MainActivity : AppCompatActivity() {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(12), dp(10), dp(12), dp(10))
                 background = roundedBox(cardSlate, dp(10), borderSubtle)
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) }
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(8) }
             }
             card.addView(TextView(this).apply {
                 text = "📹 ${session.appCategory} (${session.timestamp})"
@@ -1854,7 +1923,10 @@ class MainActivity : AppCompatActivity() {
             card.addView(createPrimaryButton("💬 इस वीडियो पर Gemini 3.8 से चैट करें", accentEmerald) {
                 openVideoSessionChatDialog(session)
             }.apply {
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) }
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(6) }
             })
             videoSessionsListLayout.addView(card)
         }
@@ -1914,9 +1986,9 @@ class MainActivity : AppCompatActivity() {
         dialogView.addView(spacer(dp(6)))
         dialogView.addView(sendBtn)
 
-        AlertDialog.Builder(this, androidx.appcompat.R.style.Theme_AppCompat_Dialog)
+        darkDialogBuilder()
             .setTitle("💬 Video Chat: ${session.appCategory}")
-            .setView(dialogView as View)
+            .setView(dialogView)
             .setPositiveButton("बंद करें", null)
             .show()
     }
@@ -2236,7 +2308,10 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(16))
             background = roundedBox(cardSlate, dp(16), borderSubtle)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(16) }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(16) }
             addView(TextView(this@MainActivity).apply {
                 text = title
                 setTextColor(textPureWhite)
@@ -2370,45 +2445,79 @@ class MainActivity : AppCompatActivity() {
             val w = width.toFloat()
             val h = height.toFloat()
             val cx = w / 2f
-            val bobY = sin(animPhase.toDouble()).toFloat() * dp(3) - (waveBoost * dp(6))
-            val glanceX = sin((animPhase * 0.7f).toDouble()).toFloat() * dp(2)
+            val bobY = sin(animPhase.toDouble()).toFloat() * dp(3).toFloat() - (waveBoost * dp(6).toFloat())
+            val glanceX = sin((animPhase * 0.7f).toDouble()).toFloat() * dp(2).toFloat()
 
-            canvas.drawOval(cx - dp(18), h - dp(14), cx - dp(4), h - dp(4), bodyPaint)
-            canvas.drawOval(cx + dp(4), h - dp(14), cx + dp(18), h - dp(4), bodyPaint)
+            canvas.drawOval(
+                cx - dp(18).toFloat(),
+                h - dp(14).toFloat(),
+                cx - dp(4).toFloat(),
+                h - dp(4).toFloat(),
+                bodyPaint
+            )
+            canvas.drawOval(
+                cx + dp(4).toFloat(),
+                h - dp(14).toFloat(),
+                cx + dp(18).toFloat(),
+                h - dp(4).toFloat(),
+                bodyPaint
+            )
 
-            rect.set(cx - dp(24), h * 0.42f + bobY, cx + dp(24), h - dp(10) + bobY)
+            rect.set(
+                cx - dp(24).toFloat(),
+                h * 0.42f + bobY,
+                cx + dp(24).toFloat(),
+                h - dp(10).toFloat() + bobY
+            )
             canvas.drawRoundRect(rect, dp(22).toFloat(), dp(22).toFloat(), bodyPaint)
             canvas.drawRoundRect(rect, dp(22).toFloat(), dp(22).toFloat(), shadowPaint)
 
-            val waveOffset = sin((animPhase * 2f).toDouble()).toFloat() * dp(6) + (waveBoost * dp(12))
-            canvas.drawOval(cx - dp(34), h * 0.46f + bobY - waveOffset, cx - dp(20), h * 0.68f + bobY, bodyPaint)
-            canvas.drawOval(cx + dp(20), h * 0.46f + bobY + waveOffset, cx + dp(34), h * 0.68f + bobY, bodyPaint)
+            val waveOffset = sin((animPhase * 2f).toDouble()).toFloat() * dp(6).toFloat() + (waveBoost * dp(12).toFloat())
+            canvas.drawOval(
+                cx - dp(34).toFloat(),
+                h * 0.46f + bobY - waveOffset,
+                cx - dp(20).toFloat(),
+                h * 0.68f + bobY,
+                bodyPaint
+            )
+            canvas.drawOval(
+                cx + dp(20).toFloat(),
+                h * 0.46f + bobY + waveOffset,
+                cx + dp(34).toFloat(),
+                h * 0.68f + bobY,
+                bodyPaint
+            )
 
-            rect.set(cx - dp(26), dp(8).toFloat() + bobY, cx + dp(26), h * 0.46f + bobY)
+            rect.set(
+                cx - dp(26).toFloat(),
+                dp(8).toFloat() + bobY,
+                cx + dp(26).toFloat(),
+                h * 0.46f + bobY
+            )
             canvas.drawRoundRect(rect, dp(24).toFloat(), dp(24).toFloat(), bodyPaint)
             canvas.drawRoundRect(rect, dp(24).toFloat(), dp(24).toFloat(), shadowPaint)
 
             val eyeY = h * 0.26f + bobY
-            canvas.drawCircle(cx - dp(15) + glanceX, eyeY + dp(5), dp(4).toFloat(), blushPaint)
-            canvas.drawCircle(cx + dp(15) + glanceX, eyeY + dp(5), dp(4).toFloat(), blushPaint)
+            canvas.drawCircle(cx - dp(15).toFloat() + glanceX, eyeY + dp(5).toFloat(), dp(4).toFloat(), blushPaint)
+            canvas.drawCircle(cx + dp(15).toFloat() + glanceX, eyeY + dp(5).toFloat(), dp(4).toFloat(), blushPaint)
 
-            val leftEyeX = cx - dp(10) + glanceX
-            val rightEyeX = cx + dp(10) + glanceX
+            val leftEyeX = cx - dp(10).toFloat() + glanceX
+            val rightEyeX = cx + dp(10).toFloat() + glanceX
             val eyeR = if (isCuriousMood) dp(5).toFloat() else dp(4).toFloat()
             canvas.drawLine(leftEyeX, eyeY, rightEyeX, eyeY, mouthStrokePaint)
             canvas.drawCircle(leftEyeX, eyeY, eyeR, featurePaint)
             canvas.drawCircle(rightEyeX, eyeY, eyeR, featurePaint)
 
-            val mouthY = eyeY + dp(8)
+            val mouthY = eyeY + dp(8).toFloat()
             if (isCuriousMood) {
                 canvas.drawCircle(cx + glanceX, mouthY, dp(3).toFloat(), mouthStrokePaint)
             } else {
                 mouthPath.reset()
-                mouthPath.moveTo(cx - dp(4) + glanceX, mouthY)
+                mouthPath.moveTo(cx - dp(4).toFloat() + glanceX, mouthY)
                 mouthPath.quadTo(
                     cx + glanceX,
                     mouthY + if (isHappyMood) dp(4).toFloat() else -dp(2).toFloat(),
-                    cx + dp(4) + glanceX,
+                    cx + dp(4).toFloat() + glanceX,
                     mouthY
                 )
                 canvas.drawPath(mouthPath, mouthStrokePaint)
