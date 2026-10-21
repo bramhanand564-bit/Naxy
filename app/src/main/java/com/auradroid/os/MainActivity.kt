@@ -28,6 +28,7 @@ import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.speech.RecognizerIntent
+import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
@@ -271,6 +272,53 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun getActiveVault(): MemoryVault = AutoTouchService.instance?.memoryVault ?: localVault
+
+    /**
+     * Guard helper: Checks whether an AI reply or LearnedFixRecord is clean and verified
+     * (Prevents saving "All models busy", "@213...", or "Chat not selected" garbage into MemoryVault)
+     */
+    private fun isValidBrainReply(replyObj: MemoryChatReply): Boolean {
+        if (replyObj.modelUsed.contains("All models busy", ignoreCase = true) ||
+            replyObj.modelUsed.contains("No API Key", ignoreCase = true)
+        ) return false
+        val sol = replyObj.extractedSolutionRule
+        if (sol.isBlank() || sol.contains("@213") || sol.contains("Chat not selected", ignoreCase = true)) return false
+        return true
+    }
+
+    private fun isPoisonedFixRecord(fix: LearnedFixRecord): Boolean {
+        val r = fix.solutionRule
+        val s = fix.sourceType
+        return r.contains("@213") ||
+            r.contains("Chat not selected", ignoreCase = true) ||
+            s.contains("All models busy", ignoreCase = true) ||
+            r.contains("All models busy", ignoreCase = true)
+    }
+
+    /**
+     * Cleans only poisoned/corrupted auto-learned entries from a category while preserving good rules!
+     */
+    private fun purgePoisonedRulesFromCategory(category: String): Int {
+        val vault = getActiveVault()
+        val allFixes = vault.recallFixesForApp(category)
+        val goodFixes = allFixes.filter { !isPoisonedFixRecord(it) }
+        val removedCount = allFixes.size - goodFixes.size
+        if (removedCount > 0) {
+            vault.clearCategoryMemory(category)
+            for (g in goodFixes.reversed()) {
+                vault.saveStuckOrHumanFix(
+                    category = category,
+                    screenSignature = g.screenSignature,
+                    problemDescription = g.problemDescription,
+                    solutionRule = g.solutionRule,
+                    tapXRatio = g.tapXRatio,
+                    tapYRatio = g.tapYRatio,
+                    sourceType = g.sourceType
+                )
+            }
+        }
+        return removedCount
+    }
 
     private fun refreshServiceBadge() {
         if (!::serviceBadge.isInitialized) return
@@ -524,7 +572,8 @@ class MainActivity : AppCompatActivity() {
             "🖼️ गैलरी से स्क्रीनशॉट/फोटो भेजें (1-2-3 पॉइंट लगाएं)",
             "📸 पिछले टास्क के स्क्रीनशॉट पर 1-2-3 पॉइंट लगाएं",
             "🎥 चैट में वीडियो (Screen Recording) भेजें & सुधारें",
-            "🗑️ किसी ऐप का पुराना लाइव कोड रूल बदलें / साफ करें"
+            "🧹 किसी ऐप के खराब नियम (@213 / Chat not selected) साफ करें",
+            "🗑️ किसी ऐप का पूरा पुराना नियम हटाकर नया बनाएं"
         )
         darkDialogBuilder()
             .setTitle("📎 चैट में स्क्रीनशॉट या वीडियो भेजें")
@@ -534,6 +583,19 @@ class MainActivity : AppCompatActivity() {
                     1 -> openLastRunScreenshotsPickerForChat()
                     2 -> startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply { type = "video/*" }, REQ_CHAT_PICK_VIDEO)
                     3 -> {
+                        val vault = getActiveVault()
+                        val catNames: List<String> = vault.getAllCategoriesSummary().map { it.first }
+                        if (catNames.isEmpty()) {
+                            Toast.makeText(this, "अभी कोई पुराना नियम नहीं है!", Toast.LENGTH_SHORT).show()
+                        } else {
+                            var totalPurged = 0
+                            for (c in catNames) {
+                                totalPurged += purgePoisonedRulesFromCategory(c)
+                            }
+                            addChatBubble("🧹 Memory Cleaner", "✅ सभी ऐप्स से **$totalPurged खराब/अधूरे नियम** (`@213...`, `Chat not selected`, `All models busy`) साफ कर दिए गए हैं! आपके असली नियम सुरक्षित हैं।", false)
+                        }
+                    }
+                    4 -> {
                         val vault = getActiveVault()
                         val catNames: List<String> = vault.getAllCategoriesSummary().map { it.first }
                         if (catNames.isEmpty()) {
@@ -783,7 +845,11 @@ class MainActivity : AppCompatActivity() {
         )
 
         uiScope.launch(Dispatchers.IO) {
-            if (replaceOld) vault.clearCategoryMemory(appCategory)
+            if (replaceOld) {
+                vault.clearCategoryMemory(appCategory)
+            } else {
+                purgePoisonedRulesFromCategory(appCategory)
+            }
 
             val b64 = brain.bitmapToHdWebpBase64(bmp, maxHeight = 1024)
             val syntheticRun = AutomationRunRecord(
@@ -800,17 +866,8 @@ class MainActivity : AppCompatActivity() {
             val combinedPrompt = "User marked ${points.size} numbered points on this screenshot: [$ptsText]. User instruction: '$userInstruction'. Create a mandatory reusable skill rule following these exact numbered points!"
             val replyObj = brain.chatAboutAutomationRunWith38Flash(syntheticRun, combinedPrompt, listOf(b64))
 
-            if (points.isEmpty()) {
-                vault.saveStuckOrHumanFix(
-                    category = appCategory,
-                    screenSignature = "live_rule_${System.currentTimeMillis()}",
-                    problemDescription = replyObj.extractedProblem,
-                    solutionRule = "MANDATORY LIVE RULE: ${replyObj.extractedSolutionRule}",
-                    tapXRatio = replyObj.tapXRatio,
-                    tapYRatio = replyObj.tapYRatio,
-                    sourceType = "LIVE_CODE_RULE (${replyObj.modelUsed})"
-                )
-            } else {
+            if (points.isNotEmpty()) {
+                // User explicitly pinned 1-2-3 coordinates: ALWAYS save user's exact coordinates even if AI models are cooling down!
                 points.forEachIndexed { idx, pt ->
                     val ptNum = idx + 1
                     vault.saveStuckOrHumanFix(
@@ -823,15 +880,41 @@ class MainActivity : AppCompatActivity() {
                         sourceType = "LIVE_CODE_RULE_PT#$ptNum"
                     )
                 }
-            }
-
-            withContext(Dispatchers.Main) {
-                addChatBubble(
-                    "⚖️ Live Code Rule Compiler (${replyObj.modelUsed})",
-                    "${replyObj.replyText}\n\n✅ **${points.size.coerceAtLeast(1)} पक्के कोडेड कानून (`LIVE_CODE_RULE`) `$appCategory` में लागू हो गए हैं!**\n• Points: `$ptsText`",
-                    isUser = false
+                withContext(Dispatchers.Main) {
+                    addChatBubble(
+                        "⚖️ Live Code Rule Compiler (${replyObj.modelUsed})",
+                        "${replyObj.replyText}\n\n✅ **${points.size} पक्के कोडेड कानून (`LIVE_CODE_RULE`) `$appCategory` में लागू हो गए हैं!**\n• Points: `$ptsText`",
+                        isUser = false
+                    )
+                    chatScrollView.post { chatScrollView.fullScroll(View.FOCUS_DOWN) }
+                }
+            } else if (isValidBrainReply(replyObj)) {
+                vault.saveStuckOrHumanFix(
+                    category = appCategory,
+                    screenSignature = "live_rule_${System.currentTimeMillis()}",
+                    problemDescription = replyObj.extractedProblem,
+                    solutionRule = "MANDATORY LIVE RULE: ${replyObj.extractedSolutionRule}",
+                    tapXRatio = replyObj.tapXRatio,
+                    tapYRatio = replyObj.tapYRatio,
+                    sourceType = "LIVE_CODE_RULE (${replyObj.modelUsed})"
                 )
-                chatScrollView.post { chatScrollView.fullScroll(View.FOCUS_DOWN) }
+                withContext(Dispatchers.Main) {
+                    addChatBubble(
+                        "⚖️ Live Code Rule Compiler (${replyObj.modelUsed})",
+                        "${replyObj.replyText}\n\n✅ **पक्का कोडेड कानून (`LIVE_CODE_RULE`) `$appCategory` में लागू हो गया है!**",
+                        isUser = false
+                    )
+                    chatScrollView.post { chatScrollView.fullScroll(View.FOCUS_DOWN) }
+                }
+            } else {
+                withContext(Dispatchers.Main) {
+                    addChatBubble(
+                        "⏳ Quota Pacer Alert",
+                        "भाई, अभी सभी AI मॉडल्स 60s कूलडाउन में हैं। कृपया फोटो पर उंगली से **1, 2, 3 पॉइंट** टैप करके भेजें ताकि बिना AI वेट के आपके सटीक कोऑर्डिनेट तुरंत सेव हो जाएं!",
+                        isUser = false
+                    )
+                    chatScrollView.post { chatScrollView.fullScroll(View.FOCUS_DOWN) }
+                }
             }
         }
     }
@@ -875,9 +958,13 @@ class MainActivity : AppCompatActivity() {
                 val vault = getActiveVault()
                 val brain = getActiveBrain()
                 uiScope.launch(Dispatchers.IO) {
-                    if (replaceOld) vault.clearCategoryMemory(appCat)
+                    if (replaceOld) {
+                        vault.clearCategoryMemory(appCat)
+                    } else {
+                        purgePoisonedRulesFromCategory(appCat)
+                    }
                     val (session, framesB64) = vault.createVideoTrainingSession(appCat, note, videoUri, 12)
-                    val rules = brain.analyzeTrainingVideoFrames(appCat, note, framesB64)
+                    val rules = brain.analyzeTrainingVideoFrames(appCat, note, framesB64).filter { !isPoisonedFixRecord(it) }
                     for (r in rules) {
                         vault.saveStuckOrHumanFix(
                             category = appCat,
@@ -891,14 +978,22 @@ class MainActivity : AppCompatActivity() {
                         vault.appendChatToVideoSession(session.sessionId, "AI", "Learned: ${r.solutionRule}", r.solutionRule)
                     }
                     withContext(Dispatchers.Main) {
-                        val rulesText = rules.take(5).mapIndexed { i, r ->
-                            "${i + 1}. ${r.problemDescription} ➔ ${r.solutionRule} (XY: ${(r.tapXRatio * 1000).toInt()}, ${(r.tapYRatio * 1000).toInt()})"
-                        }.joinToString("\n")
-                        addChatBubble(
-                            "✅ Video Live Rules Compiled ($appCat)",
-                            "भाई, आपके वीडियो से **${rules.size} पक्के कोडेड कानून (`CHAT_VIDEO_LAW`)** बनाकर `$appCat` में लागू कर दिए गए हैं:\n\n$rulesText",
-                            isUser = false
-                        )
+                        if (rules.isEmpty()) {
+                            addChatBubble(
+                                "⏳ Models Cooling Down",
+                                "भाई, अभी AI मॉडल्स कूलडाउन में होने के कारण कोई गलत रूल सेव नहीं किया गया। 30 सेकंड बाद दोबारा ट्राई करें!",
+                                isUser = false
+                            )
+                        } else {
+                            val rulesText = rules.take(5).mapIndexed { i, r ->
+                                "${i + 1}. ${r.problemDescription} ➔ ${r.solutionRule} (XY: ${(r.tapXRatio * 1000).toInt()}, ${(r.tapYRatio * 1000).toInt()})"
+                            }.joinToString("\n")
+                            addChatBubble(
+                                "✅ Video Live Rules Compiled ($appCat)",
+                                "भाई, आपके वीडियो से **${rules.size} पक्के कोडेड कानून (`CHAT_VIDEO_LAW`)** बनाकर `$appCat` में लागू कर दिए गए हैं:\n\n$rulesText",
+                                isUser = false
+                            )
+                        }
                         chatScrollView.post { chatScrollView.fullScroll(View.FOCUS_DOWN) }
                     }
                 }
@@ -987,7 +1082,10 @@ class MainActivity : AppCompatActivity() {
                 }
                 if (userMsg.contains("बदल") || userMsg.contains("हटा") || userMsg.contains("change", true)) {
                     vault.clearCategoryMemory(targetCategory)
+                } else {
+                    purgePoisonedRulesFromCategory(targetCategory)
                 }
+
                 val imgs = if (lastRun != null) vault.loadSavedImagesAsBase64(lastRun.screenshotPaths, 6) else emptyList()
                 val syntheticRun = lastRun ?: AutomationRunRecord(
                     runId = "live_${System.currentTimeMillis()}",
@@ -1000,17 +1098,21 @@ class MainActivity : AppCompatActivity() {
                     chatHistory = emptyList()
                 )
                 val replyObj = brain.chatAboutAutomationRunWith38Flash(syntheticRun, userMsg, imgs)
-                vault.saveStuckOrHumanFix(
-                    category = targetCategory,
-                    screenSignature = "live_chat_rule_${System.currentTimeMillis()}",
-                    problemDescription = replyObj.extractedProblem,
-                    solutionRule = "MANDATORY LIVE RULE: ${replyObj.extractedSolutionRule}",
-                    tapXRatio = replyObj.tapXRatio,
-                    tapYRatio = replyObj.tapYRatio,
-                    sourceType = "LIVE_CODE_RULE (${replyObj.modelUsed})"
-                )
+
                 val existingProfile = vault.getUserProfileRules()
-                vault.saveUserProfileRules((existingProfile + "\n• [$targetCategory Law]: ${replyObj.extractedSolutionRule}").trim().takeLast(2000))
+                vault.saveUserProfileRules((existingProfile + "\n• [$targetCategory Law]: $userMsg").trim().takeLast(2000))
+
+                if (isValidBrainReply(replyObj)) {
+                    vault.saveStuckOrHumanFix(
+                        category = targetCategory,
+                        screenSignature = "live_chat_rule_${System.currentTimeMillis()}",
+                        problemDescription = replyObj.extractedProblem,
+                        solutionRule = "MANDATORY LIVE RULE: ${replyObj.extractedSolutionRule}",
+                        tapXRatio = replyObj.tapXRatio,
+                        tapYRatio = replyObj.tapYRatio,
+                        sourceType = "LIVE_CODE_RULE (${replyObj.modelUsed})"
+                    )
+                }
 
                 withContext(Dispatchers.Main) {
                     planSendBtn.isEnabled = true
@@ -1709,7 +1811,10 @@ class MainActivity : AppCompatActivity() {
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply { bottomMargin = dp(8) }
             }
-            val topHeader = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val topHeader = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
             topHeader.addView(TextView(this).apply {
                 text = "📂 Memory/$cat/ ($count Laws)"
                 setTextColor(textPureWhite)
@@ -1717,20 +1822,33 @@ class MainActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             })
             topHeader.addView(TextView(this).apply {
-                text = "🗑️ Clear"
+                text = "🧹 Clean Bad"
+                setTextColor(accentAmber)
+                setPadding(dp(8), dp(4), dp(10), dp(4))
+                setOnClickListener {
+                    val removed = purgePoisonedRulesFromCategory(cat)
+                    Toast.makeText(this@MainActivity, "🧹 $removed खराब नियम साफ किए गए!", Toast.LENGTH_SHORT).show()
+                    refreshMemoryEverything()
+                }
+            })
+            topHeader.addView(TextView(this).apply {
+                text = "🗑️ Clear All"
                 setTextColor(Color.parseColor("#EF4444"))
+                setPadding(dp(6), dp(4), dp(4), dp(4))
                 setOnClickListener {
                     vault.clearCategoryMemory(cat)
                     refreshMemoryEverything()
                 }
             })
             row.addView(topHeader)
-            vault.recallFixesForApp(cat).take(8).forEach { f ->
+            vault.recallFixesForApp(cat).take(10).forEach { f ->
                 val nx = (f.tapXRatio * 1000).toInt()
                 val ny = (f.tapYRatio * 1000).toInt()
+                val isBad = isPoisonedFixRecord(f)
                 row.addView(TextView(this).apply {
-                    text = " • [${f.sourceType}] ${f.problemDescription} ➔ ${f.solutionRule} (XY: $nx, $ny)"
-                    setTextColor(textMuted)
+                    text = if (isBad) " ⚠️ [BAD RULE - Tap 'Clean Bad'] ${f.solutionRule} (XY: $nx, $ny)"
+                    else " • [${f.sourceType}] ${f.problemDescription} ➔ ${f.solutionRule} (XY: $nx, $ny)"
+                    setTextColor(if (isBad) Color.parseColor("#F87171") else textMuted)
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
                 })
             }
@@ -1868,15 +1986,17 @@ class MainActivity : AppCompatActivity() {
                 val imgs = vault.loadSavedImagesAsBase64(runRecord.screenshotPaths, 6)
                 val rep = brain.chatAboutAutomationRunWith38Flash(runRecord, userText, imgs)
                 vault.appendChatToAutomationRun(runRecord.runId, "Gemini 3.8", rep.replyText)
-                vault.saveStuckOrHumanFix(
-                    category = runRecord.appCategory,
-                    screenSignature = "run_${runRecord.runId}",
-                    problemDescription = rep.extractedProblem,
-                    solutionRule = "MANDATORY LIVE RULE: ${rep.extractedSolutionRule}",
-                    tapXRatio = rep.tapXRatio,
-                    tapYRatio = rep.tapYRatio,
-                    sourceType = "LIVE_CODE_RULE"
-                )
+                if (isValidBrainReply(rep)) {
+                    vault.saveStuckOrHumanFix(
+                        category = runRecord.appCategory,
+                        screenSignature = "run_${runRecord.runId}",
+                        problemDescription = rep.extractedProblem,
+                        solutionRule = "MANDATORY LIVE RULE: ${rep.extractedSolutionRule}",
+                        tapXRatio = rep.tapXRatio,
+                        tapYRatio = rep.tapYRatio,
+                        sourceType = "LIVE_CODE_RULE"
+                    )
+                }
                 withContext(Dispatchers.Main) {
                     btn.isEnabled = true
                     appendMsg("Gemini 3.8", rep.replyText)
@@ -1967,15 +2087,17 @@ class MainActivity : AppCompatActivity() {
                 val frames = vault.loadSavedImagesAsBase64(session.framePaths, 10)
                 val rep = brain.chatAboutTrainingVideoWith38Flash(session, userText, frames)
                 vault.appendChatToVideoSession(session.sessionId, "Gemini 3.8", rep.replyText, rep.extractedSolutionRule)
-                vault.saveStuckOrHumanFix(
-                    category = session.appCategory,
-                    screenSignature = "vid_${session.sessionId}",
-                    problemDescription = rep.extractedProblem,
-                    solutionRule = "MANDATORY LIVE RULE: ${rep.extractedSolutionRule}",
-                    tapXRatio = rep.tapXRatio,
-                    tapYRatio = rep.tapYRatio,
-                    sourceType = "VIDEO_CHAT"
-                )
+                if (isValidBrainReply(rep)) {
+                    vault.saveStuckOrHumanFix(
+                        category = session.appCategory,
+                        screenSignature = "vid_${session.sessionId}",
+                        problemDescription = rep.extractedProblem,
+                        solutionRule = "MANDATORY LIVE RULE: ${rep.extractedSolutionRule}",
+                        tapXRatio = rep.tapXRatio,
+                        tapYRatio = rep.tapYRatio,
+                        sourceType = "VIDEO_CHAT"
+                    )
+                }
                 withContext(Dispatchers.Main) {
                     btn.isEnabled = true
                     appendMsg("Gemini 3.8", rep.replyText)
@@ -2106,7 +2228,27 @@ class MainActivity : AppCompatActivity() {
         logsCard.addView(liveLogsTextView)
 
         val apiCard = createSectionCard("🔑 Gemini API & 3.5–3.8 Ladder")
-        val keyInput = createCleanInput(prefs.getString("gemini_api_key", "") ?: "", "Paste Gemini API Key")
+        val keyRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        var isKeyHidden = true
+        val keyInput = createCleanInput(prefs.getString("gemini_api_key", "") ?: "", "Paste Gemini API Key").apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+        }
+        val toggleKeyVisBtn = createPrimaryButton("👁️", Color.parseColor("#334155")) {
+            isKeyHidden = !isKeyHidden
+            keyInput.inputType = if (isKeyHidden) {
+                InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            } else {
+                InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            }
+            keyInput.setSelection(keyInput.text.length)
+        }
+        keyRow.addView(keyInput)
+        keyRow.addView(toggleKeyVisBtn)
+
         val saveKeyBtn = createPrimaryButton("💾 Save API Key", accentRoyalBlue) {
             val k = keyInput.text.toString().trim()
             prefs.edit().putString("gemini_api_key", k).apply()
@@ -2121,7 +2263,7 @@ class MainActivity : AppCompatActivity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setPadding(0, dp(10), 0, 0)
         }
-        apiCard.addView(keyInput)
+        apiCard.addView(keyRow)
         apiCard.addView(spacer(dp(10)))
         apiCard.addView(saveKeyBtn)
         apiCard.addView(ladderInfoTextView)
@@ -2261,6 +2403,7 @@ class MainActivity : AppCompatActivity() {
                 uiScope.launch(Dispatchers.IO) {
                     val (session, framesB64) = vault.createVideoTrainingSession(selectedTrainingCategory, selectedTrainingNote, videoUri, 12)
                     val rules = brain.analyzeTrainingVideoFrames(selectedTrainingCategory, selectedTrainingNote, framesB64)
+                        .filter { !isPoisonedFixRecord(it) }
                     for (r in rules) {
                         vault.saveStuckOrHumanFix(
                             category = selectedTrainingCategory,
@@ -2275,7 +2418,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     withContext(Dispatchers.Main) {
                         refreshMemoryEverything()
-                        Toast.makeText(this@MainActivity, "✅ Video Trained (${rules.size} Rules)!", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this@MainActivity, "✅ Video Trained (${rules.size} Verified Rules)!", Toast.LENGTH_LONG).show()
                     }
                 }
             }
