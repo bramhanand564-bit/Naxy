@@ -107,6 +107,12 @@ class GeminiBrain(private var apiKey: String) {
         else -> 12_000L
     }
 
+    private fun isModelInHard429Cooldown(model: String, nowMs: Long = System.currentTimeMillis()): Boolean =
+        synchronized(rateLock) {
+            val cooldownUntil = quotaCooldownModels[model] ?: 0L
+            cooldownUntil > nowMs
+        }
+
     private fun getUsedRpmInLastMinute(model: String, nowMs: Long = System.currentTimeMillis()): Int =
         synchronized(rateLock) {
             val list = modelRequestTimestamps.getOrPut(model) { mutableListOf() }
@@ -189,19 +195,18 @@ class GeminiBrain(private var apiKey: String) {
             return gemmaCasualAndTextLadder + listOf("gemini-3.8-flash")
         }
         if (isStuck) {
-            return listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite")
+            return listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
         }
         return when (preferredGear) {
             "COPILOT_38_ROBOTICS" -> {
-                // Alternates between 3.8-Flash and Robotics-ER so both work together on first-time runs without hitting 429!
                 fastRelayToggle = !fastRelayToggle
                 val first = if (fastRelayToggle) "gemini-3.8-flash" else "gemini-robotics-er-2-preview"
                 val second = if (fastRelayToggle) "gemini-robotics-er-2-preview" else "gemini-3.8-flash"
                 listOf(first, second, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview")
             }
-            "PRO_DEEP_DIAGNOSIS" -> listOf("gemini-3.1-pro-preview", "gemini-3.8-flash", "gemini-robotics-er-2-preview")
-            "ROBOTICS_PRECISION" -> listOf("gemini-robotics-er-2-preview", "gemini-3.1-pro-preview", "gemini-3.8-flash")
-            "HEAVY_38_ONLY" -> listOf("gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite")
+            "PRO_DEEP_DIAGNOSIS" -> listOf("gemini-3.1-pro-preview", "gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+            "ROBOTICS_PRECISION" -> listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+            "HEAVY_38_ONLY" -> listOf("gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
             "ROBOTICS_XY" -> listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
             "FAST_LITE" -> {
                 fastRelayToggle = !fastRelayToggle
@@ -228,29 +233,38 @@ class GeminiBrain(private var apiKey: String) {
             .ifEmpty { blockedModels.clear(); smartVisionLadder }
 
         val now = System.currentTimeMillis()
-        val primaryModel = gearLadder.first()
+        // Filter out models that are locked in hard 429 cooldown so we don't hammer them every 1 second
+        val nonCooldownModels = gearLadder.filter { !isModelInHard429Cooldown(it, now) }
+        val activePool = nonCooldownModels.ifEmpty { gearLadder }
 
-        if (preferredGear == "HEAVY_38_ONLY" || preferredGear == "PRO_DEEP_DIAGNOSIS" || preferredGear == "ROBOTICS_PRECISION") {
-            val waitPrimary = getWaitTimeMsForModel(primaryModel, now)
-            if (waitPrimary in 1L..36_000L) {
-                onBrainLog?.invoke("⏱️ Smart Quota Pacer: Waiting ${(waitPrimary / 1000L).coerceAtLeast(1L)}s for [$primaryModel]...")
-                delay(waitPrimary)
-            }
-        }
-
-        val afterWaitNow = System.currentTimeMillis()
-        val readyModels = gearLadder.filter { hasImmediateSafeSlot(it, afterWaitNow) }
+        val readyModels = activePool.filter { hasImmediateSafeSlot(it, now) }
         val orderedCandidates = if (readyModels.isNotEmpty()) {
-            readyModels + (gearLadder - readyModels.toSet())
+            readyModels + (activePool - readyModels.toSet())
         } else {
-            val fastest = gearLadder.minByOrNull { getWaitTimeMsForModel(it, afterWaitNow) } ?: primaryModel
-            val w = getWaitTimeMsForModel(fastest, afterWaitNow).coerceIn(1_000L, 13_000L)
-            onBrainLog?.invoke("⏱️ Pacer Wait (${w / 1000L}s) for [$fastest]...")
-            delay(w)
-            listOf(fastest) + (gearLadder - fastest)
+            val fastest = activePool.minByOrNull { getWaitTimeMsForModel(it, now) } ?: activePool.first()
+            listOf(fastest) + (activePool - fastest)
         }
 
         for (model in orderedCandidates) {
+            val loopNow = System.currentTimeMillis()
+
+            // Skip if this model is currently in a hard 429 cooldown and other models exist
+            if (isModelInHard429Cooldown(model, loopNow) && orderedCandidates.size > 1) {
+                continue
+            }
+
+            // Respect Pacer Wait inside the loop before firing ANY model
+            val waitNeeded = getWaitTimeMsForModel(model, loopNow)
+            if (waitNeeded > 0L) {
+                if (waitNeeded <= 15_000L) {
+                    onBrainLog?.invoke("⏱️ Smart Quota Pacer: Waiting ${(waitNeeded / 1000L).coerceAtLeast(1L)}s for [$model]...")
+                    delay(waitNeeded)
+                } else {
+                    // Too long to wait for this model; shift to next candidate immediately
+                    continue
+                }
+            }
+
             val modelImages = if (model.startsWith("gemma")) emptyList() else imagesBase64
             val usedBefore = getUsedRpmInLastMinute(model)
             recordModelRequestTimestamp(model)
@@ -259,15 +273,23 @@ class GeminiBrain(private var apiKey: String) {
             when (result.first) {
                 200 -> if (result.second.isNotBlank()) return@withContext Pair(result.second, model)
                 429 -> {
-                    quotaCooldownModels[model] = System.currentTimeMillis() + if (usedBefore <= 1) 180_000L else 25_000L
-                    onBrainLog?.invoke("⚠️ Quota 429 on [$model] -> Shifting gear...")
+                    // Lock model for 65 seconds on 429 so background/next steps never hammer it 1s later!
+                    val lockDuration = if (usedBefore <= 1) 120_000L else 65_000L
+                    synchronized(rateLock) {
+                        quotaCooldownModels[model] = System.currentTimeMillis() + lockDuration
+                    }
+                    onBrainLog?.invoke("⚠️ Quota 429 on [$model] -> Shifting gear (${lockDuration / 1000}s cooldown)...")
                 }
                 500, 502, 503, 504 -> {
-                    quotaCooldownModels[model] = System.currentTimeMillis() + 20_000L
-                    onBrainLog?.invoke("🔄 Model [$model] busy (${result.first}) -> 20s cooldown & shifting gear...")
+                    synchronized(rateLock) {
+                        quotaCooldownModels[model] = System.currentTimeMillis() + 25_000L
+                    }
+                    onBrainLog?.invoke("🔄 Model [$model] busy (${result.first}) -> 25s cooldown & shifting gear...")
                 }
                 else -> {
-                    quotaCooldownModels[model] = System.currentTimeMillis() + 30_000L
+                    synchronized(rateLock) {
+                        quotaCooldownModels[model] = System.currentTimeMillis() + 30_000L
+                    }
                     onBrainLog?.invoke("🔄 Model [$model] (${result.first}) -> Shifting gear...")
                 }
             }
@@ -322,8 +344,18 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 1. Task Decider & Modular Micro-Step Planner:
-     * Breaks tasks into explicit, verifiable micro-steps so no action (like typing in the Search box or clicking Send) is ever skipped!
+     * Filter out poisoned/broken rules (like @2131955775 or "Chat not selected" at X=500)
+     * so old poisoned Memory entries never hijack live runs!
+     */
+    private fun isValidReusableSkill(fix: LearnedFixRecord): Boolean {
+        val rule = fix.solutionRule
+        if (rule.contains("@213") || rule.contains("Chat not selected", ignoreCase = true)) return false
+        if (rule.contains("All models busy", ignoreCase = true) || fix.sourceType.contains("All models busy", ignoreCase = true)) return false
+        return true
+    }
+
+    /**
+     * 1. Task Decider & Modular Micro-Step Planner
      */
     suspend fun chatAndBuildDetailedPlan(
         userMessage: String,
@@ -386,7 +418,7 @@ class GeminiBrain(private var apiKey: String) {
     /**
      * Pre/Post-Click Confirmation Engine:
      * Inspects the live XML nodes and recent action history to CONFIRM whether a click succeeded
-     * and prevents repeating toggles (like selecting/unselecting Rahul on the Share sheet!).
+     * and prevents repeating toggles (like selecting/unselecting Rahul on the Share sheet, or getting stuck on Send!).
      */
     private fun checkDeterministicClickConfirmation(
         goal: String,
@@ -394,43 +426,60 @@ class GeminiBrain(private var apiKey: String) {
         numberedNodesList: String
     ): AgentStepDecision? {
         val recentJoined = currentStepHistory.takeLast(6).joinToString(" | ").lowercase(Locale.ROOT)
+        val lastStepText = currentStepHistory.lastOrNull()?.lowercase(Locale.ROOT) ?: ""
         val lines = numberedNodesList.lines()
 
-        // 1. SHARE SHEET SEND CONFIRMATION:
-        // If the bottom blue "Send" button is visible on the Share sheet (because a friend like rahulmishra_110 was just selected!),
-        // NEVER tap the friend's avatar again (which unselects them!). Immediately click the "Send" button!
+        // 1. SHARE SHEET SEND / SEND SEPARATELY CONFIRMATION:
         val sendButtonLine = lines.firstOrNull { line ->
-            (line.contains("\"Send\"", ignoreCase = true) || line.contains("text=Send", ignoreCase = true) || line.contains("desc=Send", ignoreCase = true)) &&
-                !line.contains("Send a", ignoreCase = true) && !line.contains("Send message", ignoreCase = true)
+            (line.contains("\"Send\"", ignoreCase = true) ||
+                line.contains("\"Send separately\"", ignoreCase = true) ||
+                line.contains("text=Send", ignoreCase = true) ||
+                line.contains("desc=Send", ignoreCase = true)) &&
+                !line.contains("Send a", ignoreCase = true) &&
+                !line.contains("Send message", ignoreCase = true) &&
+                !line.contains("Send to", ignoreCase = true)
         }
+
         if (sendButtonLine != null && (recentJoined.contains("rahul") || recentJoined.contains("select") || recentJoined.contains("share") || lines.any { it.contains("Write a message", ignoreCase = true) })) {
             val tagMatch = Regex("\\[(\\d+)]").find(sendButtonLine)
             val tagId = tagMatch?.groupValues?.get(1)?.toIntOrNull() ?: -1
+
+            // Extract exact center XY if bounds are present in the node line, else use standard bottom-sheet Send XY (500, 932)
+            val xyMatch = Regex("\\((\\d+),\\s*(\\d+)\\)").find(sendButtonLine)
+            val sendX = xyMatch?.groupValues?.get(1)?.toIntOrNull() ?: 500
+            val sendY = xyMatch?.groupValues?.get(2)?.toIntOrNull() ?: 932
+
+            // If the very last step ALREADY tried CLICK_TAG on Send and the sheet is still open, force CLICK_XY!
+            val alreadyTriedTag = lastStepText.contains("send") && lastStepText.contains("click_tag")
+
             onBrainLog?.invoke("✅ Click Confirmed: Friend selected & 'Send' button detected! Clicking 'Send' immediately...")
-            return if (tagId >= 0) {
+            return if (tagId >= 0 && !alreadyTriedTag) {
                 AgentStepDecision(
                     action = "CLICK_TAG",
                     tagId = tagId,
-                    x = 500,
-                    y = 928,
+                    x = sendX,
+                    y = sendY,
                     reason = "Confirmed & Tapping Send button",
                     modelUsed = "ConfirmEngine"
                 )
             } else {
                 AgentStepDecision(
                     action = "CLICK_XY",
-                    x = 500,
-                    y = 928,
-                    reason = "Confirmed & Tapping Send XY",
+                    x = sendX,
+                    y = sendY,
+                    reason = "Confirmed & Tapping Send XY directly",
                     modelUsed = "ConfirmEngine"
                 )
             }
         }
 
         // 2. POST-SEND COMPLETION CONFIRMATION:
-        // If we already clicked the final "Send" button on the Share sheet, confirm task is DONE!
-        if (currentStepHistory.takeLast(2).any { it.contains("Tapping Send", ignoreCase = true) || it.contains("Send button", ignoreCase = true) }) {
-            val shareSheetStillOpen = lines.any { it.contains("Write a message", ignoreCase = true) || it.contains("Add to story", ignoreCase = true) }
+        if (currentStepHistory.takeLast(2).any { it.contains("Tapping Send", ignoreCase = true) || it.contains("Send separately", ignoreCase = true) || it.contains("Send XY", ignoreCase = true) }) {
+            val shareSheetStillOpen = lines.any {
+                it.contains("Write a message", ignoreCase = true) ||
+                    it.contains("Send separately", ignoreCase = true) ||
+                    it.contains("Chat not selected", ignoreCase = true)
+            }
             if (!shareSheetStillOpen) {
                 onBrainLog?.invoke("🎉 Post-Click Confirmed: Video shared & Share sheet closed! Task DONE.")
                 return AgentStepDecision(action = "DONE", reason = "Confirmed video shared!", modelUsed = "ConfirmEngine")
@@ -466,7 +515,7 @@ class GeminiBrain(private var apiKey: String) {
         }
         lastLiveStepTimestampMs = System.currentTimeMillis()
 
-        // RULE 2: Deterministic Pre/Post-Click Confirmation Check (Instant 0ms fix for Share Send & Completion!)
+        // RULE 2: Deterministic Pre/Post-Click Confirmation Check
         if (!isContinuousMonitor) {
             checkDeterministicClickConfirmation(goal, currentStepHistory, numberedNodesList)?.let { confirmedDecision ->
                 return confirmedDecision
@@ -475,7 +524,9 @@ class GeminiBrain(private var apiKey: String) {
 
         val imgList = if (screenshotBitmap != null) listOf(bitmapToHdWebpBase64(screenshotBitmap)) else emptyList()
 
-        val sortedFixes = recalledFixes.sortedByDescending {
+        // Filter out any corrupted/poisoned skills before injecting into prompt
+        val cleanFixes = recalledFixes.filter { isValidReusableSkill(it) }
+        val sortedFixes = cleanFixes.sortedByDescending {
             it.sourceType.contains("PRO_ROBOTICS") || it.sourceType.contains("SKILL") || it.sourceType.contains("CHAT")
         }
 
@@ -484,7 +535,7 @@ class GeminiBrain(private var apiKey: String) {
             🚨 CONFIRMED UNIVERSAL APP SKILLS & MANDATORY XY COORDINATES (CROSS-TASK TRANSFER!):
             Apply these verified coordinates from previous runs to the current goal "$goal" (substitute the new search query or friend name as needed):
             """.trimIndent() + "\n" +
-                sortedFixes.take(14).joinToString("\n") { fix ->
+                sortedFixes.take(12).joinToString("\n") { fix ->
                     val px = (fix.tapXRatio * bodySpecs.screenWidth).toInt()
                     val py = (fix.tapYRatio * bodySpecs.screenHeight).toInt()
                     val normX = (fix.tapXRatio * 1000).toInt()
@@ -500,9 +551,6 @@ class GeminiBrain(private var apiKey: String) {
         val currentStepIndex = currentStepHistory.size
         val activePlannedStep = planSteps.getOrNull(currentStepIndex) ?: planSteps.lastOrNull() ?: goal
 
-        // First-Time Run vs Learned Run Model Selection:
-        // - If this app has NO confirmed skills in Memory yet (First-Time Run!) -> Use COPILOT_38_ROBOTICS (3.8-Flash + Robotics-ER working together!)
-        // - Once skills are learned, shift model based on step work type ([FAST_LITE], [ROBOTICS_XY], [DEEP_3.8])!
         val isFirstTimeForApp = sortedFixes.isEmpty()
         val preferredGear = when {
             isStuck -> "ROBOTICS_PRECISION"
@@ -538,8 +586,8 @@ class GeminiBrain(private var apiKey: String) {
                - Once the comment is posted, press "BACK" to close the comment sheet so the main Reel buttons (Like, Comment, Share) are visible again.
             4. INSTAGRAM SHARE SHEET CONFIRMATION (NEVER UNSELECT THE FRIEND!):
                - When the Share sheet is open:
-                 a) If the blue "Send" button (or "Write a message...") is visible at the bottom of the screen, THAT CONFIRMS THE FRIEND IS ALREADY SELECTED (blue checkmark)!
-                 b) NEVER tap the friend's profile/avatar a second time (tapping again unselects them)! Immediately tap the bottom blue "Send" button (x=500, y=928)!
+                 a) If the blue "Send" or "Send separately" button (or "Write a message...") is visible at the bottom of the screen, THAT CONFIRMS THE FRIEND IS ALREADY SELECTED (blue checkmark)!
+                 b) NEVER tap the friend's profile/avatar a second time (tapping again unselects them)! Immediately tap the bottom blue "Send" / "Send separately" button (x=500, y=932)!
                  c) If the friend (e.g. Rahul) is visible in the Share grid and "Send" is NOT visible yet, tap the friend's profile ONCE.
             
             $mandatorySkillTransferBlock
@@ -639,6 +687,11 @@ class GeminiBrain(private var apiKey: String) {
             preferredGear = "PRO_DEEP_DIAGNOSIS"
         )
 
+        if (stage1Model == "All models busy" || stage1Raw.isBlank()) {
+            onBrainLog?.invoke("⏸️ Stage 1 Audit skipped (models cooling down). No unverified rules saved.")
+            return PostRunReflectionResult("Models cooling down — skipped saving unverified rules.", emptyList(), "CooldownGuard")
+        }
+
         for (sec in 1..15) {
             if (isLiveTaskCurrentlyRunning) {
                 onBrainLog?.invoke("⏸️ Paused Stage 2 Audit because a live task started.")
@@ -675,33 +728,40 @@ class GeminiBrain(private var apiKey: String) {
             useDeep38Flash = true,
             preferredGear = "ROBOTICS_PRECISION"
         )
-        val combinedModelTag = "$stage1Model+$stage2Model"
-        onBrainLog?.invoke("✨ [$combinedModelTag] 40s Autonomous Audit Complete! Reusable skills saved for $appCategory.")
 
+        if (stage2Model == "All models busy" || raw.isBlank()) {
+            onBrainLog?.invoke("⏸️ Stage 2 Audit skipped (models cooling down). No unverified rules saved.")
+            return PostRunReflectionResult("Stage 2 skipped due to quota cooldown.", emptyList(), stage1Model)
+        }
+
+        val combinedModelTag = "$stage1Model+$stage2Model"
         val extractedRules = mutableListOf<LearnedFixRecord>()
         var summaryText = "3.1 Pro और Robotics ने हर स्टेप की जाँच करके Reusable Skills और सटीक XY कोऑर्डिनेट्स खुद लागू कर लिए हैं।"
 
         try {
-            val j = parseCleanJson(raw.ifBlank { stage1Raw })
+            val j = parseCleanJson(raw)
             summaryText = j.optString("reflectionSummary", j.optString("diagnosisSummary", summaryText))
             val arr = j.optJSONArray("rules") ?: JSONArray()
             for (i in 0 until arr.length()) {
                 val item = arr.getJSONObject(i)
-                extractedRules.add(
-                    LearnedFixRecord(
-                        id = "refl_${System.currentTimeMillis()}_$i",
-                        appCategory = appCategory,
-                        sourceType = "PRO_ROBOTICS_SKILL ($combinedModelTag)",
-                        screenSignature = "universal_skill_$i",
-                        problemDescription = item.optString("screenWhen", "[UNIVERSAL_SKILL] Step ${i + 1} in $appCategory"),
-                        solutionRule = item.optString("actionInstruction", "Follow autonomous skill coordinate"),
-                        tapXRatio = item.optDouble("tapXRatio", 0.5).toFloat(),
-                        tapYRatio = item.optDouble("tapYRatio", 0.5).toFloat(),
-                        timestamp = "Pro+Robotics"
-                    )
+                val record = LearnedFixRecord(
+                    id = "refl_${System.currentTimeMillis()}_$i",
+                    appCategory = appCategory,
+                    sourceType = "PRO_ROBOTICS_SKILL ($combinedModelTag)",
+                    screenSignature = "universal_skill_$i",
+                    problemDescription = item.optString("screenWhen", "[UNIVERSAL_SKILL] Step ${i + 1} in $appCategory"),
+                    solutionRule = item.optString("actionInstruction", "Follow autonomous skill coordinate"),
+                    tapXRatio = item.optDouble("tapXRatio", 0.5).toFloat(),
+                    tapYRatio = item.optDouble("tapYRatio", 0.5).toFloat(),
+                    timestamp = "Pro+Robotics"
                 )
+                if (isValidReusableSkill(record)) {
+                    extractedRules.add(record)
+                }
             }
         } catch (_: Exception) {}
+
+        onBrainLog?.invoke("✨ [$combinedModelTag] 40s Autonomous Audit Complete! Saved ${extractedRules.size} verified skills for $appCategory.")
 
         return PostRunReflectionResult(
             reflectionSummary = summaryText,
@@ -832,6 +892,9 @@ class GeminiBrain(private var apiKey: String) {
 
     /**
      * 6. Before + After Screenshot Human Touch Analyzer
+     * FIXED:
+     * - Never steals RPM quota while a live task is running!
+     * - Never saves garbage rules (@2131955775, "Chat not selected", or X=500 fallback) when models are busy!
      */
     suspend fun analyzeBeforeAfterHumanTouchWith38Flash(
         appCategory: String,
@@ -842,6 +905,21 @@ class GeminiBrain(private var apiKey: String) {
         humanTapYRatio: Float,
         clickedNodeDesc: String
     ): Pair<String, String> {
+        val cleanDesc = clickedNodeDesc.trim()
+
+        // 1. Guard against agent self-touch / active live run quota starvation
+        if (isLiveTaskCurrentlyRunning || (System.currentTimeMillis() - lastLiveStepTimestampMs) < 6_000L) {
+            return Pair("", "")
+        }
+
+        // 2. Guard against raw resource IDs (@213...) or person-specific chat rows ("Chat not selected")
+        if (cleanDesc.startsWith("@") ||
+            cleanDesc.contains("Chat not selected", ignoreCase = true) ||
+            cleanDesc.contains("selected", ignoreCase = true) && (humanTapXRatio in 0.49f..0.51f)
+        ) {
+            return Pair("", "")
+        }
+
         val imgs = mutableListOf<String>()
         if (beforeScreenshot != null) imgs.add(bitmapToHdWebpBase64(beforeScreenshot))
         if (afterScreenshot != null) imgs.add(bitmapToHdWebpBase64(afterScreenshot))
@@ -850,26 +928,37 @@ class GeminiBrain(private var apiKey: String) {
 
         val prompt = """
             You are Gemini Robotics-ER Spatial Skill Learner.
-            During "$goal" in "$appCategory", the human tapped at 0..1000 XY($normX, $normY) on [$clickedNodeDesc].
+            During "$goal" in "$appCategory", the human tapped at 0..1000 XY($normX, $normY) on [$cleanDesc].
             Image 1 = BEFORE, Image 2 = AFTER.
             Generalize this tap into a Reusable App Skill (so it works for any future search/song/friend in $appCategory).
+            Do NOT hardcode a specific person's username if it's a share list; make it a general rule.
             Return ONLY JSON:
             {
               "problem": "[UNIVERSAL_SKILL] Reusable screen state in $appCategory",
-              "solutionRule": "MANDATORY SKILL OVERRIDE: Tap '$clickedNodeDesc' at 0..1000 XY($normX, $normY) to proceed"
+              "solutionRule": "MANDATORY SKILL OVERRIDE: Tap '$cleanDesc' at 0..1000 XY($normX, $normY) to proceed"
             }
         """.trimIndent()
 
         val (raw, modelUsed) = callWithLadder(prompt, imgs, true, "ROBOTICS_PRECISION")
-        onBrainLog?.invoke("🧠 [$modelUsed] Learned Reusable Touch Skill for $appCategory")
+
+        // 3. CRITICAL: If all models are busy or call failed, DO NOT save a fallback rule into Memory!
+        if (modelUsed == "All models busy" || raw.isBlank()) {
+            onBrainLog?.invoke("⏸️ Skipped Touch Skill save because models are cooling down.")
+            return Pair("", "")
+        }
+
         return try {
             val j = parseCleanJson(raw)
-            Pair(
-                j.optString("problem", "[UNIVERSAL_SKILL] Screen in $appCategory"),
-                j.optString("solutionRule", "MANDATORY SKILL OVERRIDE: Tap '$clickedNodeDesc' at 0..1000 XY($normX, $normY)")
-            )
+            val prob = j.optString("problem", "").trim()
+            val sol = j.optString("solutionRule", "").trim()
+            if (prob.isNotEmpty() && sol.isNotEmpty()) {
+                onBrainLog?.invoke("🧠 [$modelUsed] Learned Reusable Touch Skill for $appCategory")
+                Pair(prob, sol)
+            } else {
+                Pair("", "")
+            }
         } catch (_: Exception) {
-            Pair("[UNIVERSAL_SKILL] $appCategory", "MANDATORY SKILL OVERRIDE: Tap '$clickedNodeDesc' at 0..1000 XY($normX, $normY)")
+            Pair("", "")
         }
     }
 
@@ -898,6 +987,8 @@ class GeminiBrain(private var apiKey: String) {
         """.trimIndent()
 
         val (raw, modelUsed) = callWithLadder(prompt, framesBase64, true, "ROBOTICS_PRECISION")
+        if (modelUsed == "All models busy" || raw.isBlank()) return emptyList()
+
         onBrainLog?.invoke("🎬 [$modelUsed] Extracted Reusable Video Skills (${framesBase64.size} frames)")
 
         val extracted = mutableListOf<LearnedFixRecord>()
