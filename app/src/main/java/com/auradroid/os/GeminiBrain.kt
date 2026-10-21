@@ -54,6 +54,14 @@ class GeminiBrain(private var apiKey: String) {
 
     private val rateLock = Any()
 
+    // Parsed credentials (supports FreeLLMAPI key, Google AIza key, or both!)
+    @Volatile
+    private var freeLlmBaseUrl: String = "http://127.0.0.1:3001"
+    @Volatile
+    private var freeLlmApiKey: String = ""
+    @Volatile
+    private var googleGeminiKey: String = ""
+
     private val smartVisionLadder = listOf(
         "gemini-3.8-flash",
         "gemini-robotics-er-2-preview",
@@ -84,12 +92,72 @@ class GeminiBrain(private var apiKey: String) {
 
     var onBrainLog: ((String) -> Unit)? = null
 
+    init {
+        parseAndApplyKeyConfig(apiKey)
+    }
+
     fun updateApiKey(newKey: String) {
         apiKey = newKey.trim()
+        parseAndApplyKeyConfig(apiKey)
     }
+
+    /**
+     * Automatically detects:
+     * 1. FreeLLMAPI unified key ("freellma...")
+     * 2. Pasted "BASE_URL=http://localhost:3001 \n API_KEY=freellma..." block from /agents page
+     * 3. Standard Google Gemini key ("AIza...")
+     * 4. Both keys together (e.g., "freellma..., AIza...")
+     */
+    private fun parseAndApplyKeyConfig(rawInput: String) {
+        val raw = rawInput.trim()
+        var detectedFreeKey = ""
+        var detectedGoogleKey = ""
+        var detectedUrl = "http://127.0.0.1:3001"
+
+        // Check for custom URL in pasted text
+        val urlRegex = Regex("(https?://[^\\s\"'|,;]+)", RegexOption.IGNORE_CASE)
+        urlRegex.find(raw)?.groupValues?.get(1)?.let { foundUrl ->
+            detectedUrl = foundUrl
+                .replace("localhost", "127.0.0.1")
+                .trimEnd('/')
+                .removeSuffix("/v1")
+                .removeSuffix("/agents")
+                .removeSuffix("/models/chat")
+        }
+
+        // Extract FreeLLMAPI key if present
+        val freeKeyRegex = Regex("(freellma[a-zA-Z0-9_\\-]+)", RegexOption.IGNORE_CASE)
+        freeKeyRegex.find(raw)?.groupValues?.get(1)?.let {
+            detectedFreeKey = it.trim()
+        }
+
+        // Extract Google AI Studio key if present
+        val googleKeyRegex = Regex("(AIza[a-zA-Z0-9_\\-]{20,})")
+        googleKeyRegex.find(raw)?.groupValues?.get(1)?.let {
+            detectedGoogleKey = it.trim()
+        }
+
+        // Fallback if user pasted a custom key without standard prefix
+        if (detectedFreeKey.isEmpty() && detectedGoogleKey.isEmpty() && raw.isNotBlank()) {
+            if (raw.contains("3001") || raw.contains("freellm", ignoreCase = true) || !raw.startsWith("AIza")) {
+                val cleanedKey = raw.substringAfter("API_KEY=", raw).lineSequence().firstOrNull()?.trim() ?: raw
+                detectedFreeKey = cleanedKey
+            } else {
+                detectedGoogleKey = raw
+            }
+        }
+
+        freeLlmBaseUrl = detectedUrl
+        freeLlmApiKey = detectedFreeKey
+        googleGeminiKey = detectedGoogleKey
+    }
+
+    private fun isFreeLlmConfigured(): Boolean = freeLlmApiKey.isNotBlank()
+    private fun isGoogleGeminiConfigured(): Boolean = googleGeminiKey.isNotBlank()
 
     // 50% Half-Quota Safe RPM Limits (3.8-Flash = 5 RPM / 13s Pacer)
     private fun getMaxSafeRpmForModel(model: String): Int = when {
+        model.startsWith("freellmapi:") -> 30
         model.contains("3.8-flash") -> 5
         model.contains("robotics") -> 5
         model.contains("flash-lite") -> 6
@@ -99,6 +167,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     private fun getMinSafeGapMsForModel(model: String): Long = when {
+        model.startsWith("freellmapi:") -> 1_500L
         model.contains("3.8-flash") -> 13_000L
         model.contains("robotics") -> 12_000L
         model.contains("flash-lite") -> 10_000L
@@ -153,17 +222,28 @@ class GeminiBrain(private var apiKey: String) {
 
     fun getActiveModelListStatus(): String {
         val now = System.currentTimeMillis()
-        return smartVisionLadder.joinToString("\n") { m ->
-            val used = getUsedRpmInLastMinute(m, now)
-            val maxRpm = getMaxSafeRpmForModel(m)
-            val gapSec = getMinSafeGapMsForModel(m) / 1000L
-            val waitMs = getWaitTimeMsForModel(m, now)
-            when {
-                blockedModels.contains(m) -> "🚫 $m (Unavailable)"
-                waitMs > 0L -> "⏳ $m (Pacer ${(waitMs / 1000L).coerceAtLeast(1L)}s | $used/$maxRpm RPM | ${gapSec}s Gap)"
-                else -> "✅ $m (Ready | $used/$maxRpm Safe RPM | ${gapSec}s Gap)"
+        val lines = mutableListOf<String>()
+
+        if (isFreeLlmConfigured()) {
+            val used = getUsedRpmInLastMinute("freellmapi:auto", now)
+            lines.add("🚀 FreeLLMAPI Gateway ($freeLlmBaseUrl/v1 | Ready | $used RPM used)")
+        }
+
+        if (isGoogleGeminiConfigured() || !isFreeLlmConfigured()) {
+            smartVisionLadder.forEach { m ->
+                val used = getUsedRpmInLastMinute(m, now)
+                val maxRpm = getMaxSafeRpmForModel(m)
+                val gapSec = getMinSafeGapMsForModel(m) / 1000L
+                val waitMs = getWaitTimeMsForModel(m, now)
+                val status = when {
+                    blockedModels.contains(m) -> "🚫 $m (Unavailable)"
+                    waitMs > 0L -> "⏳ $m (Pacer ${(waitMs / 1000L).coerceAtLeast(1L)}s | $used/$maxRpm RPM | ${gapSec}s Gap)"
+                    else -> "✅ $m (Ready | $used/$maxRpm Safe RPM | ${gapSec}s Gap)"
+                }
+                lines.add(status)
             }
         }
+        return lines.joinToString("\n")
     }
 
     @Suppress("DEPRECATION")
@@ -177,45 +257,111 @@ class GeminiBrain(private var apiKey: String) {
         return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
     }
 
+    /**
+     * Strips <think>...</think> reasoning blocks (used by Nemotron / DeepSeek / Qwen on FreeLLMAPI)
+     * and safely extracts the balanced JSON object.
+     */
     private fun parseCleanJson(raw: String): JSONObject {
-        val cleaned = raw.replace("```json", "").replace("```", "").trim()
-        val body = cleaned.substringAfter("{").substringBeforeLast("}")
-        return JSONObject("{$body}")
+        val noThink = raw
+            .replace(Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("<think>[\\s\\S]*$", RegexOption.IGNORE_CASE), "")
+            .replace("```json", "")
+            .replace("```", "")
+            .trim()
+
+        val firstBrace = noThink.indexOf('{')
+        if (firstBrace == -1) return JSONObject()
+
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var endBrace = -1
+
+        for (i in firstBrace until noThink.length) {
+            val c = noThink[i]
+            if (escaped) {
+                escaped = false
+                continue
+            }
+            if (c == '\\' && inString) {
+                escaped = true
+                continue
+            }
+            if (c == '"') {
+                inString = !inString
+                continue
+            }
+            if (!inString) {
+                if (c == '{') depth++
+                else if (c == '}') {
+                    depth--
+                    if (depth == 0) {
+                        endBrace = i
+                        break
+                    }
+                }
+            }
+        }
+
+        val jsonCandidate = if (endBrace != -1) {
+            noThink.substring(firstBrace, endBrace + 1)
+        } else {
+            val body = noThink.substringAfter("{").substringBeforeLast("}")
+            "{$body}"
+        }
+        return JSONObject(jsonCandidate)
+    }
+
+    private fun buildFreeLlmGearCandidates(preferredGear: String): List<String> = when (preferredGear) {
+        "FAST_LITE", "GEMMA_TEXT" -> listOf("freellmapi:auto", "freellmapi:auto:fast")
+        "PRO_DEEP_DIAGNOSIS", "ROBOTICS_PRECISION", "COPILOT_38_ROBOTICS", "HEAVY_38_ONLY" ->
+            listOf("freellmapi:auto", "freellmapi:auto:smart")
+        else -> listOf("freellmapi:auto")
     }
 
     /**
-     * Work-Wise Smart Model Shifter:
-     * - First-Time Run / Unconfirmed Screen -> 3.8-Flash + Robotics-ER Co-Pilot (COPILOT_38_ROBOTICS)
-     * - Precision Icon / Coordinate -> Robotics-ER + 3.8-Flash (ROBOTICS_XY)
-     * - Fast Known Step -> Alternates 3.5-Flash-Lite & 3.1-Flash-Lite (FAST_LITE)
-     * - Text / Prompt / Casual -> Gemma-31B & 26B (GEMMA_TEXT)
+     * Work-Wise Smart Model Shifter
      */
     private fun buildSmartGearLadder(preferredGear: String, hasImages: Boolean, isStuck: Boolean): List<String> {
-        if (!hasImages && preferredGear == "GEMMA_TEXT") {
-            return gemmaCasualAndTextLadder + listOf("gemini-3.8-flash")
+        val freeLlmList = if (isFreeLlmConfigured()) buildFreeLlmGearCandidates(preferredGear) else emptyList()
+
+        // If user ONLY configured FreeLLMAPI (no Google AIza key), route 100% through FreeLLMAPI
+        if (isFreeLlmConfigured() && !isGoogleGeminiConfigured()) {
+            return freeLlmList
         }
-        if (isStuck) {
-            return listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+
+        val geminiList = if (!hasImages && preferredGear == "GEMMA_TEXT") {
+            gemmaCasualAndTextLadder + listOf("gemini-3.8-flash")
+        } else if (isStuck) {
+            listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+        } else {
+            when (preferredGear) {
+                "COPILOT_38_ROBOTICS" -> {
+                    fastRelayToggle = !fastRelayToggle
+                    val first = if (fastRelayToggle) "gemini-3.8-flash" else "gemini-robotics-er-2-preview"
+                    val second = if (fastRelayToggle) "gemini-robotics-er-2-preview" else "gemini-3.8-flash"
+                    listOf(first, second, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview")
+                }
+                "PRO_DEEP_DIAGNOSIS" -> listOf("gemini-3.1-pro-preview", "gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+                "ROBOTICS_PRECISION" -> listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+                "HEAVY_38_ONLY" -> listOf("gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+                "ROBOTICS_XY" -> listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+                "FAST_LITE" -> {
+                    fastRelayToggle = !fastRelayToggle
+                    val first = if (fastRelayToggle) "gemini-3.5-flash-lite" else "gemini-3.1-flash-lite"
+                    val second = if (fastRelayToggle) "gemini-3.1-flash-lite" else "gemini-3.5-flash-lite"
+                    if (hasImages) listOf(first, second, "gemini-robotics-er-2-preview", "gemini-3.8-flash")
+                    else listOf(first, second, "gemma-4-31b-it", "gemma-4-26b-a4b-it", "gemini-3.8-flash")
+                }
+                else -> smartVisionLadder
+            }
         }
-        return when (preferredGear) {
-            "COPILOT_38_ROBOTICS" -> {
-                fastRelayToggle = !fastRelayToggle
-                val first = if (fastRelayToggle) "gemini-3.8-flash" else "gemini-robotics-er-2-preview"
-                val second = if (fastRelayToggle) "gemini-robotics-er-2-preview" else "gemini-3.8-flash"
-                listOf(first, second, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview")
-            }
-            "PRO_DEEP_DIAGNOSIS" -> listOf("gemini-3.1-pro-preview", "gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
-            "ROBOTICS_PRECISION" -> listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
-            "HEAVY_38_ONLY" -> listOf("gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
-            "ROBOTICS_XY" -> listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
-            "FAST_LITE" -> {
-                fastRelayToggle = !fastRelayToggle
-                val first = if (fastRelayToggle) "gemini-3.5-flash-lite" else "gemini-3.1-flash-lite"
-                val second = if (fastRelayToggle) "gemini-3.1-flash-lite" else "gemini-3.5-flash-lite"
-                if (hasImages) listOf(first, second, "gemini-robotics-er-2-preview", "gemini-3.8-flash")
-                else listOf(first, second, "gemma-4-31b-it", "gemma-4-26b-a4b-it", "gemini-3.8-flash")
-            }
-            else -> smartVisionLadder
+
+        // If both keys are present: prioritize FreeLLMAPI for text/fast tasks and keep it as fallback for vision
+        return if (!hasImages) {
+            freeLlmList + geminiList
+        } else {
+            geminiList + freeLlmList
         }
     }
 
@@ -226,14 +372,18 @@ class GeminiBrain(private var apiKey: String) {
         preferredGear: String = if (useDeep38Flash) "COPILOT_38_ROBOTICS" else "FAST_LITE",
         isStuck: Boolean = false
     ): Pair<String, String> = withContext(Dispatchers.IO) {
-        if (apiKey.isBlank()) return@withContext Pair("", "No API Key")
+        if (!isFreeLlmConfigured() && !isGoogleGeminiConfigured()) {
+            return@withContext Pair("", "No API Key")
+        }
 
         val gearLadder = buildSmartGearLadder(preferredGear, imagesBase64.isNotEmpty(), isStuck)
             .filter { !blockedModels.contains(it) }
-            .ifEmpty { blockedModels.clear(); smartVisionLadder }
+            .ifEmpty {
+                blockedModels.clear()
+                if (isFreeLlmConfigured()) buildFreeLlmGearCandidates(preferredGear) else smartVisionLadder
+            }
 
         val now = System.currentTimeMillis()
-        // Filter out models that are locked in hard 429 cooldown so we don't hammer them every 1 second
         val nonCooldownModels = gearLadder.filter { !isModelInHard429Cooldown(it, now) }
         val activePool = nonCooldownModels.ifEmpty { gearLadder }
 
@@ -248,32 +398,39 @@ class GeminiBrain(private var apiKey: String) {
         for (model in orderedCandidates) {
             val loopNow = System.currentTimeMillis()
 
-            // Skip if this model is currently in a hard 429 cooldown and other models exist
             if (isModelInHard429Cooldown(model, loopNow) && orderedCandidates.size > 1) {
                 continue
             }
 
-            // Respect Pacer Wait inside the loop before firing ANY model
             val waitNeeded = getWaitTimeMsForModel(model, loopNow)
             if (waitNeeded > 0L) {
                 if (waitNeeded <= 15_000L) {
                     onBrainLog?.invoke("⏱️ Smart Quota Pacer: Waiting ${(waitNeeded / 1000L).coerceAtLeast(1L)}s for [$model]...")
                     delay(waitNeeded)
                 } else {
-                    // Too long to wait for this model; shift to next candidate immediately
+                    continue
+                }
+            }
+
+            val usedBefore = getUsedRpmInLastMinute(model)
+            recordModelRequestTimestamp(model)
+
+            if (model.startsWith("freellmapi:")) {
+                val routeMode = model.removePrefix("freellmapi:")
+                val freeResult = executeFreeLlmApiCall(routeMode, prompt, imagesBase64)
+                if (freeResult.first == 200 && freeResult.second.isNotBlank()) {
+                    return@withContext Pair(freeResult.second, freeResult.third)
+                } else {
+                    onBrainLog?.invoke("🔄 FreeLLMAPI [$routeMode] (${freeResult.first}) -> Trying next route...")
                     continue
                 }
             }
 
             val modelImages = if (model.startsWith("gemma")) emptyList() else imagesBase64
-            val usedBefore = getUsedRpmInLastMinute(model)
-            recordModelRequestTimestamp(model)
-
             val result = executeSingleModelCall(model, prompt, modelImages)
             when (result.first) {
                 200 -> if (result.second.isNotBlank()) return@withContext Pair(result.second, model)
                 429 -> {
-                    // Lock model for 65 seconds on 429 so background/next steps never hammer it 1s later!
                     val lockDuration = if (usedBefore <= 1) 120_000L else 65_000L
                     synchronized(rateLock) {
                         quotaCooldownModels[model] = System.currentTimeMillis() + lockDuration
@@ -297,9 +454,85 @@ class GeminiBrain(private var apiKey: String) {
         Pair("", "All models busy")
     }
 
+    /**
+     * Calls local FreeLLMAPI Gateway (http://127.0.0.1:3001/v1/chat/completions).
+     * Automatically falls back to XML/Text-only mode if the active free model does not accept images.
+     */
+    private fun executeFreeLlmApiCall(
+        routeModel: String,
+        prompt: String,
+        imagesBase64: List<String>
+    ): Triple<Int, String, String> {
+        val validImages = imagesBase64.filter { it.isNotBlank() }
+
+        if (validImages.isNotEmpty()) {
+            val visionAttempt = performOpenAiCompatibleRequest(routeModel, prompt, validImages)
+            if (visionAttempt.first == 200 && visionAttempt.second.isNotBlank()) {
+                return visionAttempt
+            }
+            onBrainLog?.invoke("ℹ️ FreeLLMAPI Vision unavailable on current model -> Using XML Nodes Text Mode...")
+        }
+
+        return performOpenAiCompatibleRequest(routeModel, prompt, emptyList())
+    }
+
+    private fun performOpenAiCompatibleRequest(
+        routeModel: String,
+        prompt: String,
+        imagesBase64: List<String>
+    ): Triple<Int, String, String> {
+        return try {
+            val endpoint = "$freeLlmBaseUrl/v1/chat/completions"
+            val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("Authorization", "Bearer $freeLlmApiKey")
+                connectTimeout = 10_000
+                readTimeout = 45_000
+                doOutput = true
+            }
+
+            val messageObj = JSONObject().apply {
+                put("role", "user")
+                if (imagesBase64.isEmpty()) {
+                    put("content", prompt)
+                } else {
+                    val contentArray = JSONArray()
+                    contentArray.put(JSONObject().put("type", "text").put("text", prompt))
+                    for (imgB64 in imagesBase64) {
+                        val imageUrlObj = JSONObject().put("url", "data:image/webp;base64,$imgB64")
+                        contentArray.put(JSONObject().put("type", "image_url").put("image_url", imageUrlObj))
+                    }
+                    put("content", contentArray)
+                }
+            }
+
+            val payload = JSONObject().apply {
+                put("model", routeModel)
+                put("temperature", 0.1)
+                put("messages", JSONArray().put(messageObj))
+            }
+
+            conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            if (code == 200) {
+                val rawResp = conn.inputStream.bufferedReader().readText()
+                val json = JSONObject(rawResp)
+                val actualModel = json.optString("model", routeModel).takeIf { it.isNotBlank() } ?: routeModel
+                val message = json.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
+                val text = message?.optString("content", "")?.trim() ?: ""
+                Triple(200, text, "FreeLLM[$actualModel]")
+            } else {
+                Triple(code, "", "FreeLLM[$routeModel]")
+            }
+        } catch (_: Exception) {
+            Triple(500, "", "FreeLLM[$routeModel]")
+        }
+    }
+
     private fun executeSingleModelCall(model: String, prompt: String, imagesBase64: List<String>): Pair<Int, String> {
         return try {
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey")
+            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$googleGeminiKey")
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 setRequestProperty("Content-Type", "application/json")
@@ -444,12 +677,10 @@ class GeminiBrain(private var apiKey: String) {
             val tagMatch = Regex("\\[(\\d+)]").find(sendButtonLine)
             val tagId = tagMatch?.groupValues?.get(1)?.toIntOrNull() ?: -1
 
-            // Extract exact center XY if bounds are present in the node line, else use standard bottom-sheet Send XY (500, 932)
             val xyMatch = Regex("\\((\\d+),\\s*(\\d+)\\)").find(sendButtonLine)
             val sendX = xyMatch?.groupValues?.get(1)?.toIntOrNull() ?: 500
             val sendY = xyMatch?.groupValues?.get(2)?.toIntOrNull() ?: 932
 
-            // If the very last step ALREADY tried CLICK_TAG on Send and the sheet is still open, force CLICK_XY!
             val alreadyTriedTag = lastStepText.contains("send") && lastStepText.contains("click_tag")
 
             onBrainLog?.invoke("✅ Click Confirmed: Friend selected & 'Send' button detected! Clicking 'Send' immediately...")
@@ -524,7 +755,6 @@ class GeminiBrain(private var apiKey: String) {
 
         val imgList = if (screenshotBitmap != null) listOf(bitmapToHdWebpBase64(screenshotBitmap)) else emptyList()
 
-        // Filter out any corrupted/poisoned skills before injecting into prompt
         val cleanFixes = recalledFixes.filter { isValidReusableSkill(it) }
         val sortedFixes = cleanFixes.sortedByDescending {
             it.sourceType.contains("PRO_ROBOTICS") || it.sourceType.contains("SKILL") || it.sourceType.contains("CHAT")
@@ -563,7 +793,7 @@ class GeminiBrain(private var apiKey: String) {
 
         val navTop = bodySpecs.screenHeight - bodySpecs.navBarHeight
         val prompt = """
-            You are AuraDroid OS Autonomous Vision + Click Confirmation Engine (Gemini 3.8 + Robotics Co-Pilot).
+            You are AuraDroid OS Autonomous Vision + Click Confirmation Engine (Gemini 3.8 + Robotics + FreeLLMAPI Co-Pilot).
             
             DEVICE BODY SPECS: ${bodySpecs.modelName} (${bodySpecs.screenWidth}x${bodySpecs.screenHeight} px), Safe Top Y>${bodySpecs.cutoutSafeTop}, Nav Y>$navTop
             OVERALL GOAL: $goal
@@ -679,7 +909,7 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        onBrainLog?.invoke("🧠 Stage 1/2 (Idle Audit): Gemini 3.1 Pro diagnosing steps & generalizing reusable skills...")
+        onBrainLog?.invoke("🧠 Stage 1/2 (Idle Audit): Diagnosing steps & generalizing reusable skills...")
         val (stage1Raw, stage1Model) = callWithLadder(
             prompt = stage1ProPrompt,
             imagesBase64 = imgsBase64,
@@ -721,7 +951,7 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        onBrainLog?.invoke("🦾 Stage 2/2 (Idle Audit): Gemini Robotics-ER measuring exact X,Y coordinates for reusable skills...")
+        onBrainLog?.invoke("🦾 Stage 2/2 (Idle Audit): Measuring exact X,Y coordinates for reusable skills...")
         val (raw, stage2Model) = callWithLadder(
             prompt = stage2RoboticsPrompt,
             imagesBase64 = imgsBase64,
@@ -736,7 +966,7 @@ class GeminiBrain(private var apiKey: String) {
 
         val combinedModelTag = "$stage1Model+$stage2Model"
         val extractedRules = mutableListOf<LearnedFixRecord>()
-        var summaryText = "3.1 Pro और Robotics ने हर स्टेप की जाँच करके Reusable Skills और सटीक XY कोऑर्डिनेट्स खुद लागू कर लिए हैं।"
+        var summaryText = "Autonomous Audit ने हर स्टेप की जाँच करके Reusable Skills और सटीक XY कोऑर्डिनेट्स खुद लागू कर लिए हैं।"
 
         try {
             val j = parseCleanJson(raw)
@@ -761,7 +991,7 @@ class GeminiBrain(private var apiKey: String) {
             }
         } catch (_: Exception) {}
 
-        onBrainLog?.invoke("✨ [$combinedModelTag] 40s Autonomous Audit Complete! Saved ${extractedRules.size} verified skills for $appCategory.")
+        onBrainLog?.invoke("✨ [$combinedModelTag] Autonomous Audit Complete! Saved ${extractedRules.size} verified skills for $appCategory.")
 
         return PostRunReflectionResult(
             reflectionSummary = summaryText,
@@ -892,9 +1122,6 @@ class GeminiBrain(private var apiKey: String) {
 
     /**
      * 6. Before + After Screenshot Human Touch Analyzer
-     * FIXED:
-     * - Never steals RPM quota while a live task is running!
-     * - Never saves garbage rules (@2131955775, "Chat not selected", or X=500 fallback) when models are busy!
      */
     suspend fun analyzeBeforeAfterHumanTouchWith38Flash(
         appCategory: String,
@@ -907,12 +1134,10 @@ class GeminiBrain(private var apiKey: String) {
     ): Pair<String, String> {
         val cleanDesc = clickedNodeDesc.trim()
 
-        // 1. Guard against agent self-touch / active live run quota starvation
         if (isLiveTaskCurrentlyRunning || (System.currentTimeMillis() - lastLiveStepTimestampMs) < 6_000L) {
             return Pair("", "")
         }
 
-        // 2. Guard against raw resource IDs (@213...) or person-specific chat rows ("Chat not selected")
         if (cleanDesc.startsWith("@") ||
             cleanDesc.contains("Chat not selected", ignoreCase = true) ||
             cleanDesc.contains("selected", ignoreCase = true) && (humanTapXRatio in 0.49f..0.51f)
@@ -941,7 +1166,6 @@ class GeminiBrain(private var apiKey: String) {
 
         val (raw, modelUsed) = callWithLadder(prompt, imgs, true, "ROBOTICS_PRECISION")
 
-        // 3. CRITICAL: If all models are busy or call failed, DO NOT save a fallback rule into Memory!
         if (modelUsed == "All models busy" || raw.isBlank()) {
             onBrainLog?.invoke("⏸️ Skipped Touch Skill save because models are cooling down.")
             return Pair("", "")
@@ -1015,7 +1239,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 8. Exact Topic Video Prompt + Viral YouTube Shorts Title Generator (Uses Gemma first!)
+     * 8. Exact Topic Video Prompt + Viral YouTube Shorts Title Generator
      */
     suspend fun generateFlowSafePromptAndTitle(topic: String): Pair<String, String> {
         val cleanTopic = topic.trim().ifEmpty { "Beautiful cinematic vertical video" }
