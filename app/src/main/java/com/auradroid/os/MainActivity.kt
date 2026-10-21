@@ -520,7 +520,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showChatMediaAttachMenu() {
-        val options = arrayOf(
+        val options: Array<CharSequence> = arrayOf(
             "🖼️ गैलरी से स्क्रीनशॉट/फोटो भेजें (1-2-3 पॉइंट लगाएं)",
             "📸 पिछले टास्क के स्क्रीनशॉट पर 1-2-3 पॉइंट लगाएं",
             "🎥 चैट में वीडियो (Screen Recording) भेजें & सुधारें",
@@ -535,15 +535,17 @@ class MainActivity : AppCompatActivity() {
                     2 -> startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply { type = "video/*" }, REQ_CHAT_PICK_VIDEO)
                     3 -> {
                         val vault = getActiveVault()
-                        val cats = vault.getAllCategoriesSummary().keys.toTypedArray()
-                        if (cats.isEmpty()) {
+                        val catNames: List<String> = vault.getAllCategoriesSummary().map { it.first }
+                        if (catNames.isEmpty()) {
                             Toast.makeText(this, "अभी कोई पुराना नियम नहीं है!", Toast.LENGTH_SHORT).show()
                         } else {
+                            val catItems: Array<CharSequence> = catNames.map { it as CharSequence }.toTypedArray()
                             darkDialogBuilder()
                                 .setTitle("किस ऐप के पुराने नियम हटाकर नए बनाने हैं?")
-                                .setItems(cats) { _, idx ->
-                                    vault.clearCategoryMemory(cats[idx])
-                                    addChatBubble("⚙️ Live Rule Engine", "✅ `${cats[idx]}` के पुराने नियम हटा दिए गए हैं! अब नए 1-2-3 पॉइंट दें।", false)
+                                .setItems(catItems) { _, idx ->
+                                    val chosenCat = catNames[idx]
+                                    vault.clearCategoryMemory(chosenCat)
+                                    addChatBubble("⚙️ Live Rule Engine", "✅ `$chosenCat` के पुराने नियम हटा दिए गए हैं! अब नए 1-2-3 पॉइंट दें।", false)
                                 }
                                 .show()
                         }
