@@ -54,7 +54,7 @@ class GeminiBrain(private var apiKey: String) {
 
     private val rateLock = Any()
 
-    // Parsed credentials (supports FreeLLMAPI key, Google AIza key, or both!)
+    // Supports FreeLLMAPI (localhost:3001), OmniRoute (localhost:20128), and Google Gemini (AIza...)
     @Volatile
     private var freeLlmBaseUrl: String = "http://127.0.0.1:3001"
     @Volatile
@@ -102,19 +102,24 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * Automatically detects:
-     * 1. FreeLLMAPI unified key ("freellma...")
-     * 2. Pasted "BASE_URL=http://localhost:3001 \n API_KEY=freellma..." block from /agents page
-     * 3. Standard Google Gemini key ("AIza...")
-     * 4. Both keys together (e.g., "freellma..., AIza...")
+     * Automatically pulls installed skills from AuraPluginStore (safe even if AuraPluginStore.kt is committed later)
      */
+    private fun fetchInstalledStoreSkills(): String {
+        return try {
+            val clazz = Class.forName("com.auradroid.os.AuraPluginStore")
+            val method = clazz.getMethod("getActiveSkillsForBrain")
+            (method.invoke(null) as? String) ?: ""
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
     private fun parseAndApplyKeyConfig(rawInput: String) {
         val raw = rawInput.trim()
         var detectedFreeKey = ""
         var detectedGoogleKey = ""
         var detectedUrl = "http://127.0.0.1:3001"
 
-        // Check for custom URL in pasted text
         val urlRegex = Regex("(https?://[^\\s\"'|,;]+)", RegexOption.IGNORE_CASE)
         urlRegex.find(raw)?.groupValues?.get(1)?.let { foundUrl ->
             detectedUrl = foundUrl
@@ -125,21 +130,18 @@ class GeminiBrain(private var apiKey: String) {
                 .removeSuffix("/models/chat")
         }
 
-        // Extract FreeLLMAPI key if present
-        val freeKeyRegex = Regex("(freellma[a-zA-Z0-9_\\-]+)", RegexOption.IGNORE_CASE)
+        val freeKeyRegex = Regex("((?:freellma|sk_omniroute|sk-)[a-zA-Z0-9_\\-]+)", RegexOption.IGNORE_CASE)
         freeKeyRegex.find(raw)?.groupValues?.get(1)?.let {
             detectedFreeKey = it.trim()
         }
 
-        // Extract Google AI Studio key if present
         val googleKeyRegex = Regex("(AIza[a-zA-Z0-9_\\-]{20,})")
         googleKeyRegex.find(raw)?.groupValues?.get(1)?.let {
             detectedGoogleKey = it.trim()
         }
 
-        // Fallback if user pasted a custom key without standard prefix
         if (detectedFreeKey.isEmpty() && detectedGoogleKey.isEmpty() && raw.isNotBlank()) {
-            if (raw.contains("3001") || raw.contains("freellm", ignoreCase = true) || !raw.startsWith("AIza")) {
+            if (raw.contains("3001") || raw.contains("20128") || raw.contains("freellm", ignoreCase = true) || !raw.startsWith("AIza")) {
                 val cleanedKey = raw.substringAfter("API_KEY=", raw).lineSequence().firstOrNull()?.trim() ?: raw
                 detectedFreeKey = cleanedKey
             } else {
@@ -155,7 +157,6 @@ class GeminiBrain(private var apiKey: String) {
     private fun isFreeLlmConfigured(): Boolean = freeLlmApiKey.isNotBlank()
     private fun isGoogleGeminiConfigured(): Boolean = googleGeminiKey.isNotBlank()
 
-    // 50% Half-Quota Safe RPM Limits (3.8-Flash = 5 RPM / 13s Pacer)
     private fun getMaxSafeRpmForModel(model: String): Int = when {
         model.startsWith("freellmapi:") -> 30
         model.contains("3.8-flash") -> 5
@@ -226,7 +227,7 @@ class GeminiBrain(private var apiKey: String) {
 
         if (isFreeLlmConfigured()) {
             val used = getUsedRpmInLastMinute("freellmapi:auto", now)
-            lines.add("🚀 FreeLLMAPI Gateway ($freeLlmBaseUrl/v1 | Ready | $used RPM used)")
+            lines.add("🚀 FreeLLM / OmniRoute ($freeLlmBaseUrl/v1 | Ready | $used RPM used)")
         }
 
         if (isGoogleGeminiConfigured() || !isFreeLlmConfigured()) {
@@ -257,10 +258,6 @@ class GeminiBrain(private var apiKey: String) {
         return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
     }
 
-    /**
-     * Strips <think>...</think> reasoning blocks (used by Nemotron / DeepSeek / Qwen on FreeLLMAPI)
-     * and safely extracts the balanced JSON object.
-     */
     private fun parseCleanJson(raw: String): JSONObject {
         val noThink = raw
             .replace(Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE), "")
@@ -319,13 +316,9 @@ class GeminiBrain(private var apiKey: String) {
         else -> listOf("freellmapi:auto")
     }
 
-    /**
-     * Work-Wise Smart Model Shifter
-     */
     private fun buildSmartGearLadder(preferredGear: String, hasImages: Boolean, isStuck: Boolean): List<String> {
         val freeLlmList = if (isFreeLlmConfigured()) buildFreeLlmGearCandidates(preferredGear) else emptyList()
 
-        // If user ONLY configured FreeLLMAPI (no Google AIza key), route 100% through FreeLLMAPI
         if (isFreeLlmConfigured() && !isGoogleGeminiConfigured()) {
             return freeLlmList
         }
@@ -357,7 +350,6 @@ class GeminiBrain(private var apiKey: String) {
             }
         }
 
-        // If both keys are present: prioritize FreeLLMAPI for text/fast tasks and keep it as fallback for vision
         return if (!hasImages) {
             freeLlmList + geminiList
         } else {
@@ -454,10 +446,6 @@ class GeminiBrain(private var apiKey: String) {
         Pair("", "All models busy")
     }
 
-    /**
-     * Calls local FreeLLMAPI Gateway (http://127.0.0.1:3001/v1/chat/completions).
-     * Automatically falls back to XML/Text-only mode if the active free model does not accept images.
-     */
     private fun executeFreeLlmApiCall(
         routeModel: String,
         prompt: String,
@@ -576,10 +564,6 @@ class GeminiBrain(private var apiKey: String) {
         return actionKeywords.none { lower.contains(it) }
     }
 
-    /**
-     * Filter out poisoned/broken rules (like @2131955775 or "Chat not selected" at X=500)
-     * so old poisoned Memory entries never hijack live runs!
-     */
     private fun isValidReusableSkill(fix: LearnedFixRecord): Boolean {
         val rule = fix.solutionRule
         if (rule.contains("@213") || rule.contains("Chat not selected", ignoreCase = true)) return false
@@ -588,7 +572,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 1. Task Decider & Modular Micro-Step Planner
+     * 1. Task Decider & Modular Micro-Step Planner (Automatically includes installed AuraStore skills!)
      */
     suspend fun chatAndBuildDetailedPlan(
         userMessage: String,
@@ -596,9 +580,12 @@ class GeminiBrain(private var apiKey: String) {
         userProfileRules: String
     ): JSONObject {
         val isCasual = isCasualGreetingOrChitchat(userMessage)
+        val storeSkills = fetchInstalledStoreSkills()
+        val combinedProfileAndStoreRules = "$userProfileRules\n$storeSkills".trim()
+
         val sysPrompt = """
             You are AuraDroid OS, an intelligent Hinglish AI Companion, Modular Skill Task Decider & Planner.
-            User's saved profile/rules: $userProfileRules
+            User's saved profile & Installed AuraStore Plugins: $combinedProfileAndStoreRules
             Recent conversation: $chatHistory
             User just said: "$userMessage"
             
@@ -608,7 +595,7 @@ class GeminiBrain(private var apiKey: String) {
             3. Run only when phone is free -> "executionMode": "IDLE_PHONE_MODE", "readyToExecute": true.
             4. Folder to YouTube -> "executionMode": "YOUTUBE_FOLDER_UPLOAD", "readyToExecute": true.
             5. Google Flow to YouTube -> "executionMode": "GOOGLE_FLOW_UPLOAD", "readyToExecute": true.
-            6. Background web mode -> "executionMode": "BACKGROUND_WEB", "readyToExecute": true.
+            6. Background web / OpenDots mode -> "executionMode": "BACKGROUND_WEB", "readyToExecute": true.
             7. For phone automation, break every action into SEPARATE, CONFIRMABLE micro-steps:
                - Never combine "Tap bottom search icon" and "Type query in top search bar" into one step! Make them 2 separate steps so each click is confirmed!
                - Never combine "Select friend" and "Tap bottom blue Send button" into one step! Make them 2 separate steps!
@@ -648,11 +635,6 @@ class GeminiBrain(private var apiKey: String) {
         }
     }
 
-    /**
-     * Pre/Post-Click Confirmation Engine:
-     * Inspects the live XML nodes and recent action history to CONFIRM whether a click succeeded
-     * and prevents repeating toggles (like selecting/unselecting Rahul on the Share sheet, or getting stuck on Send!).
-     */
     private fun checkDeterministicClickConfirmation(
         goal: String,
         currentStepHistory: List<String>,
@@ -662,7 +644,6 @@ class GeminiBrain(private var apiKey: String) {
         val lastStepText = currentStepHistory.lastOrNull()?.lowercase(Locale.ROOT) ?: ""
         val lines = numberedNodesList.lines()
 
-        // 1. SHARE SHEET SEND / SEND SEPARATELY CONFIRMATION:
         val sendButtonLine = lines.firstOrNull { line ->
             (line.contains("\"Send\"", ignoreCase = true) ||
                 line.contains("\"Send separately\"", ignoreCase = true) ||
@@ -704,7 +685,6 @@ class GeminiBrain(private var apiKey: String) {
             }
         }
 
-        // 2. POST-SEND COMPLETION CONFIRMATION:
         if (currentStepHistory.takeLast(2).any { it.contains("Tapping Send", ignoreCase = true) || it.contains("Send separately", ignoreCase = true) || it.contains("Send XY", ignoreCase = true) }) {
             val shareSheetStillOpen = lines.any {
                 it.contains("Write a message", ignoreCase = true) ||
@@ -720,9 +700,6 @@ class GeminiBrain(private var apiKey: String) {
         return null
     }
 
-    /**
-     * 2. Real-Time Vision + Click Confirmation + First-Time 3.8 & Robotics Co-Pilot + Cross-Task Skill Transfer
-     */
     suspend fun decideNextStep(
         goal: String,
         planSteps: List<String>,
@@ -736,7 +713,6 @@ class GeminiBrain(private var apiKey: String) {
     ): AgentStepDecision {
         isLiveTaskCurrentlyRunning = true
 
-        // RULE 1: Minimum 5-Second Phone & Internet Load Delay
         val now = System.currentTimeMillis()
         val elapsed = now - lastLiveStepTimestampMs
         if (lastLiveStepTimestampMs > 0L && elapsed in 1L..4_999L) {
@@ -746,7 +722,6 @@ class GeminiBrain(private var apiKey: String) {
         }
         lastLiveStepTimestampMs = System.currentTimeMillis()
 
-        // RULE 2: Deterministic Pre/Post-Click Confirmation Check
         if (!isContinuousMonitor) {
             checkDeterministicClickConfirmation(goal, currentStepHistory, numberedNodesList)?.let { confirmedDecision ->
                 return confirmedDecision
@@ -863,9 +838,6 @@ class GeminiBrain(private var apiKey: String) {
         }
     }
 
-    /**
-     * 3. 40-Second Idle-Only 2-Stage Autonomous Auditor & Universal Skill Extractor
-     */
     suspend fun autoReflectAndImproveAfterRun(
         appCategory: String,
         goal: String,
@@ -1008,9 +980,6 @@ class GeminiBrain(private var apiKey: String) {
         return Pair((x / 1000f).coerceIn(0.01f, 0.99f), (y / 1000f).coerceIn(0.01f, 0.99f))
     }
 
-    /**
-     * 4. Interactive Chat Inside Any Past Automation Run
-     */
     suspend fun chatAboutAutomationRunWith38Flash(
         runRecord: AutomationRunRecord,
         userCorrectionMessage: String,
@@ -1071,9 +1040,6 @@ class GeminiBrain(private var apiKey: String) {
         }
     }
 
-    /**
-     * 5. Interactive Chat Inside Any Uploaded Training Video
-     */
     suspend fun chatAboutTrainingVideoWith38Flash(
         videoSession: VideoTrainingSession,
         userMessage: String,
@@ -1120,9 +1086,6 @@ class GeminiBrain(private var apiKey: String) {
         }
     }
 
-    /**
-     * 6. Before + After Screenshot Human Touch Analyzer
-     */
     suspend fun analyzeBeforeAfterHumanTouchWith38Flash(
         appCategory: String,
         goal: String,
@@ -1186,9 +1149,6 @@ class GeminiBrain(private var apiKey: String) {
         }
     }
 
-    /**
-     * 7. Frame-by-Frame Uploaded Video Analyzer
-     */
     suspend fun analyzeTrainingVideoFrames(
         appCategory: String,
         userInstruction: String,
@@ -1238,9 +1198,6 @@ class GeminiBrain(private var apiKey: String) {
         return extracted
     }
 
-    /**
-     * 8. Exact Topic Video Prompt + Viral YouTube Shorts Title Generator
-     */
     suspend fun generateFlowSafePromptAndTitle(topic: String): Pair<String, String> {
         val cleanTopic = topic.trim().ifEmpty { "Beautiful cinematic vertical video" }
         val prompt = """
