@@ -9,6 +9,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -38,6 +39,7 @@ import android.view.animation.LinearInterpolator
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -53,6 +55,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -105,6 +108,11 @@ class MainActivity : AppCompatActivity() {
     private var isDesktopMode = false
     private val downloadedFilesLog = mutableListOf<String>()
 
+    // OpenDots-style Invisible Background Web-Container ("App inside App")
+    private var backgroundDotWebView: WebView? = null
+    private var currentDotTaskTitle: String = "Ready (Idle)"
+    private var currentDotStatusLog: String = "कोई भी वेबसाइट या टास्क बैकग्राउंड में चलाएं"
+
     private lateinit var memoryCategoriesLayout: LinearLayout
     private lateinit var automationRunsListLayout: LinearLayout
     private lateinit var videoSessionsListLayout: LinearLayout
@@ -119,6 +127,154 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var localVault: MemoryVault
     private lateinit var localBrain: GeminiBrain
+
+    // Modular Feature Store Data Models
+    enum class PluginAccessType(val label: String) {
+        BRAIN_SKILL("🧠 AI Brain Sub-Agent & Prompt Skill"),
+        BACKGROUND_DOT("🟣 OpenDots Background PC (Watch Live)"),
+        STORAGE_FOLDER("📁 Auto Folder Watcher & Media Access"),
+        MICROPHONE_VOICE("🎙️ Real-Time Voice & Mic Access"),
+        LOCAL_GATEWAY("🔓 Localhost:3001 / OmniRoute Gateway"),
+        ACCESSIBILITY_UI("📱 Live Phone UI Auto-Touch Access"),
+        PUBLIC_DATA_API("🌍 Free Public APIs & Web Research")
+    }
+
+    data class AuraStoreModule(
+        val id: String,
+        val title: String,
+        val badge: String,
+        val repoSource: String,
+        val descHinglish: String,
+        val accessTypes: List<PluginAccessType>,
+        val skillRuleForBrain: String,
+        val quickLaunchUrl: String = "",
+        val sampleChatCommand: String = ""
+    )
+
+    private val storeCatalog: List<AuraStoreModule> = listOf(
+        AuraStoreModule(
+            id = "freellm_omniroute_9b",
+            title = "9B Free Token Booster (FreeLLM + OmniRoute)",
+            badge = "🔥 9B TOKENS",
+            repoSource = "tashfeenahmed/freellmapi + diegosouzapw/OmniRoute",
+            descHinglish = "हर महीने 9 Billion+ फ्री टोकन्स! एक मॉडल का कोटा खत्म होते ही खुद दूसरे फ्री प्रोवाइडर (Nemotron, Dots, Qwen, DeepSeek) पर शिफ्ट हो जाता है।",
+            accessTypes = listOf(PluginAccessType.LOCAL_GATEWAY, PluginAccessType.BRAIN_SKILL),
+            skillRuleForBrain = "[9B_TOKEN_ROUTER]: Route seamlessly across FreeLLMAPI (localhost:3001) and OmniRoute pools with zero quota downtime.",
+            quickLaunchUrl = "http://localhost:3001/models/chat",
+            sampleChatCommand = "Check FreeLLM status and plan a fast Instagram task"
+        ),
+        AuraStoreModule(
+            id = "opendots_bg_pc",
+            title = "OpenDots Background PC (App के अंदर App)",
+            badge = "🟣 BACKGROUND PC",
+            repoSource = "CopilotKit/OpenDots",
+            descHinglish = "हर AI एजेंट को अपना खुद का अलग बैकग्राउंड कंप्यूटर/ब्राउज़र (Dot) देता है। आप फोन नॉर्मल चलाओ, AI पीछे काम करेगा। जब चाहो 'Watch Live' या 'Take Control' दबाओ!",
+            accessTypes = listOf(PluginAccessType.BACKGROUND_DOT, PluginAccessType.BRAIN_SKILL),
+            skillRuleForBrain = "[OPENDOTS_BACKGROUND_PC]: For web studio, research, or generator tasks, prefer executionMode 'BACKGROUND_WEB' so it runs invisibly inside the OpenDots Background PC.",
+            quickLaunchUrl = "https://studio.youtube.com",
+            sampleChatCommand = "Background Dot me YouTube Studio kholo"
+        ),
+        AuraStoreModule(
+            id = "hermes_agenttube_yt",
+            title = "Hermes + AgentTube YouTube Auto-Uploader",
+            badge = "🎬 YOUTUBE 24/7",
+            repoSource = "Hermes CDP + darkzOGx/youtube-automation-agent",
+            descHinglish = "फोल्डर से अपने-आप अन-पोस्टेड वीडियो उठाता है, ऑडियो और ऑन-स्क्रीन टेक्स्ट पढ़कर वायरल Title/Tags लिखता है, और बैकग्राउंड में YouTube Studio UI से पब्लिश कर देता है!",
+            accessTypes = listOf(PluginAccessType.STORAGE_FOLDER, PluginAccessType.BACKGROUND_DOT, PluginAccessType.ACCESSIBILITY_UI),
+            skillRuleForBrain = "[HERMES_YT_PIPELINE]: 1. Pick unposted video from folder. 2. Analyze audio & on-screen text. 3. Generate viral Hinglish Title, Description & Tags. 4. Upload via YouTube Studio UI, click 'Publish anyway' on check dialog, and verify playback.",
+            quickLaunchUrl = "https://studio.youtube.com",
+            sampleChatCommand = "Folder se 1 video utha kar YouTube Shorts par viral title ke sath upload karo"
+        ),
+        AuraStoreModule(
+            id = "ruflo_adk_swarm",
+            title = "Ruflo 60-Agent Swarm + Google ADK Hierarchy",
+            badge = "🐝 60+ AGENTS",
+            repoSource = "ruvnet/ruflo + Google ADK (agents-cli)",
+            descHinglish = "एक अकेले AI के बजाय Queen Agent + Sub-Agents की टीम बनाता है (Researcher, Planner, Executor, Auditor)। आसान काम हल्के मॉडल को और मुश्किल काम बड़े मॉडल को देता है!",
+            accessTypes = listOf(PluginAccessType.BRAIN_SKILL),
+            skillRuleForBrain = "[RUFLO_ADK_SWARM]: Act as Queen Orchestrator. Decompose tasks into specialized Sub-Agent micro-steps ([FAST_LITE] for simple steps, [ROBOTICS_XY] for spatial clicks, [DEEP_3.8] for verification).",
+            sampleChatCommand = "Ruflo Swarm use karke Instagram par trending reel search, like aur Rahul ko share karo"
+        ),
+        AuraStoreModule(
+            id = "moneyprinter_hypit_viral",
+            title = "MoneyPrinterTurbo + Hypit Viral Video Cloner",
+            badge = "💸 VIRAL FACTORY",
+            repoSource = "harry0703/MoneyPrinterTurbo + hypit-ai/hypit",
+            descHinglish = "सिर्फ एक टॉपिक दो या कोई 1M+ व्यूज वाली वायरल रील दो—यह उसका पूरा वर्कफ़्लो, स्क्रिप्ट, हुक, B-Roll और कराओके सबटाइटल्स क्लोन करके नए वायरल Shorts तैयार कर देगा!",
+            accessTypes = listOf(PluginAccessType.STORAGE_FOLDER, PluginAccessType.BRAIN_SKILL),
+            skillRuleForBrain = "[MONEYPRINTER_HYPIT]: When creating or cloning a video, build a 3-second viral hook, scene-by-scene B-roll prompts, karaoke subtitle blocks, and high-CTR title.",
+            sampleChatCommand = "AI Facts topic par ek viral YouTube Short ki script, B-roll prompt aur title banao"
+        ),
+        AuraStoreModule(
+            id = "open_gen_ai_studio",
+            title = "Open Generative AI Studio (Qwen, Wan, MiniMax, Synthesia)",
+            badge = "🎨 400+ MODELS",
+            repoSource = "Anil-matcha/Open-Generative-AI + Qwen Image + Wan AI + MiniMax H3",
+            descHinglish = "Midjourney और Runway के पैसे बचाओ! ऐप के बैकग्राउंड में फ्री में Qwen Image, Wan AI Video, MiniMax H3 और Synthesia से अनलिमिटेड इमेज और वीडियो बनवाओ।",
+            accessTypes = listOf(PluginAccessType.BACKGROUND_DOT, PluginAccessType.BRAIN_SKILL),
+            skillRuleForBrain = "[OPEN_GEN_STUDIO]: Use free generative web studios (Qwen Image, Wan AI, MiniMax H3, Synthesia, Google Flow) in Background Dot to generate 8k images and 9:16 videos.",
+            quickLaunchUrl = "https://chat.qwen.ai",
+            sampleChatCommand = "Qwen AI par ek cinematic 9:16 poster image generate karo"
+        ),
+        AuraStoreModule(
+            id = "heygem_comfy_avatar",
+            title = "HeyGem Talking Avatar + ComfyUI Workflow Builder",
+            badge = "🎭 AI AVATAR",
+            repoSource = "suifeng9203/HeyGem.ai + Comfy-Org/ComfyUI",
+            descHinglish = "HeyGen ($29/mo) का फ्री ओपन-सोर्स वर्ज़न! आपके चेहरे और आवाज़ को क्लोन करके Talking-Head Avatar वीडियो और विजुअल इमेज पाइपलाइन बनाता है।",
+            accessTypes = listOf(PluginAccessType.STORAGE_FOLDER, PluginAccessType.BACKGROUND_DOT, PluginAccessType.BRAIN_SKILL),
+            skillRuleForBrain = "[HEYGEM_AVATAR]: Design talking-head avatar scripts with natural lip-sync pacing and ComfyUI visual node prompts.",
+            sampleChatCommand = "Mere AI Avatar ke liye 30 second ki tech reel script likho"
+        ),
+        AuraStoreModule(
+            id = "omnivoice_handy_voice",
+            title = "OmniVoice + Handy Real-Time Voice Companion",
+            badge = "🎙️ VOICE CLONE",
+            repoSource = "k2-fsa/OmniVoice + cjpais/Handy",
+            descHinglish = "ElevenLabs और Wispr Flow का फ्री विकल्प! आपकी आवाज़ सुनकर तुरंत एक्शन लेता है और इंसानों जैसी इमोशनल टोन में बात करता है।",
+            accessTypes = listOf(PluginAccessType.MICROPHONE_VOICE, PluginAccessType.BRAIN_SKILL),
+            skillRuleForBrain = "[OMNIVOICE_HANDY]: Reply with natural, human-like emotional intonation and conversational warmth.",
+            sampleChatCommand = "Voice mode me mujhse ek dost ki tarah baat karo"
+        ),
+        AuraStoreModule(
+            id = "adhd_no_ai_slop",
+            title = "50% Token Saver & Human Writer (ADHD + No AI Slop)",
+            badge = "⚡ 2X SPEED",
+            repoSource = "ayghri/i-have-adhd + petergyang/no-ai-slop",
+            descHinglish = "AI की फालतू बातें ('I hope this helps') और 20+ बनावटी आदतें हटाता है। सीधा पॉइंट-टू-पॉइंट जवाब देता है जिससे 50% टोकन्स बचते हैं!",
+            accessTypes = listOf(PluginAccessType.BRAIN_SKILL),
+            skillRuleForBrain = "[ADHD_NO_SLOP]: Be ultra-concise, direct, and numbered. Eliminate all generic AI filler phrases or dramatic intros."
+        ),
+        AuraStoreModule(
+            id = "open_notebook_book_skill",
+            title = "Open Notebook + Book-to-Skill PDF Research Brain",
+            badge = "📚 PDF BRAIN",
+            repoSource = "lfnovo/open-notebook + virgiliojr94/book-to-skill",
+            descHinglish = "Google NotebookLM का प्राइवेट वर्ज़न! किसी भी 400-पेज की PDF, वेबसाइट या नोट्स को छोटे-छोटे AI Skills में बदल देता है ताकि टोकन खर्च न हों।",
+            accessTypes = listOf(PluginAccessType.STORAGE_FOLDER, PluginAccessType.BRAIN_SKILL),
+            skillRuleForBrain = "[BOOK_TO_SKILL]: Distill large notes or documents into modular chapter skills and recall only the relevant rule."
+        ),
+        AuraStoreModule(
+            id = "openseo_job_assistant",
+            title = "OpenSEO (Free Semrush) + AI Job & Resume Assistant",
+            badge = "🔍 SEO & JOBS",
+            repoSource = "every-app/open-seo + MadsLorentzen/ai-job-search",
+            descHinglish = "आपके YouTube/Web के लिए हाई-रैंकिंग कीवर्ड्स व SEO ऑडिट करता है, और किसी भी जॉब के हिसाब से आपका Resume/Cover Letter तैयार करता है।",
+            accessTypes = listOf(PluginAccessType.PUBLIC_DATA_API, PluginAccessType.BRAIN_SKILL),
+            skillRuleForBrain = "[OPENSEO_JOB_AGENT]: Perform deep keyword/competitor SEO optimization for titles/tags and tailor resumes to job descriptions.",
+            sampleChatCommand = "Mere YouTube channel ke liye top 10 low-competition viral AI keywords batao"
+        ),
+        AuraStoreModule(
+            id = "strix_security_public_apis",
+            title = "Strix AI Security Hacker + 4.8L Free Public APIs",
+            badge = "🛡️ 4.8L APIs",
+            repoSource = "usestrix/strix + public-apis/public-apis",
+            descHinglish = "आपके कोड की कमियाँ (Vulnerabilities) असली हैकर्स की तरह ढूँढकर ठीक करता है, और दुनिया की 4.8 लाख+ फ्री APIs (मौसम, क्रिप्टो, NASA, न्यूज़) जोड़ता है!",
+            accessTypes = listOf(PluginAccessType.PUBLIC_DATA_API, PluginAccessType.BRAIN_SKILL),
+            skillRuleForBrain = "[STRIX_PUBLIC_APIS]: Audit apps/workflows for security flaws and leverage free public REST APIs for live data.",
+            quickLaunchUrl = "https://github.com/public-apis/public-apis"
+        )
+    )
 
     companion object {
         private const val REQ_VOICE_INPUT = 201
@@ -154,28 +310,42 @@ class MainActivity : AppCompatActivity() {
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(14), dp(16), dp(12))
+            setPadding(dp(14), dp(12), dp(14), dp(10))
             setBackgroundColor(Color.parseColor("#181B20"))
         }
 
         val titleView = TextView(this).apply {
             text = "AuraDroid OS"
             setTextColor(textPureWhite)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 19f)
             typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val storeHeaderBtn = TextView(this).apply {
+            text = "🧩 Store"
+            setTextColor(textPureWhite)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            background = roundedBox(accentPurple, dp(14))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(6) }
+            setOnClickListener { showModularFeatureStoreDialog() }
         }
 
         val quickLogsBtn = TextView(this).apply {
             text = "📜 Logs"
             setTextColor(textPureWhite)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             setPadding(dp(10), dp(6), dp(10), dp(6))
             background = roundedBox(Color.parseColor("#262B36"), dp(14), borderSubtle)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { marginEnd = dp(8) }
+            ).apply { marginEnd = dp(6) }
             setOnClickListener {
                 switchTab(4)
                 refreshEngineTabDetails()
@@ -184,14 +354,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         serviceBadge = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setPadding(dp(12), dp(6), dp(12), dp(6))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
             background = roundedBox(Color.parseColor("#222630"), dp(16), borderSubtle)
             setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
         }
         refreshServiceBadge()
 
         header.addView(titleView)
+        header.addView(storeHeaderBtn)
         header.addView(quickLogsBtn)
         header.addView(serviceBadge)
 
@@ -264,6 +435,353 @@ class MainActivity : AppCompatActivity() {
         return AlertDialog.Builder(this)
     }
 
+    // =========================================================================
+    // 🧩 AURASTORE (1-TAP FEATURE INSTALLER) & 🟣 OPENDOTS BACKGROUND PC ENGINE
+    // =========================================================================
+
+    private fun getInstalledPluginIds(): Set<String> {
+        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+        return prefs.getStringSet(
+            "installed_store_plugins",
+            setOf("freellm_omniroute_9b", "opendots_bg_pc", "adhd_no_ai_slop")
+        ) ?: setOf("freellm_omniroute_9b", "opendots_bg_pc", "adhd_no_ai_slop")
+    }
+
+    private fun isStoreModuleInstalled(moduleId: String): Boolean {
+        return getInstalledPluginIds().contains(moduleId)
+    }
+
+    private fun buildActiveInstalledSkillsPrompt(): String {
+        val installedIds = getInstalledPluginIds()
+        val activeModules = storeCatalog.filter { installedIds.contains(it.id) }
+        if (activeModules.isEmpty()) return ""
+        return "\n[ACTIVE INSTALLED AURASTORE MODULES (${activeModules.size})]:\n" +
+            activeModules.joinToString("\n") { "• ${it.skillRuleForBrain}" }
+    }
+
+    private fun installStoreModuleAndUnlockAccess(module: AuraStoreModule, onDone: () -> Unit) {
+        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+        val current = getInstalledPluginIds().toMutableSet()
+        current.add(module.id)
+        prefs.edit().putStringSet("installed_store_plugins", current).apply()
+
+        for (access in module.accessTypes) {
+            when (access) {
+                PluginAccessType.MICROPHONE_VOICE -> {
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1001)
+                    }
+                }
+                PluginAccessType.STORAGE_FOLDER -> {
+                    requestStoragePermissionsOnDemand()
+                }
+                PluginAccessType.BACKGROUND_DOT -> {
+                    ensureBackgroundDotInitialized(module.quickLaunchUrl.ifEmpty { "https://www.google.com" })
+                }
+                PluginAccessType.ACCESSIBILITY_UI -> {
+                    if (AutoTouchService.instance == null) {
+                        Toast.makeText(this, "Live UI टैप के लिए Accessibility ऑन करें", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                else -> {}
+            }
+        }
+
+        val unlockedText = module.accessTypes.joinToString(", ") { it.label }
+        Toast.makeText(this, "✅ '${module.title}' Installed!\n🔓 Unlocked: $unlockedText", Toast.LENGTH_LONG).show()
+        onDone()
+    }
+
+    private fun uninstallStoreModule(moduleId: String, onDone: () -> Unit) {
+        val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+        val current = getInstalledPluginIds().toMutableSet()
+        current.remove(moduleId)
+        prefs.edit().putStringSet("installed_store_plugins", current).apply()
+        Toast.makeText(this, "🗑️ Feature Removed", Toast.LENGTH_SHORT).show()
+        onDone()
+    }
+
+    private fun ensureBackgroundDotInitialized(initialUrl: String = "https://www.google.com"): WebView {
+        if (backgroundDotWebView == null) {
+            backgroundDotWebView = WebView(applicationContext).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.databaseEnabled = true
+                settings.mediaPlaybackRequiresUserGesture = false
+                settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                settings.userAgentString =
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                CookieManager.getInstance().setAcceptCookie(true)
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                webChromeClient = WebChromeClient()
+                webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        currentDotStatusLog = "✅ Background Dot Active: ${url?.take(55) ?: ""}"
+                        CookieManager.getInstance().flush()
+                    }
+                }
+                if (initialUrl.isNotBlank()) loadUrl(initialUrl)
+            }
+        } else if (initialUrl.isNotBlank() && backgroundDotWebView?.url.isNullOrBlank()) {
+            backgroundDotWebView?.loadUrl(initialUrl)
+        }
+        return backgroundDotWebView!!
+    }
+
+    private fun launchInBackgroundDot(taskTitle: String, url: String) {
+        val wv = ensureBackgroundDotInitialized(url)
+        currentDotTaskTitle = taskTitle
+        currentDotStatusLog = "🚀 Running '$taskTitle' in Background Dot..."
+        wv.loadUrl(url)
+    }
+
+    private fun showOpenDotsLiveViewerDialog(initialUrl: String = "") {
+        val wv = ensureBackgroundDotInitialized(initialUrl.ifEmpty { "https://studio.youtube.com" })
+        if (initialUrl.isNotBlank()) wv.loadUrl(initialUrl)
+        (wv.parent as? ViewGroup)?.removeView(wv)
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bgMatteDark)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }
+
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(8))
+            setBackgroundColor(cardSlate)
+        }
+
+        val titleTv = TextView(this).apply {
+            text = "🟣 OpenDots Background PC — Watch Live & Take Control"
+            setTextColor(textPureWhite)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+            typeface = Typeface.DEFAULT_BOLD
+        }
+
+        val statusTv = TextView(this).apply {
+            text = currentDotStatusLog
+            setTextColor(accentEmerald)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, dp(2), 0, dp(6))
+        }
+
+        val quickRowScroll = HorizontalScrollView(this)
+        val quickRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+
+        fun addQuickDotBtn(label: String, color: Int, targetUrl: String) {
+            quickRow.addView(createPrimaryButton(label, color) {
+                currentDotTaskTitle = label
+                wv.loadUrl(targetUrl)
+                statusTv.text = "⏳ Loading $label in Background Dot..."
+            }.apply {
+                setPadding(dp(10), dp(6), dp(10), dp(6))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { marginEnd = dp(6) }
+            })
+        }
+
+        addQuickDotBtn("🎬 YT Studio", Color.parseColor("#DC2626"), "https://studio.youtube.com")
+        addQuickDotBtn("🔓 FreeLLM :3001", accentPurple, "http://localhost:3001/models/chat")
+        addQuickDotBtn("🎨 Qwen Image", accentRoyalBlue, "https://chat.qwen.ai")
+        addQuickDotBtn("🌊 Google Flow", Color.parseColor("#0D9488"), "https://labs.google/fx/tools/flow")
+        addQuickDotBtn("🎥 Synthesia", Color.parseColor("#475569"), "https://www.synthesia.io/features/text-to-video")
+
+        quickRowScroll.addView(quickRow)
+        topBar.addView(titleTv)
+        topBar.addView(statusTv)
+        topBar.addView(quickRowScroll)
+
+        val webFrame = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(430), 1f)
+        }
+        webFrame.addView(
+            wv,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        root.addView(topBar)
+        root.addView(webFrame)
+
+        val dlg = darkDialogBuilder()
+            .setView(root)
+            .setPositiveButton("⬇️ Keep Running in Background") { d, _ ->
+                Toast.makeText(this, "🟣 Background Dot पीछे चुपचाप चलता रहेगा!", Toast.LENGTH_SHORT).show()
+                d.dismiss()
+            }
+            .setOnDismissListener {
+                (wv.parent as? ViewGroup)?.removeView(wv)
+            }
+            .create()
+
+        dlg.show()
+    }
+
+    private fun showModularFeatureStoreDialog() {
+        val scroll = ScrollView(this).apply { setBackgroundColor(bgMatteDark) }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(24))
+        }
+        scroll.addView(container)
+
+        lateinit var renderStoreCards: () -> Unit
+
+        val storeDialog = darkDialogBuilder()
+            .setView(scroll)
+            .setPositiveButton("Done", null)
+            .create()
+
+        renderStoreCards = {
+            container.removeAllViews()
+            val installedCount = getInstalledPluginIds().size
+
+            container.addView(TextView(this).apply {
+                text = "🧩 AuraStore — 1-Tap AI Feature Installer ($installedCount/${storeCatalog.size} Active)"
+                setTextColor(textPureWhite)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 17.5f)
+                typeface = Typeface.DEFAULT_BOLD
+            })
+
+            container.addView(TextView(this).apply {
+                text = "आपके भेजे गए सारे 14 Videos + 11 Photos के टूल्स यहाँ मौजूद हैं। जो फीचर चाहिए बस Install पर टैप करें—उसका Access Type और AI पावर अपने-आप ऐप में जुड़ जाएगा!"
+                setTextColor(textMuted)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                setPadding(0, dp(4), 0, dp(12))
+            })
+
+            val topActionsRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, 0, 0, dp(10))
+            }
+
+            topActionsRow.addView(createPrimaryButton("🟣 OpenDots Live PC", accentPurple) {
+                storeDialog.dismiss()
+                showOpenDotsLiveViewerDialog()
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+            })
+
+            topActionsRow.addView(createPrimaryButton("⚡ Install All 12", accentEmerald) {
+                val allIds = storeCatalog.map { it.id }.toSet()
+                getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+                    .edit()
+                    .putStringSet("installed_store_plugins", allIds)
+                    .apply()
+                ensureBackgroundDotInitialized("https://www.google.com")
+                Toast.makeText(this, "🔥 सारे 12 सुपर-फीचर्स और AI Skills अनलॉक हो गए!", Toast.LENGTH_LONG).show()
+                renderStoreCards()
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+
+            container.addView(topActionsRow)
+
+            for (module in storeCatalog) {
+                val installed = isStoreModuleInstalled(module.id)
+                val card = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(14), dp(12), dp(14), dp(12))
+                    background = roundedBox(
+                        if (installed) Color.parseColor("#132A1E") else cardSlate,
+                        dp(14),
+                        if (installed) accentEmerald else borderSubtle
+                    )
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { bottomMargin = dp(12) }
+                }
+
+                card.addView(TextView(this).apply {
+                    text = "${module.badge}  •  📦 ${module.repoSource}"
+                    setTextColor(Color.parseColor("#38BDF8"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    typeface = Typeface.DEFAULT_BOLD
+                })
+
+                card.addView(TextView(this).apply {
+                    text = module.title
+                    setTextColor(textPureWhite)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 15.5f)
+                    typeface = Typeface.DEFAULT_BOLD
+                    setPadding(0, dp(4), 0, dp(4))
+                })
+
+                card.addView(TextView(this).apply {
+                    text = module.descHinglish
+                    setTextColor(Color.parseColor("#E2E8F0"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                })
+
+                card.addView(TextView(this).apply {
+                    text = "🔓 Access Type:\n" + module.accessTypes.joinToString("\n") { "  • ${it.label}" }
+                    setTextColor(accentAmber)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    setPadding(0, dp(8), 0, dp(10))
+                })
+
+                val btnRow = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.END
+                }
+
+                if (installed && (module.quickLaunchUrl.isNotBlank() || module.sampleChatCommand.isNotBlank())) {
+                    btnRow.addView(createPrimaryButton("⚡ Use Now", accentRoyalBlue) {
+                        storeDialog.dismiss()
+                        if (module.quickLaunchUrl.isNotBlank()) {
+                            launchInBackgroundDot(module.title, module.quickLaunchUrl)
+                            showOpenDotsLiveViewerDialog(module.quickLaunchUrl)
+                        } else if (module.sampleChatCommand.isNotBlank()) {
+                            switchTab(0)
+                            chatInputBox.setText(module.sampleChatCommand)
+                            handleUserChatMessage(module.sampleChatCommand, chatScrollView)
+                        }
+                    }.apply {
+                        setPadding(dp(12), dp(8), dp(12), dp(8))
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                        layoutParams = LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT
+                        ).apply { marginEnd = dp(8) }
+                    })
+                }
+
+                btnRow.addView(createPrimaryButton(
+                    if (installed) "✅ Installed (Remove)" else "⬇️ Install & Unlock Access",
+                    if (installed) Color.parseColor("#15803D") else accentEmerald
+                ) {
+                    if (installed) {
+                        uninstallStoreModule(module.id, renderStoreCards)
+                    } else {
+                        installStoreModuleAndUnlockAccess(module, renderStoreCards)
+                    }
+                }.apply {
+                    setPadding(dp(12), dp(8), dp(12), dp(8))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                })
+
+                card.addView(btnRow)
+                container.addView(card)
+            }
+        }
+
+        renderStoreCards()
+        storeDialog.show()
+    }
+
+    // =========================================================================
+
     private fun getActiveBrain(): GeminiBrain {
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
         val savedKey = prefs.getString("gemini_api_key", "") ?: ""
@@ -273,10 +791,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun getActiveVault(): MemoryVault = AutoTouchService.instance?.memoryVault ?: localVault
 
-    /**
-     * Guard helper: Checks whether an AI reply or LearnedFixRecord is clean and verified
-     * (Prevents saving "All models busy", "@213...", or "Chat not selected" garbage into MemoryVault)
-     */
     private fun isValidBrainReply(replyObj: MemoryChatReply): Boolean {
         if (replyObj.modelUsed.contains("All models busy", ignoreCase = true) ||
             replyObj.modelUsed.contains("No API Key", ignoreCase = true)
@@ -295,9 +809,6 @@ class MainActivity : AppCompatActivity() {
             r.contains("All models busy", ignoreCase = true)
     }
 
-    /**
-     * Cleans only poisoned/corrupted auto-learned entries from a category while preserving good rules!
-     */
     private fun purgePoisonedRulesFromCategory(category: String): Int {
         val vault = getActiveVault()
         val allFixes = vault.recallFixesForApp(category)
@@ -427,12 +938,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         homeBotReportSubtitle = TextView(this).apply {
-            text = "सर, नीचे चैट में '📎' दबाकर स्क्रीनशॉट (1-2-3 पॉइंट लगाकर) या वीडियो सीधे यहीं भेजें!"
+            text = "सर, नीचे चैट में '📎' दबाकर स्क्रीनशॉट (1-2-3 पॉइंट लगाकर) या '🧩 Store' से नए AI फीचर्स जोड़ें!"
             setTextColor(Color.parseColor("#CBD5E1"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(0, dp(3), 0, dp(6))
         }
 
+        val pillsScroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
         val actionPillsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
 
         val dailyReportBtn = TextView(this).apply {
@@ -450,20 +962,52 @@ class MainActivity : AppCompatActivity() {
         }
 
         val diagnoseBtn = TextView(this).apply {
-            text = "🛠️ 1-2-3 स्क्रीनशॉट Fix"
+            text = "🛠️ 1-2-3 Fix"
             setTextColor(textPureWhite)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(9), dp(6), dp(9), dp(6))
             background = roundedBox(accentPurple, dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(6) }
             setOnClickListener { openLastRunScreenshotsPickerForChat() }
+        }
+
+        val storePillBtn = TextView(this).apply {
+            text = "🧩 Add Features"
+            setTextColor(textPureWhite)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+            background = roundedBox(accentRoyalBlue, dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(6) }
+            setOnClickListener { showModularFeatureStoreDialog() }
+        }
+
+        val liveDotPillBtn = TextView(this).apply {
+            text = "🟣 Live Dot PC"
+            setTextColor(textPureWhite)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+            background = roundedBox(Color.parseColor("#0D9488"), dp(8))
+            setOnClickListener { showOpenDotsLiveViewerDialog() }
         }
 
         actionPillsRow.addView(dailyReportBtn)
         actionPillsRow.addView(diagnoseBtn)
+        actionPillsRow.addView(storePillBtn)
+        actionPillsRow.addView(liveDotPillBtn)
+        pillsScroll.addView(actionPillsRow)
+
         rightStatusCol.addView(homeBotStatusTitle)
         rightStatusCol.addView(homeBotReportSubtitle)
-        rightStatusCol.addView(actionPillsRow)
+        rightStatusCol.addView(pillsScroll)
         companionCard.addView(homeBotView)
         companionCard.addView(rightStatusCol)
 
@@ -475,9 +1019,9 @@ class MainActivity : AppCompatActivity() {
 
         addChatBubble(
             "AuraDroid Chanchal Bot",
-            "नमस्ते भाई! अब आप सीधे इसी चैट में सब कुछ कर सकते हैं:\n" +
-                "• नीचे **`📎` बटन** दबाकर स्क्रीनशॉट चुनें ➔ उस पर उंगली से **`1`**, **`2`**, **`3`** पॉइंट लगाएं और लिख दें कि कहाँ टाइप/टैप करना है!\n" +
-                "• या **`📎` बटन** से सीधे यहीं **वीडियो (Screen Recording)** भेजें — मैं पुराना नियम बदलकर पक्का कोडेड कानून (`LIVE_CODE_RULE`) बना दूँगा!",
+            "नमस्ते भाई! आपका ऐप अब सुपर-पावरफुल हो चुका है:\n" +
+                "• ऊपर **`🧩 Store`** दबाकर **OpenDots Background PC**, **Hermes YouTube Auto-Pilot**, **9B Free Tokens**, या **MoneyPrinter** में से जो फीचर चाहिए उसे 1-टैप में Install करें!\n" +
+                "• नीचे **`📎` बटन** से स्क्रीनशॉट पर **`1`**, **`2`**, **`3`** पॉइंट लगाएं या वीडियो भेजकर पक्का कोडेड कानून (`LIVE_CODE_RULE`) बनाएं!",
             isUser = false
         )
 
@@ -569,6 +1113,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun showChatMediaAttachMenu() {
         val options: Array<CharSequence> = arrayOf(
+            "🧩 AuraStore खोलें (1-Tap में नए AI Features जोड़ें)",
+            "🟣 OpenDots Background PC खोलें (Watch Live / Take Control)",
             "🖼️ गैलरी से स्क्रीनशॉट/फोटो भेजें (1-2-3 पॉइंट लगाएं)",
             "📸 पिछले टास्क के स्क्रीनशॉट पर 1-2-3 पॉइंट लगाएं",
             "🎥 चैट में वीडियो (Screen Recording) भेजें & सुधारें",
@@ -576,13 +1122,15 @@ class MainActivity : AppCompatActivity() {
             "🗑️ किसी ऐप का पूरा पुराना नियम हटाकर नया बनाएं"
         )
         darkDialogBuilder()
-            .setTitle("📎 चैट में स्क्रीनशॉट या वीडियो भेजें")
+            .setTitle("📎 चैट टूल्स & 1-Tap Feature Store")
             .setItems(options) { _, which ->
                 when (which) {
-                    0 -> startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply { type = "image/*" }, REQ_CHAT_PICK_IMAGE)
-                    1 -> openLastRunScreenshotsPickerForChat()
-                    2 -> startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply { type = "video/*" }, REQ_CHAT_PICK_VIDEO)
-                    3 -> {
+                    0 -> showModularFeatureStoreDialog()
+                    1 -> showOpenDotsLiveViewerDialog()
+                    2 -> startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply { type = "image/*" }, REQ_CHAT_PICK_IMAGE)
+                    3 -> openLastRunScreenshotsPickerForChat()
+                    4 -> startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply { type = "video/*" }, REQ_CHAT_PICK_VIDEO)
+                    5 -> {
                         val vault = getActiveVault()
                         val catNames: List<String> = vault.getAllCategoriesSummary().map { it.first }
                         if (catNames.isEmpty()) {
@@ -595,7 +1143,7 @@ class MainActivity : AppCompatActivity() {
                             addChatBubble("🧹 Memory Cleaner", "✅ सभी ऐप्स से **$totalPurged खराब/अधूरे नियम** (`@213...`, `Chat not selected`, `All models busy`) साफ कर दिए गए हैं! आपके असली नियम सुरक्षित हैं।", false)
                         }
                     }
-                    4 -> {
+                    6 -> {
                         val vault = getActiveVault()
                         val catNames: List<String> = vault.getAllCategoriesSummary().map { it.first }
                         if (catNames.isEmpty()) {
@@ -867,7 +1415,6 @@ class MainActivity : AppCompatActivity() {
             val replyObj = brain.chatAboutAutomationRunWith38Flash(syntheticRun, combinedPrompt, listOf(b64))
 
             if (points.isNotEmpty()) {
-                // User explicitly pinned 1-2-3 coordinates: ALWAYS save user's exact coordinates even if AI models are cooling down!
                 points.forEachIndexed { idx, pt ->
                     val ptNum = idx + 1
                     vault.saveStuckOrHumanFix(
@@ -1026,7 +1573,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (failedRun != null) {
             homeBotStatusTitle.text = "$greetingPrefix (1 टास्क में ध्यान दें)"
-            homeBotReportSubtitle.text = "आज $successCount टास्क पूरे हुए, लेकिन '${failedRun.title.take(20)}' के ${failedRun.screenshotPaths.size} स्क्रीनशॉट सेव हैं। नीचे '🛠️ 1-2-3 स्क्रीनशॉट Fix' या '📎' दबाएं!"
+            homeBotReportSubtitle.text = "आज $successCount टास्क पूरे हुए, लेकिन '${failedRun.title.take(20)}' के ${failedRun.screenshotPaths.size} स्क्रीनशॉट सेव हैं। नीचे '🛠️ 1-2-3 Fix' या '🧩 Add Features' दबाएं!"
             homeBotView.setBotMood(isHappy = false, isCurious = true)
         } else if (runs.isNotEmpty()) {
             homeBotStatusTitle.text = "$greetingPrefix सारे टास्क फिट हैं ✅"
@@ -1034,7 +1581,7 @@ class MainActivity : AppCompatActivity() {
             homeBotView.setBotMood(isHappy = true, isCurious = false)
         } else {
             homeBotStatusTitle.text = "$greetingPrefix Have a good luck day!"
-            homeBotReportSubtitle.text = "नीचे चैट में '📎' दबाकर स्क्रीनशॉट (1-2-3 पॉइंट) या वीडियो से सीधा नियम सिखाएं!"
+            homeBotReportSubtitle.text = "ऊपर '🧩 Store' से नए AI फीचर्स जोड़ें या चैट में '📎' दबाकर नियम सिखाएं!"
             homeBotView.setBotMood(isHappy = true, isCurious = false)
         }
     }
@@ -1132,10 +1679,11 @@ class MainActivity : AppCompatActivity() {
 
         uiScope.launch {
             try {
+                val combinedProfileAndStoreSkills = vault.getUserProfileRules() + buildActiveInstalledSkillsPrompt()
                 val planJson = brain.chatAndBuildDetailedPlan(
                     userMessage = userMsg,
                     chatHistory = chatHistoryBuilder.toString().takeLast(1500),
-                    userProfileRules = vault.getUserProfileRules()
+                    userProfileRules = combinedProfileAndStoreSkills
                 )
                 val reply = planJson.optString("reply", "समझ गया भाई!")
                 val ready = planJson.optBoolean("readyToExecute", false)
@@ -1211,10 +1759,24 @@ class MainActivity : AppCompatActivity() {
             })
         }
         card.addView(createPrimaryButton("▶ हाँ, काम शुरू करो (Start Execution)", accentEmerald) {
+            if (mode == "BACKGROUND_WEB" && isStoreModuleInstalled("opendots_bg_pc")) {
+                val targetUrl = when {
+                    rawGoal.contains("youtube", true) -> "https://studio.youtube.com"
+                    rawGoal.contains("qwen", true) -> "https://chat.qwen.ai"
+                    rawGoal.contains("flow", true) -> "https://labs.google/fx/tools/flow"
+                    else -> "https://www.google.com"
+                }
+                launchInBackgroundDot(title, targetUrl)
+                Toast.makeText(this@MainActivity, "🟣 OpenDots Background PC में टास्क शुरू हो गया!", Toast.LENGTH_LONG).show()
+            }
             val svc = AutoTouchService.instance
             if (svc == null) {
-                Toast.makeText(this@MainActivity, "पहले Accessibility Service ऑन करें!", Toast.LENGTH_LONG).show()
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                if (mode == "BACKGROUND_WEB") {
+                    showOpenDotsLiveViewerDialog()
+                } else {
+                    Toast.makeText(this@MainActivity, "पहले Accessibility Service ऑन करें!", Toast.LENGTH_LONG).show()
+                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                }
             } else {
                 svc.hud.showHud()
                 svc.startUniversalTask(rawGoal, steps, mode)
@@ -1321,10 +1883,12 @@ class MainActivity : AppCompatActivity() {
         }
         listOf(
             "✨ Gemini" to "https://gemini.google.com",
-            "🤖 ChatGPT" to "https://chatgpt.com",
-            "🎬 Hailuo Free" to "https://hailuoai.video",
-            "🎥 Kling AI" to "https://klingai.com",
-            "🌊 Google Flow" to "https://labs.google/fx/tools/flow"
+            "🎨 Qwen Image" to "https://chat.qwen.ai",
+            "🎥 Synthesia Free" to "https://www.synthesia.io/features/text-to-video",
+            "🎬 Hailuo / MiniMax" to "https://hailuoai.video",
+            "🎥 Kling / Wan AI" to "https://klingai.com",
+            "🌊 Google Flow" to "https://labs.google/fx/tools/flow",
+            "🔓 FreeLLM :3001" to "http://localhost:3001/models/chat"
         ).forEach { (label, url) ->
             siteChipsRow.addView(TextView(this).apply {
                 text = label
@@ -1379,10 +1943,17 @@ class MainActivity : AppCompatActivity() {
             val prompt = freeHubPromptInput.text.toString().trim()
             val saveDir = freeWebDownloadFolderEditText.text.toString().trim().ifEmpty { defaultDownloadDir }
             prefs.edit().putString("free_hub_site", site).putString("free_hub_prompt", prompt).putString("custom_download_folder", saveDir).apply()
+            if (freeHubExecMode == "BACKGROUND") {
+                launchInBackgroundDot("Free Hub: $site", site)
+            }
             val svc = AutoTouchService.instance
             if (svc == null) {
-                Toast.makeText(this, "पहले Accessibility Service ऑन करें!", Toast.LENGTH_SHORT).show()
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                if (freeHubExecMode == "BACKGROUND") {
+                    showOpenDotsLiveViewerDialog(site)
+                } else {
+                    Toast.makeText(this, "पहले Accessibility Service ऑन करें!", Toast.LENGTH_SHORT).show()
+                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                }
             } else {
                 val ytOn = prefs.getBoolean("yt_link_enabled", true)
                 val instaOn = prefs.getBoolean("insta_link_enabled", false)
@@ -1672,8 +2243,8 @@ class MainActivity : AppCompatActivity() {
         fun navBtn(label: String, onClick: () -> Unit) = TextView(this).apply {
             text = label
             setTextColor(textPureWhite)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            setPadding(dp(9), dp(8), dp(9), dp(8))
             setOnClickListener { onClick() }
         }
         navBar.addView(navBtn("⬅") { if (studioWebView?.canGoBack() == true) studioWebView?.goBack() })
@@ -1686,14 +2257,23 @@ class MainActivity : AppCompatActivity() {
             studioWebView?.loadUrl(u)
         })
 
+        val toolStripScroll = HorizontalScrollView(this).apply {
+            setBackgroundColor(Color.parseColor("#181B20"))
+            isHorizontalScrollBarEnabled = false
+        }
         val toolStrip = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(8), dp(6), dp(8), dp(6))
-            setBackgroundColor(Color.parseColor("#181B20"))
+            setPadding(dp(6), dp(4), dp(6), dp(4))
         }
         toolStrip.addView(navBtn("🔑 Gmail") { studioWebView?.loadUrl("https://accounts.google.com") })
         toolStrip.addView(navBtn("🎬 Flow") { studioWebView?.loadUrl("https://labs.google/fx/tools/flow") })
         toolStrip.addView(navBtn("📺 YT Studio") { studioWebView?.loadUrl("https://studio.youtube.com") })
+        toolStrip.addView(navBtn("🔓 FreeLLM :3001") { studioWebView?.loadUrl("http://localhost:3001/models/chat") })
+        toolStrip.addView(navBtn("🟣 BG Dot") {
+            val currentUrl = studioWebView?.url ?: "https://studio.youtube.com"
+            launchInBackgroundDot("Browser Dot", currentUrl)
+            showOpenDotsLiveViewerDialog(currentUrl)
+        })
         toolStrip.addView(navBtn("🖥️ Desktop") {
             isDesktopMode = !isDesktopMode
             studioWebView?.settings?.userAgentString = if (isDesktopMode)
@@ -1707,6 +2287,7 @@ class MainActivity : AppCompatActivity() {
             CookieManager.getInstance().flush()
             Toast.makeText(this, "Saved!", Toast.LENGTH_SHORT).show()
         })
+        toolStripScroll.addView(toolStrip)
 
         studioWebView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
@@ -1727,7 +2308,7 @@ class MainActivity : AppCompatActivity() {
             loadUrl(prefs.getString("saved_flow_url", "https://labs.google/fx/tools/flow") ?: "https://labs.google/fx/tools/flow")
         }
         container.addView(navBar)
-        container.addView(toolStrip)
+        container.addView(toolStripScroll)
         container.addView(studioWebView)
         return container
     }
@@ -2125,6 +2706,15 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(24))
         }
 
+        val storeQuickCard = createSectionCard("🧩 Modular AI Feature Store & OpenDots Background PC")
+        storeQuickCard.addView(createPrimaryButton("🧩 Open AuraStore (Install / Manage 12 AI Features)", accentPurple) {
+            showModularFeatureStoreDialog()
+        })
+        storeQuickCard.addView(spacer(dp(8)))
+        storeQuickCard.addView(createPrimaryButton("🟣 OpenDots Background PC (Watch Live / Take Control)", accentRoyalBlue) {
+            showOpenDotsLiveViewerDialog()
+        })
+
         val stealthCard = createSectionCard("👻 Floating Chanchal Bot: Stealth Mode & Corner Transparency")
         var isStealth = prefs.getBoolean("hud_stealth_mode", false)
         val stealthToggleBtn = createPrimaryButton(
@@ -2227,13 +2817,16 @@ class MainActivity : AppCompatActivity() {
         logsCard.addView(logControlsRow)
         logsCard.addView(liveLogsTextView)
 
-        val apiCard = createSectionCard("🔑 Gemini API & 3.5–3.8 Ladder")
+        val apiCard = createSectionCard("🔑 FreeLLMAPI (localhost:3001) + OmniRoute + Gemini Key")
         val keyRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
         var isKeyHidden = true
-        val keyInput = createCleanInput(prefs.getString("gemini_api_key", "") ?: "", "Paste Gemini API Key").apply {
+        val keyInput = createCleanInput(
+            prefs.getString("gemini_api_key", "") ?: "",
+            "Paste freellma... key or AIza... key (or both)"
+        ).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
         }
@@ -2249,7 +2842,7 @@ class MainActivity : AppCompatActivity() {
         keyRow.addView(keyInput)
         keyRow.addView(toggleKeyVisBtn)
 
-        val saveKeyBtn = createPrimaryButton("💾 Save API Key", accentRoyalBlue) {
+        val saveKeyBtn = createPrimaryButton("💾 Save API Key (FreeLLM / Gemini)", accentRoyalBlue) {
             val k = keyInput.text.toString().trim()
             prefs.edit().putString("gemini_api_key", k).apply()
             localBrain.updateApiKey(k)
@@ -2298,6 +2891,7 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
+        container.addView(storeQuickCard)
         container.addView(stealthCard)
         container.addView(logsCard)
         container.addView(apiCard)
