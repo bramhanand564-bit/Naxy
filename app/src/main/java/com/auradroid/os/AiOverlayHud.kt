@@ -22,6 +22,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -81,6 +82,9 @@ class AiOverlayHud(
     private var webCardContainer: LinearLayout? = null
     private var backgroundWebView: WebView? = null
     private var isWebExpandedFull = false
+    private var isWebDesktopUa = true
+    private var isUserDrivingWebDot = false
+    private var driveModeToggleBtn: TextView? = null
 
     private var handOverlayView: BaymaxHandOverlayView? = null
     private var handOverlayParams: WindowManager.LayoutParams? = null
@@ -108,7 +112,7 @@ class AiOverlayHud(
     )
 
     private val autoCollapseAndDockRunnable = Runnable {
-        if (!isNotchExpandedByUser) {
+        if (!isNotchExpandedByUser && !isUserDrivingWebDot) {
             notchCapsuleContainer?.visibility = View.GONE
             if (webCardContainer?.visibility == View.VISIBLE && !isTaskActivelyRunning) {
                 setWebCardVisibility(false)
@@ -164,12 +168,44 @@ class AiOverlayHud(
         mainHandler.post {
             val params = podParams ?: return@post
             val root = podRootLayout ?: return@post
+            isUserDrivingWebDot = false
+            driveModeToggleBtn?.text = "🤖 AI Auto"
+            driveModeToggleBtn?.setTextColor(Color.parseColor("#10B981"))
+            root.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+            backgroundWebView?.isFocusable = false
+            backgroundWebView?.isFocusableInTouchMode = false
             params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
             try {
                 if (isAdded) windowManager.updateViewLayout(root, params)
             } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * OpenDots "Take Control (You are driving)" toggle:
+     * Only enables keyboard focus inside the floating WebView when the user explicitly taps [🎮 Drive]!
+     */
+    private fun setUserDrivingWebDotMode(enableDrive: Boolean) {
+        mainHandler.post {
+            val params = podParams ?: return@post
+            val root = podRootLayout ?: return@post
+            isUserDrivingWebDot = enableDrive
+            if (enableDrive) {
+                driveModeToggleBtn?.text = "🎮 Driving"
+                driveModeToggleBtn?.setTextColor(Color.parseColor("#FACC15"))
+                root.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+                backgroundWebView?.isFocusable = true
+                backgroundWebView?.isFocusableInTouchMode = true
+                params.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                try {
+                    if (isAdded) windowManager.updateViewLayout(root, params)
+                } catch (_: Exception) {}
+            } else {
+                enforceKeyboardFriendlyFocusFlags()
+            }
         }
     }
 
@@ -204,10 +240,6 @@ class AiOverlayHud(
         }
     }
 
-    /**
-     * Applies user's Stealth Mode (Hide Bot while background tasks still run) and Custom Opacity/Transparency!
-     * Supports both MainActivity and internal preference keys.
-     */
     fun applyUserTransparencyAndStealthSettings() {
         mainHandler.post {
             val stealthHideBot = prefs.getBoolean("hud_stealth_mode", false) ||
@@ -229,13 +261,12 @@ class AiOverlayHud(
                 baymaxFaceView?.visibility = View.VISIBLE
                 baymaxFaceView?.alpha = targetAlpha
             }
-            enforceKeyboardFriendlyFocusFlags()
+            if (!isUserDrivingWebDot) {
+                enforceKeyboardFriendlyFocusFlags()
+            }
         }
     }
 
-    /**
-     * Smoothly docks the bot into the left or right screen corner so only a subtle edge peeks out!
-     */
     private fun dockBotToNearestCornerEdge() {
         val params = podParams ?: return
         val root = podRootLayout ?: return
@@ -275,9 +306,11 @@ class AiOverlayHud(
         val screenW = dm.widthPixels
         isDockedAtEdge = false
         baymaxFaceView?.alpha = 1.0f
-        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        if (!isUserDrivingWebDot) {
+            params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        }
 
         val targetX = if (params.x < screenW / 2) dp(10) else (screenW - dp(68)).coerceAtLeast(dp(10))
         if (params.x < 0 || params.x > screenW - dp(56)) {
@@ -288,9 +321,6 @@ class AiOverlayHud(
         }
     }
 
-    /**
-     * Peeks out from the corner to say Good Morning / Good Luck / Late Night Sleep greeting if enabled in Settings!
-     */
     fun triggerGreetingPeekIfAllowed(customGreeting: String? = null) {
         mainHandler.post {
             val stealth = prefs.getBoolean("hud_stealth_mode", false) ||
@@ -460,7 +490,9 @@ class AiOverlayHud(
             baymaxFaceView?.setMood(smartMood)
             statusTextView?.text = statusText
             updateNotchTelemetryFromStatus(statusText, taskRunning)
-            enforceKeyboardFriendlyFocusFlags()
+            if (!isUserDrivingWebDot) {
+                enforceKeyboardFriendlyFocusFlags()
+            }
 
             val stealth = prefs.getBoolean("hud_stealth_mode", false) ||
                 prefs.getBoolean("stealth_hide_bot", false) ||
@@ -505,8 +537,27 @@ class AiOverlayHud(
         if (backgroundWebView == null && !isAdded) {
             showHud()
         }
-        enforceKeyboardFriendlyFocusFlags()
+        if (!isUserDrivingWebDot) {
+            enforceKeyboardFriendlyFocusFlags()
+        }
         return backgroundWebView
+    }
+
+    fun openBackgroundDotUrl(url: String, desktopMode: Boolean = true, showCard: Boolean = false) {
+        mainHandler.post {
+            if (!isAdded) showHud()
+            isWebDesktopUa = desktopMode
+            backgroundWebView?.settings?.userAgentString = if (desktopMode) {
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            } else {
+                "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+            }
+            backgroundWebView?.loadUrl(url)
+            if (showCard) {
+                undockBotFromEdgeToVisible()
+                setWebCardVisibility(true)
+            }
+        }
     }
 
     fun captureWebViewCanvasBitmap(): Bitmap? {
@@ -573,7 +624,7 @@ class AiOverlayHud(
             y = dp(95)
         }
 
-        // CRITICAL KEYBOARD FIX: Block descendant focus so no child view in the overlay ever steals Gboard!
+        // CRITICAL KEYBOARD FIX: Block descendant focus by default so no child view ever steals Gboard!
         podRootLayout = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             isFocusable = false
@@ -625,7 +676,7 @@ class AiOverlayHud(
         }
 
         peekWebButton = TextView(context).apply {
-            text = " 👁️ Web "
+            text = " 🟣 Dot "
             setTextColor(Color.parseColor("#38BDF8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = Typeface.DEFAULT_BOLD
@@ -746,7 +797,7 @@ class AiOverlayHud(
                 cornerRadius = dp(16).toFloat()
                 setStroke(dp(1), Color.parseColor("#334155"))
             }
-            layoutParams = LinearLayout.LayoutParams(dp(300), dp(420)).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(310), dp(440)).apply {
                 topMargin = dp(8)
             }
         }
@@ -754,42 +805,55 @@ class AiOverlayHud(
         val webHeader = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(4), dp(2), dp(4), dp(6))
+            setPadding(dp(4), dp(2), dp(4), dp(4))
         }
 
         val webTitle = TextView(context).apply {
-            text = "🎬 Live Background Workspace"
+            text = "🟣 OpenDots Live Workspace"
             setTextColor(Color.parseColor("#E2E8F0"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
 
+        // OpenDots "Take Control / You are driving" toggle button
+        driveModeToggleBtn = TextView(context).apply {
+            text = "🤖 AI Auto"
+            setTextColor(Color.parseColor("#10B981"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(6), dp(2), dp(6), dp(2))
+            setOnClickListener {
+                setUserDrivingWebDotMode(!isUserDrivingWebDot)
+            }
+        }
+
         val expandBtn = TextView(context).apply {
-            text = "[ ⛶ Full ]"
+            text = "[ ⛶ ]"
             setTextColor(Color.parseColor("#3B82F6"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(dp(8), dp(2), dp(8), dp(2))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setPadding(dp(6), dp(2), dp(6), dp(2))
             setOnClickListener {
                 isWebExpandedFull = !isWebExpandedFull
                 val lp = webCardContainer?.layoutParams as? LinearLayout.LayoutParams
                 if (isWebExpandedFull) {
-                    lp?.width = dp(350)
+                    lp?.width = dp(355)
                     lp?.height = dp(620)
-                    text = "[ ↙ Mini ]"
+                    text = "[ ↙ ]"
                 } else {
-                    lp?.width = dp(300)
-                    lp?.height = dp(420)
-                    text = "[ ⛶ Full ]"
+                    lp?.width = dp(310)
+                    lp?.height = dp(440)
+                    text = "[ ⛶ ]"
                 }
                 webCardContainer?.layoutParams = lp
-                enforceKeyboardFriendlyFocusFlags()
+                if (!isUserDrivingWebDot) enforceKeyboardFriendlyFocusFlags()
             }
         }
 
         val hideBtn = TextView(context).apply {
             text = "[ ✕ ]"
             setTextColor(Color.parseColor("#94A3B8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             setPadding(dp(6), dp(2), dp(4), dp(2))
             setOnClickListener {
                 setWebCardVisibility(false)
@@ -797,14 +861,50 @@ class AiOverlayHud(
         }
 
         webHeader.addView(webTitle)
+        webHeader.addView(driveModeToggleBtn)
         webHeader.addView(expandBtn)
         webHeader.addView(hideBtn)
 
-        // CRITICAL KEYBOARD FIX: Override onCheckIsTextEditor & requestFocus so backgroundWebView
-        // never steals Android's InputMethodManager (Soft Keyboard) from Instagram, Chrome, or AuraDroid!
+        // OpenDots Quick Dot Switcher Strip (YT Studio, FreeLLM :3001, Flow, Qwen, Desktop)
+        val dotStripScroll = HorizontalScrollView(context).apply {
+            isHorizontalScrollBarEnabled = false
+            setPadding(0, 0, 0, dp(4))
+        }
+        val dotStripRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        fun addDotChip(label: String, targetUrl: String, forceDesktop: Boolean = true) {
+            dotStripRow.addView(TextView(context).apply {
+                text = label
+                setTextColor(Color.parseColor("#F8FAFC"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+                setPadding(dp(7), dp(3), dp(7), dp(3))
+                background = GradientDrawable().apply {
+                    setColor(Color.parseColor("#1E293B"))
+                    cornerRadius = dp(6).toFloat()
+                }
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginEnd = dp(4) }
+                setOnClickListener {
+                    openBackgroundDotUrl(targetUrl, desktopMode = forceDesktop, showCard = true)
+                }
+            })
+        }
+        addDotChip("📺 YT Studio", "https://studio.youtube.com", true)
+        addDotChip("🔓 FreeLLM :3001", "http://localhost:3001/models/chat", false)
+        addDotChip("🌊 Flow", "https://labs.google/fx/tools/flow", true)
+        addDotChip("🎨 Qwen AI", "https://chat.qwen.ai", false)
+        addDotChip("🎥 Synthesia", "https://www.synthesia.io/features/text-to-video", true)
+        dotStripScroll.addView(dotStripRow)
+
+        // CRITICAL KEYBOARD FIX: Only allow text editor focus when user explicitly turns ON [🎮 Driving] mode!
         backgroundWebView = object : WebView(context) {
-            override fun onCheckIsTextEditor(): Boolean = false
-            override fun requestFocus(direction: Int, previouslyFocusedRect: Rect?): Boolean = false
+            override fun onCheckIsTextEditor(): Boolean = isUserDrivingWebDot
+            override fun requestFocus(direction: Int, previouslyFocusedRect: Rect?): Boolean {
+                return if (isUserDrivingWebDot) super.requestFocus(direction, previouslyFocusedRect) else false
+            }
         }.apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -821,7 +921,7 @@ class AiOverlayHud(
             settings.mediaPlaybackRequiresUserGesture = false
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             settings.userAgentString =
-                "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
@@ -849,6 +949,7 @@ class AiOverlayHud(
         }
 
         webCardContainer?.addView(webHeader)
+        webCardContainer?.addView(dotStripScroll)
         webCardContainer?.addView(backgroundWebView)
 
         podRootLayout?.addView(topRow)
@@ -865,8 +966,10 @@ class AiOverlayHud(
 
     private fun setWebCardVisibility(show: Boolean) {
         webCardContainer?.visibility = if (show) View.VISIBLE else View.GONE
-        // CRITICAL KEYBOARD FIX: Always keep FLAG_NOT_FOCUSABLE even when Web Card is visible!
-        enforceKeyboardFriendlyFocusFlags()
+        if (!show) {
+            // Always restore keyboard-safe non-focusable mode when closing the web card!
+            enforceKeyboardFriendlyFocusFlags()
+        }
     }
 
     private fun toggleWebCardVisibility() {
@@ -906,9 +1009,11 @@ class AiOverlayHud(
                         isDockedAtEdge = false
                         params.x = (startX + dx).coerceIn(-dp(32), maxX)
                         params.y = (startY + dy).coerceIn(0, maxY)
-                        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        if (!isUserDrivingWebDot) {
+                            params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        }
                         try {
                             windowManager.updateViewLayout(podRootLayout, params)
                         } catch (_: Exception) {}
@@ -951,12 +1056,14 @@ class AiOverlayHud(
             updateNotchTelemetryFromStatus(statusTextView?.text?.toString() ?: "Ready", isTaskActivelyRunning)
             notchCapsuleContainer?.visibility = View.VISIBLE
             notchDetailsSection?.visibility = View.VISIBLE
-            enforceKeyboardFriendlyFocusFlags()
+            if (!isUserDrivingWebDot) enforceKeyboardFriendlyFocusFlags()
             mainHandler.postDelayed({
-                isNotchExpandedByUser = false
-                notchDetailsSection?.visibility = View.GONE
-                notchCapsuleContainer?.visibility = View.GONE
-                if (!isTaskActivelyRunning) dockBotToNearestCornerEdge()
+                if (!isUserDrivingWebDot) {
+                    isNotchExpandedByUser = false
+                    notchDetailsSection?.visibility = View.GONE
+                    notchCapsuleContainer?.visibility = View.GONE
+                    if (!isTaskActivelyRunning) dockBotToNearestCornerEdge()
+                }
             }, 7000L)
         }
     }
