@@ -300,18 +300,20 @@ class AutoTouchService : AccessibilityService() {
                         humanTapYRatio = tapYRatio,
                         clickedNodeDesc = nodeDesc
                     )
-                    memoryVault.saveStuckOrHumanFix(
-                        category = cat,
-                        screenSignature = sig,
-                        problemDescription = prob,
-                        solutionRule = rule,
-                        tapXRatio = tapXRatio,
-                        tapYRatio = tapYRatio,
-                        beforeScreenshot = beforeBitmap,
-                        afterScreenshot = afterBitmap,
-                        sourceType = "HUMAN_TOUCH_FIX"
-                    )
-                    log("🧠 Learned & Saved in Memory/$cat: $rule")
+                    if (prob.isNotBlank() && rule.isNotBlank()) {
+                        memoryVault.saveStuckOrHumanFix(
+                            category = cat,
+                            screenSignature = sig,
+                            problemDescription = prob,
+                            solutionRule = rule,
+                            tapXRatio = tapXRatio,
+                            tapYRatio = tapYRatio,
+                            beforeScreenshot = beforeBitmap,
+                            afterScreenshot = afterBitmap,
+                            sourceType = "HUMAN_TOUCH_FIX"
+                        )
+                        log("🧠 Learned & Saved in Memory/$cat: $rule")
+                    }
                 }
             }
         }
@@ -342,7 +344,7 @@ class AutoTouchService : AccessibilityService() {
 
         if (rBitmaps.isNotEmpty() || rSteps.isNotEmpty()) {
             serviceScope.launch(Dispatchers.IO) {
-                log("🧠 Gemini 3.8 Post-Run Auto-Reflection started for '$rTitle' [$finalStatus]...")
+                log("🧠 Post-Run Auto-Reflection started for '$rTitle' [$finalStatus]...")
                 val reflection = geminiBrain.autoReflectAndImproveAfterRun(
                     appCategory = rCat,
                     goal = rGoal,
@@ -354,7 +356,7 @@ class AutoTouchService : AccessibilityService() {
 
                 memoryVault.appendChatToAutomationRun(
                     runId = rId,
-                    sender = "Gemini 3.8 Auto-Reflection",
+                    sender = "Auto-Reflection (${reflection.modelUsed})",
                     message = reflection.reflectionSummary
                 )
 
@@ -405,6 +407,7 @@ class AutoTouchService : AccessibilityService() {
         currentTaskJob?.cancel()
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
         geminiBrain.updateApiKey(prefs.getString("gemini_api_key", "") ?: "")
+        AuraPluginStore.syncFromContext(this)
 
         val execMode = forceMode ?: prefs.getString("execution_mode", "LIVE_PHONE") ?: "LIVE_PHONE"
 
@@ -774,6 +777,7 @@ class AutoTouchService : AccessibilityService() {
                 val (_, viralTitle) = geminiBrain.generateFlowSafePromptAndTitle(cleanTopic)
                 log("✨ Generated Viral Title: $viralTitle")
                 dispatchVideoToLinkedPlatforms(videoUri, viralTitle)
+                memoryVault.markVideoAsPostedInLedger(rawDisplayName, "YouTube")
                 finalizeRunAndTriggerAutoReflection("SUCCESS")
             } catch (_: CancellationException) {
                 finalizeRunAndTriggerAutoReflection("STOPPED")
@@ -825,6 +829,7 @@ class AutoTouchService : AccessibilityService() {
                         dispatchVideoToLinkedPlatforms(uri, viralTitle)
                         uploadedSet.add(uri.toString())
                         prefs.edit().putStringSet("uploaded_videos_set", uploadedSet).apply()
+                        memoryVault.markVideoAsPostedInLedger(name, "YouTube")
                         finalizeRunAndTriggerAutoReflection("SUCCESS")
                         return@launch
                     }
@@ -853,6 +858,7 @@ class AutoTouchService : AccessibilityService() {
 
                 uploadedSet.add(chosenVideo.absolutePath)
                 prefs.edit().putStringSet("uploaded_videos_set", uploadedSet).apply()
+                memoryVault.markVideoAsPostedInLedger(chosenVideo.absolutePath, "YouTube")
                 finalizeRunAndTriggerAutoReflection("SUCCESS")
             } catch (_: CancellationException) {
                 finalizeRunAndTriggerAutoReflection("STOPPED")
@@ -870,12 +876,22 @@ class AutoTouchService : AccessibilityService() {
 
     /**
      * Routes the video upload to YouTube (Background Web Studio OR Live App) AND Instagram Reels if linked!
+     * Reads both MainActivity keys ('bg_youtube_upload', 'yt_link_enabled', 'insta_link_enabled') and legacy keys.
      */
     private suspend fun dispatchVideoToLinkedPlatforms(videoUri: Uri, viralTitle: String) {
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
-        val useBackgroundYtUpload = prefs.getBoolean("yt_upload_in_background", false)
-        val linkYoutube = prefs.getBoolean("link_platform_youtube", true)
-        val linkInstagram = prefs.getBoolean("link_platform_instagram", false)
+        val useBackgroundYtUpload = prefs.getBoolean(
+            "bg_youtube_upload",
+            prefs.getBoolean("yt_upload_in_background", false)
+        )
+        val linkYoutube = prefs.getBoolean(
+            "yt_link_enabled",
+            prefs.getBoolean("link_platform_youtube", true)
+        )
+        val linkInstagram = prefs.getBoolean(
+            "insta_link_enabled",
+            prefs.getBoolean("link_platform_instagram", false)
+        )
 
         if (linkYoutube) {
             if (useBackgroundYtUpload) {
@@ -896,32 +912,46 @@ class AutoTouchService : AccessibilityService() {
     }
 
     /**
-     * Silent Background YouTube Studio Web Uploader using hud.pendingUploadFileUri + WebChromeClient.onShowFileChooser!
+     * Silent Background YouTube Studio Web Uploader (Hermes CDP-style):
+     * Handles file injection, Title/Description, Not Made for Kids, Public radio, AND "Publish anyway" content-check dialog!
      */
     private suspend fun uploadVideoInBackgroundWebStudio(videoUri: Uri, viralTitle: String): Boolean {
         val webView = hud.getOrCreateBackgroundWebView() ?: return false
         hud.pendingUploadFileUri = videoUri
-        hud.updateStatus("🌐 BG Uploading to YouTube...", BotMood.UPLOAD_UP, taskRunning = true)
-        log("🌐 Starting Silent Background YouTube Studio Upload for: $viralTitle")
+        hud.updateStatus("🌐 Hermes BG YouTube Upload...", BotMood.UPLOAD_UP, taskRunning = true)
+        log("🌐 Starting Hermes Silent Background YouTube Studio Upload for: $viralTitle")
 
         withContext(Dispatchers.Main) {
             webView.settings.userAgentString =
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
             webView.loadUrl("https://www.youtube.com/upload")
         }
         delay(6500L)
 
         var fileInjected = false
-        for (step in 1..15) {
+        var clickedPublishOnce = false
+
+        for (step in 1..18) {
             if (!isAgentRunning) return false
             val jsRes = evaluateWebStudioUploadStep(webView, viralTitle)
-            log("🌐 BG YouTube Studio Step #$step -> $jsRes")
-            if (jsRes.contains("FILE_INPUT_TRIGGERED")) {
+            log("🌐 Hermes BG Studio Step #$step -> $jsRes")
+
+            if (jsRes.contains("FILE_INPUT_TRIGGERED") || jsRes.contains("CLICKED_SELECT_FILES")) {
                 fileInjected = true
             }
+            if (jsRes.contains("CLICKED_PUBLISH_ANYWAY") || (clickedPublishOnce && jsRes.contains("DIALOG_CLOSED_SUCCESS"))) {
+                hud.updateStatus("🎉 BG UPLOAD & PUBLISH SUCCESS!", BotMood.HAPPY, taskRunning = false)
+                log("🎉 Hermes Background YouTube Upload Completed: $viralTitle")
+                hud.pendingUploadFileUri = null
+                return true
+            }
             if (jsRes.contains("PUBLISHED_DONE")) {
+                clickedPublishOnce = true
+                // Wait 1 extra cycle to catch the "We're still checking your content -> Publish anyway" popup if it appears!
+                delay(3000L)
+                val checkPopupRes = evaluateWebStudioUploadStep(webView, viralTitle)
+                log("🌐 Post-Publish Check Dialog -> $checkPopupRes")
                 hud.updateStatus("🎉 BG UPLOAD SUCCESS!", BotMood.HAPPY, taskRunning = false)
-                log("🎉 Background YouTube Upload Completed: $viralTitle")
                 hud.pendingUploadFileUri = null
                 return true
             }
@@ -936,6 +966,18 @@ class AutoTouchService : AccessibilityService() {
         suspendCancellableCoroutine { cont ->
             val js = """
                 (function() {
+                    // 1. Hermes Check: Handle "We're still checking your content" -> "Publish anyway" button!
+                    const allButtons = Array.from(document.querySelectorAll('ytcp-button, button, [role="button"]'));
+                    const publishAnywayBtn = allButtons.find(b => {
+                        const txt = (b.innerText || b.getAttribute('aria-label') || '').toLowerCase();
+                        return txt.includes('publish anyway') || b.id === 'secondary-action-button';
+                    });
+                    if (publishAnywayBtn && publishAnywayBtn.getBoundingClientRect().width > 10) {
+                        publishAnywayBtn.click();
+                        return 'CLICKED_PUBLISH_ANYWAY';
+                    }
+
+                    // 2. File input injection
                     const fileInput = document.querySelector('input[type="file"]');
                     if (fileInput && !window.__auraFileInjected) {
                         window.__auraFileInjected = true;
@@ -947,15 +989,20 @@ class AutoTouchService : AccessibilityService() {
                         selectBtn.click();
                         return 'CLICKED_SELECT_FILES';
                     }
+
+                    // 3. Title & Description boxes
                     const titleBox = document.querySelector('#textbox[aria-label*="title" i], #title-textarea #textbox');
                     if (titleBox && (!titleBox.innerText || titleBox.innerText.length < 5)) {
                         titleBox.focus();
                         titleBox.innerText = ${JSONObject.quote(viralTitle)};
                         titleBox.dispatchEvent(new InputEvent('input', { bubbles: true }));
                     }
+
+                    // 4. Audience: Not Made For Kids
                     const notForKids = document.querySelector('tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], #audience tp-yt-paper-radio-button:nth-child(2)');
                     if (notForKids) notForKids.click();
 
+                    // 5. Visibility: Public + Publish (#done-button)
                     const doneBtn = document.querySelector('#done-button, ytcp-button#done-button');
                     if (doneBtn && !doneBtn.disabled && doneBtn.getBoundingClientRect().width > 10) {
                         const publicRadio = document.querySelector('tp-yt-paper-radio-button[name="PUBLIC"]');
@@ -963,11 +1010,14 @@ class AutoTouchService : AccessibilityService() {
                         setTimeout(() => { doneBtn.click(); }, 400);
                         return 'PUBLISHED_DONE';
                     }
+
+                    // 6. Step Next button
                     const nextBtn = document.querySelector('#next-button, ytcp-button#next-button');
                     if (nextBtn && !nextBtn.disabled && nextBtn.getBoundingClientRect().width > 10) {
                         nextBtn.click();
                         return 'CLICKED_STUDIO_NEXT';
                     }
+
                     return 'WAITING_STUDIO';
                 })();
             """.trimIndent()
@@ -1079,8 +1129,10 @@ class AutoTouchService : AccessibilityService() {
 
         fun isVideo(f: File): Boolean {
             val n = f.name.lowercase(Locale.ROOT)
-            return f.isFile && (n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".mkv") || n.endsWith(".webm")) &&
-                !uploadedSet.contains(f.absolutePath)
+            return f.isFile &&
+                (n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".mkv") || n.endsWith(".webm")) &&
+                !uploadedSet.contains(f.absolutePath) &&
+                !memoryVault.isVideoPostedInLedger(f.absolutePath)
         }
 
         dir.listFiles()?.forEach { f ->
@@ -1129,7 +1181,7 @@ class AutoTouchService : AccessibilityService() {
                     val contentUri = Uri.withAppendedPath(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id.toString())
 
                     val matchesBucket = kw.isEmpty() || kw == "storage" || kw == "download" || bucket.contains(kw) || kw.contains(bucket)
-                    if (matchesBucket && !uploadedSet.contains(contentUri.toString())) {
+                    if (matchesBucket && !uploadedSet.contains(contentUri.toString()) && !memoryVault.isVideoPostedInLedger(name)) {
                         return Pair(contentUri, name)
                     }
                 }
@@ -1425,10 +1477,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Automatically closes the big Google Flow video player card (0:00 / 0:10) right after download
-     * and before starting a new Flow run so it never gets stuck on the open video card!
-     */
     private suspend fun closeFlowVideoPlayerCardIfOpen(webView: WebView) {
         val jsClose = """
             (function() {
@@ -1497,7 +1545,6 @@ class AutoTouchService : AccessibilityService() {
                         break
                     }
 
-                    // Fix 1: If the big video card was left open from a previous run, close it immediately!
                     closeFlowVideoPlayerCardIfOpen(webView)
                     val initialVideoUrl = extractExistingVideoUrlOnly(webView)
 
@@ -1586,7 +1633,6 @@ class AutoTouchService : AccessibilityService() {
                                 log("📥 Found Generated MP4 Stream: ${videoUrl.take(70)}...")
                                 downloadedVideoFile = downloadVideoFromUrlToStorage(videoUrl, "flow_${System.currentTimeMillis()}.mp4")
                                 if (downloadedVideoFile != null) {
-                                    // Immediately close the open big video card so the next run never gets stuck!
                                     closeFlowVideoPlayerCardIfOpen(webView)
                                     break
                                 }
@@ -1622,6 +1668,7 @@ class AutoTouchService : AccessibilityService() {
                         log("✅ Downloaded 8s Video: ${downloadedVideoFile.absolutePath}")
                         hideWebPreviewCardIfOpen()
                         dispatchVideoToLinkedPlatforms(Uri.fromFile(downloadedVideoFile), viralTitle)
+                        memoryVault.markVideoAsPostedInLedger(downloadedVideoFile.absolutePath, "YouTube")
                     } else {
                         log("⚠️ Could not auto-catch MP4 stream; check Google Flow login or Video mode.")
                         hud.updateStatus("Check Flow Login/Video Mode", BotMood.ERROR, taskRunning = false)
@@ -1646,7 +1693,6 @@ class AutoTouchService : AccessibilityService() {
                         return r.width > 10 && r.height > 10 && r.top >= 0;
                     }
 
-                    // If big video player card ('0:00 /' or video player view without prompt box) is open, click Back!
                     const allInputs = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"]')).filter(isVisible);
                     const promptBox = allInputs.find(el => {
                         const ph = (el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.innerText || '').toLowerCase();
@@ -1896,9 +1942,27 @@ class AutoTouchService : AccessibilityService() {
         val specs = getCalibratedDeviceBodySpecs()
         val history = mutableListOf<String>()
 
+        // Auto-load target website in OpenDots Background WebView if goal mentions a known platform or URL
+        val lowerGoal = goal.lowercase(Locale.ROOT)
+        val initialTargetUrl = when {
+            Regex("https?://[^\\s]+").find(goal) != null -> Regex("https?://[^\\s]+").find(goal)!!.value
+            lowerGoal.contains("youtube studio") || lowerGoal.contains("yt studio") -> "https://studio.youtube.com"
+            lowerGoal.contains("qwen") -> "https://chat.qwen.ai"
+            lowerGoal.contains("synthesia") -> "https://www.synthesia.io/features/text-to-video"
+            lowerGoal.contains("flow") -> "https://labs.google/fx/tools/flow"
+            lowerGoal.contains("freellm") || lowerGoal.contains("3001") -> "http://localhost:3001/models/chat"
+            else -> ""
+        }
+        if (initialTargetUrl.isNotBlank()) {
+            withContext(Dispatchers.Main) {
+                webView.loadUrl(initialTargetUrl)
+            }
+            delay(4000L)
+        }
+
         for (step in 1..60) {
             if (!isAgentRunning) break
-            hud.updateStatus("🌐 Web Step $step...", BotMood.WORKING, taskRunning = true)
+            hud.updateStatus("🟣 Dot Web Step $step...", BotMood.WORKING, taskRunning = true)
 
             val domTagList = injectVisualNumberStickersInWebView(webView)
             delay(400L)
@@ -1917,10 +1981,10 @@ class AutoTouchService : AccessibilityService() {
                 isContinuousMonitor = false
             )
 
-            log("🌐 Web Step $step [${decision.modelUsed}]: ${decision.action} -> ${decision.reason}")
+            log("🟣 Dot Web Step $step [${decision.modelUsed}]: ${decision.action} -> ${decision.reason}")
             currentRunSteps.add("Web Step $step: ${decision.action} (${decision.reason})")
             if (decision.action == "DONE") {
-                hud.updateStatus("🎉 Web Task Done!", BotMood.HAPPY, taskRunning = false)
+                hud.updateStatus("🎉 Background Dot Task Done!", BotMood.HAPPY, taskRunning = false)
                 break
             }
 
@@ -1983,9 +2047,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * Downloads video to user's custom chosen folder path (or /Download/AutoVideos by default)
-     */
     private suspend fun downloadVideoFromUrlToStorage(videoUrl: String, fileName: String): File? =
         withContext(Dispatchers.IO) {
             try {
@@ -2011,13 +2072,6 @@ class AutoTouchService : AccessibilityService() {
             }
         }
 
-    /**
-     * 24/7 Scheduler Loop with:
-     * - 10-minute Snooze check ('snooze_until_ms')
-     * - Idle Phone Mode check ('run_only_when_idle')
-     * - Smart Pre-Run Confirmation Banner when user is actively using phone
-     * - 10:00 PM Nightly Daily Summary Report!
-     */
     private fun startDailySchedulerLoop() {
         schedulerJob?.cancel()
         schedulerJob = serviceScope.launch {
@@ -2032,7 +2086,6 @@ class AutoTouchService : AccessibilityService() {
                 val snoozeUntil = prefs.getLong("snooze_until_ms", 0L)
                 if (nowMs < snoozeUntil) continue
 
-                // 1. Check if there is a Pending Idle-Phone Task waiting for the user to put down the phone!
                 val pendingIdleGoal = prefs.getString("pending_idle_goal", "") ?: ""
                 if (pendingIdleGoal.isNotBlank() && isPhoneCurrentlyIdleOrFree()) {
                     prefs.edit().remove("pending_idle_goal").apply()
@@ -2044,7 +2097,6 @@ class AutoTouchService : AccessibilityService() {
                 val nowHm = java.text.SimpleDateFormat("HH:mm", Locale.getDefault()).format(java.util.Date())
                 val todayStr = java.text.SimpleDateFormat("dd MMM", Locale.getDefault()).format(java.util.Date())
 
-                // 2. 10:00 PM (22:00) Nightly Friendly Summary Report
                 if (nowHm == "22:00" && lastNightReportDay != todayStr) {
                     lastNightReportDay = todayStr
                     val dailyStatus = prefs.getString("last_daily_action_log", "आज के सभी सिस्टम रेडी हैं!")
@@ -2067,7 +2119,6 @@ class AutoTouchService : AccessibilityService() {
 
                     val runWhenIdleOnly = prefs.getBoolean("run_only_when_idle", false)
                     if (runWhenIdleOnly && !isPhoneCurrentlyIdleOrFree()) {
-                        // User is actively using the phone right now -> Show non-intrusive Skip 10m / When Free / Background banner!
                         log("⏰ Scheduled time $nowHm reached while phone is in use -> Showing Smart Skip/Idle banner!")
                         hud.showScheduledTaskConfirmBanner(
                             taskTitle = if (mode == "FLOW_YT") "Flow AI Video" else "YouTube Upload",
@@ -2088,7 +2139,7 @@ class AutoTouchService : AccessibilityService() {
                                 log("🌙 Queued scheduled task to run when phone becomes idle.")
                             },
                             onRunBackground = {
-                                prefs.edit().putBoolean("yt_upload_in_background", true).apply()
+                                prefs.edit().putBoolean("bg_youtube_upload", true).putBoolean("yt_upload_in_background", true).apply()
                                 if (mode == "FLOW_YT") startGoogleFlowToYouTubePipeline(topic, credits)
                                 else startYouTubeFolderAutoUpload(folder, oldest)
                             }
