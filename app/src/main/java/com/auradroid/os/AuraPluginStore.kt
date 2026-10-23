@@ -64,6 +64,21 @@ object AuraPluginStore {
     private var currentDotTaskTitle: String = "Idle"
     private var currentDotStatusLog: String = "Ready for background task"
 
+    private val legacySkillMap = mapOf(
+        "freellm_omniroute_9b" to "[9B_TOKEN_ROUTER]: Route seamlessly across FreeLLMAPI (localhost:3001) and OmniRoute pools.",
+        "opendots_bg_pc" to "[OPENDOTS_BACKGROUND_PC]: Prefer BACKGROUND_WEB execution for web studio, YouTube Studio, and AI generator tasks.",
+        "hermes_agenttube_yt" to "[HERMES_YT_PIPELINE]: Pick unposted video from folder ledger, extract audio/screen text, write viral Hinglish title/tags, upload via YouTube Studio UI, and click 'Publish anyway' on check dialogs.",
+        "ruflo_adk_swarm" to "[RUFLO_ADK_SWARM]: Act as Queen Orchestrator. Decompose goals into specialized Sub-Agent micro-steps ([FAST_LITE], [ROBOTICS_XY], [DEEP_3.8]).",
+        "moneyprinter_hypit_viral" to "[MONEYPRINTER_HYPIT]: Build a 3-second viral hook, scene-by-scene B-roll prompts, karaoke subtitle blocks, and high-CTR title.",
+        "open_gen_ai_studio" to "[OPEN_GEN_STUDIO]: Use free generative studios (Qwen Image, Wan AI, MiniMax H3, Synthesia, Google Flow) in Background Dot.",
+        "heygem_comfy_avatar" to "[HEYGEM_AVATAR]: Design talking-head avatar scripts with natural lip-sync pacing and visual node prompts.",
+        "omnivoice_handy_voice" to "[OMNIVOICE_HANDY]: Reply with natural, human-like emotional intonation and conversational Hinglish warmth.",
+        "adhd_no_ai_slop" to "[ADHD_NO_SLOP]: Be ultra-concise, direct, and numbered. Eliminate generic AI filler phrases.",
+        "open_notebook_book_skill" to "[BOOK_TO_SKILL]: Distill large notes or documents into modular chapter rules and recall only relevant rules.",
+        "openseo_job_assistant" to "[OPENSEO_JOB_AGENT]: Perform deep keyword/competitor SEO optimization for titles/tags and tailor resumes.",
+        "strix_security_public_apis" to "[STRIX_PUBLIC_APIS]: Audit workflows for reliability/security flaws and leverage free public APIs."
+    )
+
     val allPlugins: List<AuraFeaturePlugin> = listOf(
         AuraFeaturePlugin(
             id = "freellm_omniroute_9b",
@@ -167,20 +182,48 @@ object AuraPluginStore {
     @JvmStatic
     fun getActiveSkillsForBrain(): String = cachedBrainSkillsText
 
+    /**
+     * Called by AutoTouchService and MemoryVault to synchronize active plugin skills
+     */
+    @JvmStatic
+    fun syncFromContext(context: Context) {
+        refreshCachedSkills(context)
+    }
+
     fun isInstalled(context: Context, pluginId: String): Boolean {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val set = prefs.getStringSet(KEY_INSTALLED_SET, setOf("freellm_omniroute_9b", "adhd_no_ai_slop")) ?: emptySet()
-        return set.contains(pluginId)
+        val storePrefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val storeSet = storePrefs.getStringSet(KEY_INSTALLED_SET, setOf("freellm_omniroute_9b", "adhd_no_ai_slop")) ?: emptySet()
+
+        val mainPrefs = context.getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+        val mainSet = mainPrefs.getStringSet("installed_store_plugins", emptySet()) ?: emptySet()
+
+        return storeSet.contains(pluginId) || mainSet.contains(pluginId)
     }
 
     fun refreshCachedSkills(context: Context): String {
-        val active = allPlugins.filter { isInstalled(context, it.id) }
-        cachedBrainSkillsText = if (active.isEmpty()) {
-            ""
-        } else {
-            active.joinToString("\n") { "- ${it.brainSkillInstruction}" }
+        return try {
+            val activeLines = mutableListOf<String>()
+
+            for (plugin in allPlugins) {
+                if (isInstalled(context, plugin.id)) {
+                    activeLines.add("- ${plugin.brainSkillInstruction}")
+                }
+            }
+
+            val mainPrefs = context.getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+            val mainSet = mainPrefs.getStringSet("installed_store_plugins", emptySet()) ?: emptySet()
+            for (id in mainSet) {
+                val mapped = legacySkillMap[id]
+                if (mapped != null && activeLines.none { it.contains(mapped) }) {
+                    activeLines.add("- $mapped")
+                }
+            }
+
+            cachedBrainSkillsText = activeLines.joinToString("\n")
+            cachedBrainSkillsText
+        } catch (_: Exception) {
+            cachedBrainSkillsText
         }
-        return cachedBrainSkillsText
     }
 
     fun installAndUnlockAccess(activity: Activity, plugin: AuraFeaturePlugin, onUpdated: () -> Unit) {
