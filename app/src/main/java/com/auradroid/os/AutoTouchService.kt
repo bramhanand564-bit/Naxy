@@ -1,4 +1,4 @@
-Package com.auradroid.os
+package com.auradroid.os
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
