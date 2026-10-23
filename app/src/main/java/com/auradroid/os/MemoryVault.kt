@@ -19,7 +19,7 @@ import kotlin.math.hypot
 data class LearnedFixRecord(
     val id: String,
     val appCategory: String,
-    val sourceType: String,         // "LIVE_CODE_RULE", "AUTO_3.8_REFLECTION", "HUMAN_TOUCH_FIX", "VIDEO_FRAME_TRAINING", "RUN_CHAT_CORRECTION"
+    val sourceType: String,
     val screenSignature: String,
     val problemDescription: String,
     val solutionRule: String,
@@ -32,7 +32,7 @@ data class AutomationRunRecord(
     val runId: String,
     val title: String,
     val appCategory: String,
-    val status: String,             // "SUCCESS", "FAILED", "STOPPED"
+    val status: String,
     val timestamp: String,
     val stepsSummary: List<String>,
     val screenshotPaths: List<String>,
@@ -48,48 +48,6 @@ data class VideoTrainingSession(
     val extractedRulesSummary: List<String>,
     val chatHistory: List<String>
 )
-
-/**
- * Global bridge so GeminiBrain & AutoTouchService automatically read whichever
- * features the user installed in MainActivity's 1-Tap AuraStore!
- */
-object AuraPluginStore {
-    @Volatile
-    private var activeBrainSkillsSummary: String =
-        "- [9B_TOKEN_ROUTER]: Route seamlessly across FreeLLMAPI (localhost:3001) and OmniRoute pools.\n" +
-            "- [OPENDOTS_BACKGROUND_PC]: Use BACKGROUND_WEB mode for web studio & generator tasks.\n" +
-            "- [ADHD_NO_SLOP]: Be concise, direct, and numbered. No generic AI filler."
-
-    private val skillMap = mapOf(
-        "freellm_omniroute_9b" to "[9B_TOKEN_ROUTER]: Route seamlessly across FreeLLMAPI (localhost:3001) and OmniRoute pools.",
-        "opendots_bg_pc" to "[OPENDOTS_BACKGROUND_PC]: Prefer BACKGROUND_WEB execution for web studio, YouTube Studio, and AI generator tasks.",
-        "hermes_agenttube_yt" to "[HERMES_YT_PIPELINE]: Pick unposted video from folder ledger, extract audio/screen text, write viral Hinglish title/tags, upload via YouTube Studio UI, and click 'Publish anyway' on check dialogs.",
-        "ruflo_adk_swarm" to "[RUFLO_ADK_SWARM]: Act as Queen Orchestrator. Decompose goals into specialized Sub-Agent micro-steps ([FAST_LITE], [ROBOTICS_XY], [DEEP_3.8]).",
-        "moneyprinter_hypit_viral" to "[MONEYPRINTER_HYPIT]: Build a 3-second viral hook, scene-by-scene B-roll prompts, karaoke subtitle blocks, and high-CTR title.",
-        "open_gen_ai_studio" to "[OPEN_GEN_STUDIO]: Use free generative studios (Qwen Image, Wan AI, MiniMax H3, Synthesia, Google Flow) in Background Dot.",
-        "heygem_comfy_avatar" to "[HEYGEM_AVATAR]: Design talking-head avatar scripts with natural lip-sync pacing and visual node prompts.",
-        "omnivoice_handy_voice" to "[OMNIVOICE_HANDY]: Reply with natural, human-like emotional intonation and conversational Hinglish warmth.",
-        "adhd_no_ai_slop" to "[ADHD_NO_SLOP]: Be ultra-concise, direct, and numbered. Eliminate generic AI filler phrases.",
-        "open_notebook_book_skill" to "[BOOK_TO_SKILL]: Distill large notes or documents into modular chapter rules and recall only relevant rules.",
-        "openseo_job_assistant" to "[OPENSEO_JOB_AGENT]: Perform deep keyword/competitor SEO optimization for titles/tags and tailor resumes.",
-        "strix_security_public_apis" to "[STRIX_PUBLIC_APIS]: Audit workflows for reliability/security flaws and leverage free public APIs."
-    )
-
-    fun syncFromContext(context: Context) {
-        try {
-            val prefs = context.getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
-            val installed = prefs.getStringSet(
-                "installed_store_plugins",
-                setOf("freellm_omniroute_9b", "opendots_bg_pc", "adhd_no_ai_slop")
-            ) ?: emptySet()
-            val lines = installed.mapNotNull { id -> skillMap[id]?.let { "- $it" } }
-            activeBrainSkillsSummary = lines.joinToString("\n")
-        } catch (_: Exception) {}
-    }
-
-    @JvmStatic
-    fun getActiveSkillsForBrain(): String = activeBrainSkillsSummary
-}
 
 class MemoryVault(private val context: Context) {
 
@@ -110,11 +68,9 @@ class MemoryVault(private val context: Context) {
 
     private val profileFile: File = File(rootDir, "user_profile_rules.json")
     private val persistentLogsFile: File = File(rootDir, "system_action_logs.txt")
-    // Hermes-style state.json ledger to track posted videos & notebook skill chunks
     private val hermesLedgerFile: File = File(rootDir, "hermes_posted_ledger.json")
     private val notebookSkillsFile: File = File(rootDir, "notebook_book_skills.json")
 
-    // Fast In-Memory Cache for Logs to prevent Main-Thread Disk I/O lag
     private val cachedLogs = ArrayDeque<String>()
     private var logsInitialized = false
 
@@ -122,9 +78,6 @@ class MemoryVault(private val context: Context) {
         AuraPluginStore.syncFromContext(context)
     }
 
-    /**
-     * Maps any package name, app name, or Hindi/Hinglish goal into a single canonical Category folder
-     */
     fun resolveCategoryFolder(packageName: String, taskGoal: String): String {
         val combined = "$packageName $taskGoal".lowercase(Locale.ROOT)
         return when {
@@ -154,9 +107,6 @@ class MemoryVault(private val context: Context) {
         return File(rootDir, safeName).apply { if (!exists()) mkdirs() }
     }
 
-    /**
-     * Firewall check to block poisoned/unverified rules from ever entering MemoryVault
-     */
     private fun isPoisonedRuleText(problem: String, rule: String, source: String): Boolean {
         if (rule.contains("@213") || problem.contains("@213")) return true
         if (rule.contains("Chat not selected", ignoreCase = true)) return true
@@ -165,10 +115,6 @@ class MemoryVault(private val context: Context) {
         return false
     }
 
-    /**
-     * Saves any Learned Rule (Live 1-2-3 Point Rule, Auto Post-Run Reflection, Human Touch, Video Frame Training, or Chat Correction)
-     * Includes Smart Upsert/Deduplication and protects LIVE_CODE_RULE entries from being pruned!
-     */
     @Suppress("DEPRECATION")
     fun saveStuckOrHumanFix(
         category: String,
@@ -265,7 +211,6 @@ class MemoryVault(private val context: Context) {
         }
         existingList.add(newObj)
 
-        // Cap per-category rules to 60 entries; never drop LIVE_CODE_RULE if auto-reflections exist
         while (existingList.size > 60) {
             val dropIdx = existingList.indexOfFirst {
                 it.optString("sourceType").contains("REFLECTION", true)
@@ -288,12 +233,6 @@ class MemoryVault(private val context: Context) {
         writeTextSafely(fixesFile, outArr.toString(2))
     }
 
-    /**
-     * Recalls learned rules for an App Category, strictly prioritizing:
-     * 1. Explicit 1-2-3 Point & Video Laws (LIVE_CODE_RULE / CHAT_VIDEO_LAW)
-     * 2. Human Touch & Video Chat Fixes
-     * 3. Latest Verified Pro+Robotics Reflections
-     */
     fun recallFixesForApp(category: String): List<LearnedFixRecord> = synchronized(vaultLock) {
         val canonicalCat = resolveCategoryFolder(category, category)
         val catDir = getCategoryDir(canonicalCat)
@@ -359,10 +298,6 @@ class MemoryVault(private val context: Context) {
         }.sortedByDescending { it.second }
     }
 
-    // =========================================================================
-    // HERMES VIDEO LEDGER (state.json) & BOOK-TO-SKILL NOTEBOOK CHUNKS
-    // =========================================================================
-
     fun markVideoAsPostedInLedger(videoFilePathOrName: String, platform: String = "YouTube") = synchronized(vaultLock) {
         val key = File(videoFilePathOrName).name.lowercase(Locale.ROOT)
         val obj = try {
@@ -403,10 +338,6 @@ class MemoryVault(private val context: Context) {
         )
         writeTextSafely(notebookSkillsFile, arr.toString(2))
     }
-
-    // =========================================================================
-    // 1. AUTOMATION RUN SESSIONS (Save every run + Screenshots + Auto Reflection)
-    // =========================================================================
 
     @Suppress("DEPRECATION")
     fun saveAutomationRunSession(
@@ -515,10 +446,6 @@ class MemoryVault(private val context: Context) {
         }
         return list
     }
-
-    // =========================================================================
-    // 2. VIDEO TRAINING SESSIONS (Exact Frame Extraction + Visual Deduplication)
-    // =========================================================================
 
     @Suppress("DEPRECATION")
     fun createVideoTrainingSession(
@@ -739,10 +666,6 @@ class MemoryVault(private val context: Context) {
         }
     }
 
-    // =========================================================================
-    // 3. FAST IN-MEMORY + PERSISTENT LOGS & USER PROFILE RULES
-    // =========================================================================
-
     private fun ensureLogsLoadedLocked() {
         if (logsInitialized) return
         logsInitialized = true
@@ -803,10 +726,6 @@ class MemoryVault(private val context: Context) {
             dir.deleteRecursively()
         } catch (_: Exception) {}
     }
-
-    // =========================================================================
-    // 4. ATOMIC WRITE & AUTO-PRUNE STORAGE HELPERS
-    // =========================================================================
 
     private fun writeTextSafely(targetFile: File, content: String) {
         try {
