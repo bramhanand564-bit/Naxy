@@ -72,36 +72,37 @@ class GeminiBrain(private var apiKey: String) {
 
     private val rateLock = Any()
 
-    // Supports FreeLLMAPI (localhost:3001), OmniRoute (localhost:20128), and Google Gemini (AIza...)
+    // Supports FreeLLMAPI (localhost:3001), OmniRoute, and Google Gemini (1 or more AIza... backup keys)
     @Volatile
     private var freeLlmBaseUrl: String = "http://127.0.0.1:3001"
     @Volatile
     private var freeLlmApiKey: String = ""
     @Volatile
     private var googleGeminiKey: String = ""
+    @Volatile
+    private var googleBackupKeys: List<String> = emptyList()
+    @Volatile
+    private var activeGoogleKeyIndex: Int = 0
 
+    // ONLY Google's 3 Official, High-Reliability, Fast Models (Removed gemma-4 500s & 3.1-pro 429s!)
     private val smartVisionLadder = listOf(
         "gemini-3.8-flash",
-        "gemini-robotics-er-2-preview",
         "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-        "gemini-3.1-pro-preview",
-        "gemma-4-31b-it",
-        "gemma-4-26b-a4b-it"
+        "gemini-robotics-er-2-preview"
     )
 
-    private val gemmaCasualAndTextLadder = listOf(
-        "gemma-4-31b-it",
-        "gemma-4-26b-a4b-it",
-        "gemini-3.1-flash-lite",
+    private val textAndMetadataLadder = listOf(
+        "gemini-3.8-flash",
         "gemini-3.5-flash-lite"
     )
 
-    private var fastRelayToggle = false
     private val modelRequestTimestamps = mutableMapOf<String, MutableList<Long>>()
     private val lastModelCallTimeMs = mutableMapOf<String, Long>()
     private val blockedModels = mutableSetOf<String>()
     private val quotaCooldownModels = mutableMapOf<String, Long>()
+
+    // Minimum safe inter-call gap so two calls NEVER hit Google with 0.01s gap!
+    private val minGlobalInterCallGapMs = 2_200L
 
     // Detailed API Telemetry & Timing State
     @Volatile
@@ -136,7 +137,6 @@ class GeminiBrain(private var apiKey: String) {
     private fun parseAndApplyKeyConfig(rawInput: String) {
         val raw = rawInput.trim()
         var detectedFreeKey = ""
-        var detectedGoogleKey = ""
         var detectedUrl = "http://127.0.0.1:3001"
 
         val urlRegex = Regex("(https?://[^\\s\"'|,;]+)", RegexOption.IGNORE_CASE)
@@ -155,22 +155,43 @@ class GeminiBrain(private var apiKey: String) {
         }
 
         val googleKeyRegex = Regex("(AIza[a-zA-Z0-9_\\-]{20,})")
-        googleKeyRegex.find(raw)?.groupValues?.get(1)?.let {
-            detectedGoogleKey = it.trim()
-        }
+        val allGoogleKeys = googleKeyRegex.findAll(raw).map { it.groupValues[1].trim() }.distinct().toList()
 
-        if (detectedFreeKey.isEmpty() && detectedGoogleKey.isEmpty() && raw.isNotBlank()) {
+        if (detectedFreeKey.isEmpty() && allGoogleKeys.isEmpty() && raw.isNotBlank()) {
             if (raw.contains("3001") || raw.contains("20128") || raw.contains("freellm", ignoreCase = true) || !raw.startsWith("AIza")) {
                 val cleanedKey = raw.substringAfter("API_KEY=", raw).lineSequence().firstOrNull()?.trim() ?: raw
                 detectedFreeKey = cleanedKey
             } else {
-                detectedGoogleKey = raw
+                googleGeminiKey = raw
+                googleBackupKeys = listOf(raw)
+                activeGoogleKeyIndex = 0
+                freeLlmBaseUrl = detectedUrl
+                freeLlmApiKey = detectedFreeKey
+                return
             }
         }
 
         freeLlmBaseUrl = detectedUrl
         freeLlmApiKey = detectedFreeKey
-        googleGeminiKey = detectedGoogleKey
+        googleBackupKeys = allGoogleKeys
+        activeGoogleKeyIndex = 0
+        googleGeminiKey = allGoogleKeys.firstOrNull() ?: ""
+    }
+
+    private fun getCurrentGoogleKey(): String {
+        val keys = googleBackupKeys
+        if (keys.isEmpty()) return googleGeminiKey
+        val idx = activeGoogleKeyIndex.coerceIn(0, keys.lastIndex)
+        return keys[idx]
+    }
+
+    private fun switchToNextBackupGoogleKeyIfAvailable(): Boolean {
+        val keys = googleBackupKeys
+        if (keys.size <= 1) return false
+        activeGoogleKeyIndex = (activeGoogleKeyIndex + 1) % keys.size
+        googleGeminiKey = keys[activeGoogleKeyIndex]
+        onBrainLog?.invoke("🔑 Switched safely to Backup API Key #${activeGoogleKeyIndex + 1}/${keys.size}")
+        return true
     }
 
     private fun isFreeLlmConfigured(): Boolean = freeLlmApiKey.isNotBlank()
@@ -179,21 +200,17 @@ class GeminiBrain(private var apiKey: String) {
     private fun getMaxSafeRpmForModel(model: String): Int = when {
         model.startsWith("freellmapi:") -> 30
         model.contains("3.8-flash") -> 5
+        model.contains("flash-lite") -> 10
         model.contains("robotics") -> 5
-        model.contains("flash-lite") -> 6
-        model.contains("pro") -> 2
-        model.startsWith("gemma") -> 8
         else -> 5
     }
 
     private fun getMinSafeGapMsForModel(model: String): Long = when {
         model.startsWith("freellmapi:") -> 1_500L
-        model.contains("3.8-flash") -> 13_000L
+        model.contains("3.8-flash") -> 12_000L
+        model.contains("flash-lite") -> 6_000L
         model.contains("robotics") -> 12_000L
-        model.contains("flash-lite") -> 10_000L
-        model.contains("pro") -> 35_000L
-        model.startsWith("gemma") -> 7_000L
-        else -> 12_000L
+        else -> 10_000L
     }
 
     private fun isModelInHard429Cooldown(model: String, nowMs: Long = System.currentTimeMillis()): Boolean =
@@ -290,7 +307,7 @@ class GeminiBrain(private var apiKey: String) {
                 timestampMs = now
             )
             recentApiCallHistory.add(rec)
-            recentApiCallHistory.removeAll { now - it.timestampMs > 300_000L } // Keep 5 mins window
+            recentApiCallHistory.removeAll { now - it.timestampMs > 300_000L }
 
             val lastMinRecords = recentApiCallHistory.filter { now - it.timestampMs <= 60_000L }
             oneMinCalls = lastMinRecords.size
@@ -326,9 +343,6 @@ class GeminiBrain(private var apiKey: String) {
         perModelTotalTimeMs.clear()
     }
 
-    /**
-     * Full Live Test Report for Engine Tab showing exact per-minute calls, seconds spent, quota left & per-model breakdown
-     */
     fun getDetailedApiTelemetryReport(): String = synchronized(rateLock) {
         val now = System.currentTimeMillis()
         val lastMinList = recentApiCallHistory.filter { now - it.timestampMs <= 60_000L }
@@ -341,6 +355,9 @@ class GeminiBrain(private var apiKey: String) {
         sb.append("⚡ 1-Min Live Meter: $oneMinCalls Calls | ⏱️ $oneMinSec API Time (Wait: $oneMinWaitSec)\n")
         sb.append("📊 Session Total: $totalApiCallsSession Calls (✅ $totalSuccessCallsSession OK | ⚠️ $totalQuota429HitsSession Quota 429)\n")
         sb.append("⏱️ Total API Time: ${formatSec(totalApiTimeMsSession)} (Avg: $avgSec/call) | 🪙 Total Tokens: $totalTokensUsedSession\n")
+        if (googleBackupKeys.size > 1) {
+            sb.append("🔑 Active Key Pool: Key #${activeGoogleKeyIndex + 1} of ${googleBackupKeys.size}\n")
+        }
 
         if (perModelCallCount.isNotEmpty()) {
             sb.append("\n🤖 Model-Wise Usage Breakdown:\n")
@@ -351,10 +368,10 @@ class GeminiBrain(private var apiKey: String) {
             }
         }
 
-        val last3 = recentApiCallHistory.takeLast(4).reversed()
-        if (last3.isNotEmpty()) {
+        val last4 = recentApiCallHistory.takeLast(4).reversed()
+        if (last4.isNotEmpty()) {
             sb.append("\n🕒 Recent API Calls (किस काम में कितना समय लगा):\n")
-            for (r in last3) {
+            for (r in last4) {
                 sb.append(" • #${r.callNumber} [${r.purpose}] ➔ ${formatSec(r.durationMs)} (Gap: ${formatSec(r.gapSincePrevMs)}, ${r.tokensUsed} tok, ${r.model})\n")
             }
         }
@@ -371,6 +388,9 @@ class GeminiBrain(private var apiKey: String) {
         }
 
         if (isGoogleGeminiConfigured() || !isFreeLlmConfigured()) {
+            if (googleBackupKeys.size > 1) {
+                lines.add("🔑 Google API Keys Configured: ${googleBackupKeys.size} (Active: #${activeGoogleKeyIndex + 1})")
+            }
             smartVisionLadder.forEach { m ->
                 val used = getUsedRpmInLastMinute(m, now)
                 val maxRpm = getMaxSafeRpmForModel(m)
@@ -378,7 +398,7 @@ class GeminiBrain(private var apiKey: String) {
                 val gapSec = getMinSafeGapMsForModel(m) / 1000L
                 val waitMs = getWaitTimeMsForModel(m, now)
                 val status = when {
-                    blockedModels.contains(m) -> "🚫 $m (Unavailable)"
+                    blockedModels.contains(m) -> "🚫 $m (Daily Quota Full)"
                     waitMs > 0L -> "⏳ $m (Wait ${(waitMs / 1000L).coerceAtLeast(1L)}s | Used $used/$maxRpm RPM, $left left | ${gapSec}s Gap)"
                     else -> "✅ $m (Ready | Used $used/$maxRpm RPM, $left left | ${gapSec}s Gap)"
                 }
@@ -452,11 +472,12 @@ class GeminiBrain(private var apiKey: String) {
 
     private fun buildFreeLlmGearCandidates(preferredGear: String): List<String> = when (preferredGear) {
         "FAST_LITE", "GEMMA_TEXT" -> listOf("freellmapi:auto", "freellmapi:auto:fast")
-        "PRO_DEEP_DIAGNOSIS", "ROBOTICS_PRECISION", "COPILOT_38_ROBOTICS", "HEAVY_38_ONLY" ->
-            listOf("freellmapi:auto", "freellmapi:auto:smart")
-        else -> listOf("freellmapi:auto")
+        else -> listOf("freellmapi:auto", "freellmapi:auto:smart")
     }
 
+    /**
+     * Always prioritizes `gemini-3.8-flash` #1, backed by `gemini-3.5-flash-lite` and `gemini-robotics-er-2-preview`!
+     */
     private fun buildSmartGearLadder(preferredGear: String, hasImages: Boolean, isStuck: Boolean): List<String> {
         val freeLlmList = if (isFreeLlmConfigured()) buildFreeLlmGearCandidates(preferredGear) else emptyList()
 
@@ -465,29 +486,17 @@ class GeminiBrain(private var apiKey: String) {
         }
 
         val geminiList = if (!hasImages && preferredGear == "GEMMA_TEXT") {
-            gemmaCasualAndTextLadder + listOf("gemini-3.8-flash")
+            textAndMetadataLadder
         } else if (isStuck) {
-            listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
+            listOf("gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.5-flash-lite")
         } else {
             when (preferredGear) {
-                "COPILOT_38_ROBOTICS" -> {
-                    fastRelayToggle = !fastRelayToggle
-                    val first = if (fastRelayToggle) "gemini-3.8-flash" else "gemini-robotics-er-2-preview"
-                    val second = if (fastRelayToggle) "gemini-robotics-er-2-preview" else "gemini-3.8-flash"
-                    listOf(first, second, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview")
-                }
-                "PRO_DEEP_DIAGNOSIS" -> listOf("gemini-3.1-pro-preview", "gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
-                "ROBOTICS_PRECISION" -> listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
-                "HEAVY_38_ONLY" -> listOf("gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.1-pro-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
-                "ROBOTICS_XY" -> listOf("gemini-robotics-er-2-preview", "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
-                "FAST_LITE" -> {
-                    fastRelayToggle = !fastRelayToggle
-                    val first = if (fastRelayToggle) "gemini-3.5-flash-lite" else "gemini-3.1-flash-lite"
-                    val second = if (fastRelayToggle) "gemini-3.1-flash-lite" else "gemini-3.5-flash-lite"
-                    if (hasImages) listOf(first, second, "gemini-robotics-er-2-preview", "gemini-3.8-flash")
-                    else listOf(first, second, "gemma-4-31b-it", "gemma-4-26b-a4b-it", "gemini-3.8-flash")
-                }
-                else -> smartVisionLadder
+                "ROBOTICS_PRECISION", "ROBOTICS_XY" ->
+                    listOf("gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.5-flash-lite")
+                "FAST_LITE" ->
+                    listOf("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-robotics-er-2-preview")
+                else ->
+                    smartVisionLadder
             }
         }
 
@@ -496,6 +505,18 @@ class GeminiBrain(private var apiKey: String) {
         } else {
             geminiList + freeLlmList
         }
+    }
+
+    private suspend fun enforceSafeGlobalInterCallGap(): Long {
+        val lastFinish = synchronized(rateLock) { lastGlobalApiCallFinishMs }
+        if (lastFinish <= 0L) return 0L
+        val elapsed = System.currentTimeMillis() - lastFinish
+        if (elapsed in 0L until minGlobalInterCallGapMs) {
+            val waitMs = minGlobalInterCallGapMs - elapsed
+            delay(waitMs)
+            return waitMs
+        }
+        return 0L
     }
 
     private suspend fun callWithLadder(
@@ -522,12 +543,21 @@ class GeminiBrain(private var apiKey: String) {
         val nonCooldownModels = gearLadder.filter { !isModelInHard429Cooldown(it, now) }
         val activePool = nonCooldownModels.ifEmpty { gearLadder }
 
-        val readyModels = activePool.filter { hasImmediateSafeSlot(it, now) }
-        val orderedCandidates = if (readyModels.isNotEmpty()) {
-            readyModels + (activePool - readyModels.toSet())
+        // Keep gemini-3.8-flash first whenever it is ready or within a short wait (<= 6s)!
+        val primary38ReadyOrSoon = activePool.firstOrNull {
+            it == "gemini-3.8-flash" && getWaitTimeMsForModel(it, now) <= 6_000L
+        }
+
+        val orderedCandidates = if (primary38ReadyOrSoon != null) {
+            listOf(primary38ReadyOrSoon) + (activePool - primary38ReadyOrSoon)
         } else {
-            val fastest = activePool.minByOrNull { getWaitTimeMsForModel(it, now) } ?: activePool.first()
-            listOf(fastest) + (activePool - fastest)
+            val readyModels = activePool.filter { hasImmediateSafeSlot(it, now) }
+            if (readyModels.isNotEmpty()) {
+                readyModels + (activePool - readyModels.toSet())
+            } else {
+                val fastest = activePool.minByOrNull { getWaitTimeMsForModel(it, now) } ?: activePool.first()
+                listOf(fastest) + (activePool - fastest)
+            }
         }
 
         for (model in orderedCandidates) {
@@ -537,20 +567,22 @@ class GeminiBrain(private var apiKey: String) {
                 continue
             }
 
-            val waitNeeded = getWaitTimeMsForModel(model, loopNow)
-            var actualPacerWaitMs = 0L
+            // 1. Always enforce a safe minimum global gap so two requests NEVER hit Google 0.01s apart!
+            var actualPacerWaitMs = enforceSafeGlobalInterCallGap()
+
+            // 2. Enforce per-model RPM pacer
+            val waitNeeded = getWaitTimeMsForModel(model, System.currentTimeMillis())
             if (waitNeeded > 0L) {
-                if (waitNeeded <= 15_000L) {
-                    onBrainLog?.invoke("⏱️ [$callPurpose] Quota Pacer: Waiting ${formatSec(waitNeeded)} for [$model]...")
+                if (waitNeeded <= 14_000L) {
+                    onBrainLog?.invoke("⏱️ [$callPurpose] Safe Pacer: Waiting ${formatSec(waitNeeded)} for [$model]...")
                     val wStart = System.currentTimeMillis()
                     delay(waitNeeded)
-                    actualPacerWaitMs = System.currentTimeMillis() - wStart
+                    actualPacerWaitMs += (System.currentTimeMillis() - wStart)
                 } else {
                     continue
                 }
             }
 
-            val usedBefore = getUsedRpmInLastMinute(model)
             recordModelRequestTimestamp(model)
 
             if (model.startsWith("freellmapi:")) {
@@ -576,40 +608,63 @@ class GeminiBrain(private var apiKey: String) {
                 }
             }
 
-            val modelImages = if (model.startsWith("gemma")) emptyList() else imagesBase64
             val startMs = System.currentTimeMillis()
-            val result = executeSingleModelCall(model, prompt, modelImages)
-            val durMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+            var result = executeSingleModelCall(model, prompt, imagesBase64)
+            var durMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
 
             recordAndLogApiCallTelemetry(
                 purpose = callPurpose,
                 model = model,
-                httpCode = result.first,
+                httpCode = result.httpCode,
                 durationMs = durMs,
                 pacerWaitMs = actualPacerWaitMs,
-                tokensInCall = result.third
+                tokensInCall = result.tokensUsed
             )
 
-            when (result.first) {
-                200 -> if (result.second.isNotBlank()) return@withContext Pair(result.second, model)
+            // Official Google 503 Backoff Rule: 503 is transient server overload, NOT quota! Wait 2.2s and retry same model once!
+            if (result.httpCode in listOf(500, 502, 503, 504)) {
+                onBrainLog?.invoke("⏳ [$callPurpose] [$model] transient ${result.httpCode} -> Waiting 2.2s & retrying [$model] (Google Official Backoff)...")
+                delay(2_200L)
+                recordModelRequestTimestamp(model)
+                val retryStartMs = System.currentTimeMillis()
+                result = executeSingleModelCall(model, prompt, imagesBase64)
+                durMs = (System.currentTimeMillis() - retryStartMs).coerceAtLeast(1L)
+
+                recordAndLogApiCallTelemetry(
+                    purpose = "$callPurpose (Retry)",
+                    model = model,
+                    httpCode = result.httpCode,
+                    durationMs = durMs,
+                    pacerWaitMs = 2_200L,
+                    tokensInCall = result.tokensUsed
+                )
+            }
+
+            when (result.httpCode) {
+                200 -> if (result.text.isNotBlank()) return@withContext Pair(result.text, model)
                 429 -> {
-                    val lockDuration = if (usedBefore <= 1) 120_000L else 65_000L
-                    synchronized(rateLock) {
-                        quotaCooldownModels[model] = System.currentTimeMillis() + lockDuration
+                    if (result.isDailyQuotaExhausted) {
+                        val switchedKey = switchToNextBackupGoogleKeyIfAvailable()
+                        if (!switchedKey) {
+                            synchronized(rateLock) {
+                                // Daily quota exhausted for this specific model -> rest it for 60 mins and use partner models
+                                quotaCooldownModels[model] = System.currentTimeMillis() + 3_600_000L
+                            }
+                            onBrainLog?.invoke("⚠️ [$callPurpose] Daily Quota (PerDay) reached on [$model] -> Using partner model...")
+                        }
+                    } else {
+                        val serverRetryMs = if (result.retryDelayMs > 0L) result.retryDelayMs + 1_500L else 35_000L
+                        synchronized(rateLock) {
+                            quotaCooldownModels[model] = System.currentTimeMillis() + serverRetryMs
+                        }
+                        onBrainLog?.invoke("⏱️ [$callPurpose] 1-Min Quota (429) on [$model] -> Resting ${serverRetryMs / 1000}s (from Google RetryInfo) & using partner model...")
                     }
-                    onBrainLog?.invoke("⚠️ [$callPurpose] Quota 429 on [$model] after ${formatSec(durMs)} -> Shifting gear (${lockDuration / 1000}s cooldown)...")
-                }
-                500, 502, 503, 504 -> {
-                    synchronized(rateLock) {
-                        quotaCooldownModels[model] = System.currentTimeMillis() + 25_000L
-                    }
-                    onBrainLog?.invoke("🔄 [$callPurpose] Model [$model] busy (${result.first}) after ${formatSec(durMs)} -> Shifting gear...")
                 }
                 else -> {
                     synchronized(rateLock) {
-                        quotaCooldownModels[model] = System.currentTimeMillis() + 30_000L
+                        quotaCooldownModels[model] = System.currentTimeMillis() + 15_000L
                     }
-                    onBrainLog?.invoke("🔄 [$callPurpose] Model [$model] (${result.first}) -> Shifting gear...")
+                    onBrainLog?.invoke("🔄 [$callPurpose] Model [$model] (${result.httpCode}) -> Shifting to partner model...")
                 }
             }
         }
@@ -621,6 +676,14 @@ class GeminiBrain(private var apiKey: String) {
         val second: String,
         val third: String,
         val fourth: Int
+    )
+
+    private data class GeminiCallResult(
+        val httpCode: Int,
+        val text: String,
+        val tokensUsed: Int,
+        val retryDelayMs: Long = 0L,
+        val isDailyQuotaExhausted: Boolean = false
     )
 
     private fun executeFreeLlmApiCall(
@@ -652,8 +715,8 @@ class GeminiBrain(private var apiKey: String) {
                 requestMethod = "POST"
                 setRequestProperty("Content-Type", "application/json")
                 setRequestProperty("Authorization", "Bearer $freeLlmApiKey")
-                connectTimeout = 10_000
-                readTimeout = 45_000
+                connectTimeout = 8_000
+                readTimeout = 25_000
                 doOutput = true
             }
 
@@ -698,18 +761,22 @@ class GeminiBrain(private var apiKey: String) {
         }
     }
 
+    /**
+     * Executes Official Google Gemini REST Call + Reads `RetryInfo.retryDelay` & `quotaId` on 429
+     */
     private fun executeSingleModelCall(
         model: String,
         prompt: String,
         imagesBase64: List<String>
-    ): Triple<Int, String, Int> {
+    ): GeminiCallResult {
         return try {
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$googleGeminiKey")
+            val activeKey = getCurrentGoogleKey()
+            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$activeKey")
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 setRequestProperty("Content-Type", "application/json")
-                connectTimeout = 10000
-                readTimeout = 22000
+                connectTimeout = 9_000
+                readTimeout = 18_000
                 doOutput = true
             }
             val partsArray = JSONArray().put(JSONObject().put("text", prompt))
@@ -722,7 +789,7 @@ class GeminiBrain(private var apiKey: String) {
                 put("contents", JSONArray().put(JSONObject().put("parts", partsArray)))
                 put("generationConfig", JSONObject().apply {
                     put("temperature", 0.1)
-                    if (!model.startsWith("gemma")) put("responseMimeType", "application/json")
+                    put("responseMimeType", "application/json")
                 })
             }
             conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
@@ -734,12 +801,25 @@ class GeminiBrain(private var apiKey: String) {
                 val usageMeta = json.optJSONObject("usageMetadata")
                 val totalTokens = usageMeta?.optInt("totalTokenCount", 0)?.takeIf { it > 0 }
                     ?: ((prompt.length + text.length) / 4 + imagesBase64.size * 258)
-                Triple(200, text.trim(), totalTokens)
+                GeminiCallResult(200, text.trim(), totalTokens)
+            } else if (code == 429) {
+                val errBody = try { conn.errorStream?.bufferedReader()?.readText() ?: "" } catch (_: Exception) { "" }
+                val isPerDay = errBody.contains("PerDay", ignoreCase = true) ||
+                    errBody.contains("RequestsPerDay", ignoreCase = true)
+                val retryMatch = Regex("\"retryDelay\"\\s*:\\s*\"(\\d+(?:\\.\\d+)?)s\"").find(errBody)
+                val retrySec = retryMatch?.groupValues?.get(1)?.toDoubleOrNull() ?: 25.0
+                GeminiCallResult(
+                    httpCode = 429,
+                    text = "",
+                    tokensUsed = 0,
+                    retryDelayMs = (retrySec * 1000L).toLong().coerceIn(5_000L, 65_000L),
+                    isDailyQuotaExhausted = isPerDay
+                )
             } else {
-                Triple(code, "", 0)
+                GeminiCallResult(code, "", 0)
             }
         } catch (_: Exception) {
-            Triple(500, "", 0)
+            GeminiCallResult(500, "", 0)
         }
     }
 
@@ -813,7 +893,7 @@ class GeminiBrain(private var apiKey: String) {
         val purposeName = if (isCasual) "Chat Reply" else "Task Plan Builder"
         val (raw, model) = callWithLadder(
             prompt = sysPrompt,
-            useDeep38Flash = !isCasual,
+            useDeep38Flash = true,
             preferredGear = gear,
             callPurpose = purposeName
         )
@@ -949,21 +1029,10 @@ class GeminiBrain(private var apiKey: String) {
 
         val currentStepIndex = currentStepHistory.size
         val stepNum = currentStepIndex + 1
-        val activePlannedStep = planSteps.getOrNull(currentStepIndex) ?: planSteps.lastOrNull() ?: goal
-
-        val isFirstTimeForApp = sortedFixes.isEmpty()
-        val preferredGear = when {
-            isStuck -> "ROBOTICS_PRECISION"
-            isFirstTimeForApp -> "COPILOT_38_ROBOTICS"
-            activePlannedStep.contains("ROBOTICS_XY", ignoreCase = true) -> "ROBOTICS_XY"
-            activePlannedStep.contains("DEEP_3.8", ignoreCase = true) -> "HEAVY_38_ONLY"
-            activePlannedStep.contains("FAST_LITE", ignoreCase = true) -> "FAST_LITE"
-            else -> "COPILOT_38_ROBOTICS"
-        }
 
         val navTop = bodySpecs.screenHeight - bodySpecs.navBarHeight
         val prompt = """
-            You are AuraDroid OS Autonomous Vision + Click Confirmation Engine (Gemini 3.8 + Robotics + FreeLLMAPI Co-Pilot).
+            You are AuraDroid OS Autonomous Vision + Click Confirmation Engine (Gemini 3.8 Flash Primary).
             
             DEVICE BODY SPECS: ${bodySpecs.modelName} (${bodySpecs.screenWidth}x${bodySpecs.screenHeight} px), Safe Top Y>${bodySpecs.cutoutSafeTop}, Nav Y>$navTop
             OVERALL GOAL: $goal
@@ -1009,8 +1078,8 @@ class GeminiBrain(private var apiKey: String) {
         val (raw, modelUsed) = callWithLadder(
             prompt = prompt,
             imagesBase64 = imgList,
-            useDeep38Flash = (preferredGear != "FAST_LITE"),
-            preferredGear = preferredGear,
+            useDeep38Flash = true,
+            preferredGear = "COPILOT_38_ROBOTICS",
             isStuck = isStuck,
             callPurpose = "Step #$stepNum Screen Decision"
         )
@@ -1034,6 +1103,9 @@ class GeminiBrain(private var apiKey: String) {
         }
     }
 
+    /**
+     * Single-Pass Lightweight Reflection (ONLY called when a live task FAILED, never on SUCCESS!)
+     */
     suspend fun autoReflectAndImproveAfterRun(
         appCategory: String,
         goal: String,
@@ -1044,71 +1116,34 @@ class GeminiBrain(private var apiKey: String) {
     ): PostRunReflectionResult {
         isLiveTaskCurrentlyRunning = false
 
+        // ZERO-WASTE RULE: Never burn 11,000 tokens auditing a run that already succeeded or was manually stopped!
+        if (finalStatus.equals("SUCCESS", ignoreCase = true) || finalStatus.equals("STOPPED", ignoreCase = true)) {
+            return PostRunReflectionResult(
+                reflectionSummary = "टास्क सफलतापूर्वक पूरा हुआ (Quota Saver: फालतू ऑडिट स्किप किया गया)।",
+                learnedRules = emptyList(),
+                modelUsed = "QuotaSaver"
+            )
+        }
+
         delay(10_000L)
         if (isLiveTaskCurrentlyRunning || (System.currentTimeMillis() - lastLiveStepTimestampMs) < 8_000L) {
-            onBrainLog?.invoke("⏸️ Deferred Autonomous Audit because a live task is running.")
             return PostRunReflectionResult("Deferred for live task", emptyList(), "IdleGuard")
         }
 
-        val imgsBase64 = runBitmaps.takeLast(8).map { bitmapToHdWebpBase64(it, maxHeight = 960) }
+        val imgsBase64 = runBitmaps.takeLast(4).map { bitmapToHdWebpBase64(it, maxHeight = 800) }
         val stepByStepLog = actualStepsTaken.mapIndexed { idx, s -> "Step ${idx + 1}: $s" }.joinToString("\n")
 
-        val stage1ProPrompt = """
-            You are Gemini 3.1 Pro Autonomous Step-by-Step Auditor & Universal Skill Architect for AuraDroid OS.
-            A run in app "$appCategory" finished with status "$finalStatus" for goal "$goal".
+        val singlePassPrompt = """
+            You are Gemini 3.8 Flash Autonomous Auditor for AuraDroid OS.
+            A run in app "$appCategory" ended with status "$finalStatus" for goal "$goal".
             Planned: ${plannedSteps.joinToString(" -> ")}
             Actual Steps Taken:
             $stepByStepLog
             
-            Examine all ${imgsBase64.size} sequential screenshots step by step (Step 1, Step 2, Step 3...):
-            1. Verify which clicks were confirmed successful and which steps skipped typing, repeated a click (like selecting/unselecting a friend on Share sheet), or tapped the wrong place.
-            2. Generalize into Reusable Modular App Skills ("[SKILL_SEARCH_TYPE]", "[SKILL_SELECT_VIDEO]", "[SKILL_LIKE]", "[SKILL_COMMENT_AND_BACK]", "[SKILL_SHARE_SELECT]", "[SKILL_SHARE_SEND]") using {search_query} and {friend_name} placeholders!
-            
-            Return ONLY JSON:
-            {
-              "diagnosisSummary": "Step-by-step Hinglish diagnosis of each step",
-              "draftSkills": [
-                {
-                  "skillName": "[SKILL_SEARCH_TYPE] or [SKILL_SHARE_SEND] etc.",
-                  "screenState": "Reusable screen description in $appCategory",
-                  "whatToTap": "Exact visual icon/button that must be tapped"
-                }
-              ]
-            }
-        """.trimIndent()
-
-        onBrainLog?.invoke("🧠 Stage 1/2 (Idle Audit): Diagnosing steps & generalizing reusable skills...")
-        val (stage1Raw, stage1Model) = callWithLadder(
-            prompt = stage1ProPrompt,
-            imagesBase64 = imgsBase64,
-            useDeep38Flash = true,
-            preferredGear = "PRO_DEEP_DIAGNOSIS",
-            callPurpose = "Post-Run Audit Stage 1 ($appCategory)"
-        )
-
-        if (stage1Model == "All models busy" || stage1Raw.isBlank()) {
-            onBrainLog?.invoke("⏸️ Stage 1 Audit skipped (models cooling down). No unverified rules saved.")
-            return PostRunReflectionResult("Models cooling down — skipped saving unverified rules.", emptyList(), "CooldownGuard")
-        }
-
-        for (sec in 1..15) {
-            if (isLiveTaskCurrentlyRunning) {
-                onBrainLog?.invoke("⏸️ Paused Stage 2 Audit because a live task started.")
-                return PostRunReflectionResult("Paused for live task", emptyList(), stage1Model)
-            }
-            delay(1_000L)
-        }
-
-        val stage2RoboticsPrompt = """
-            You are Gemini Robotics-ER Spatial Coordinate Engineer for AuraDroid OS.
-            Stage 1 Pro Diagnosis for "$appCategory" (Goal: "$goal"):
-            $stage1Raw
-            
-            Look at the ${imgsBase64.size} screenshots and measure the EXACT 0.00 to 1.00 screen X,Y coordinates ("tapXRatio", "tapYRatio") for every reusable skill & fix so the AI can execute them autonomously on ANY future task!
-            
+            Inspect the screenshots, measure the exact 0.00..1.00 "tapXRatio" & "tapYRatio" where it got stuck, and output reusable skills.
             Return ONLY valid JSON:
             {
-              "reflectionSummary": "Clear Hinglish Step-by-Step audit report & reusable skills learned",
+              "reflectionSummary": "Clear Hinglish diagnosis & fix",
               "rules": [
                 {
                   "screenWhen": "[UNIVERSAL_SKILL] Reusable screen state in $appCategory",
@@ -1120,40 +1155,37 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        onBrainLog?.invoke("🦾 Stage 2/2 (Idle Audit): Measuring exact X,Y coordinates for reusable skills...")
-        val (raw, stage2Model) = callWithLadder(
-            prompt = stage2RoboticsPrompt,
+        val (raw, modelUsed) = callWithLadder(
+            prompt = singlePassPrompt,
             imagesBase64 = imgsBase64,
             useDeep38Flash = true,
-            preferredGear = "ROBOTICS_PRECISION",
-            callPurpose = "Post-Run Audit Stage 2 XY ($appCategory)"
+            preferredGear = "COPILOT_38_ROBOTICS",
+            callPurpose = "Failed-Run Diagnosis ($appCategory)"
         )
 
-        if (stage2Model == "All models busy" || raw.isBlank()) {
-            onBrainLog?.invoke("⏸️ Stage 2 Audit skipped (models cooling down). No unverified rules saved.")
-            return PostRunReflectionResult("Stage 2 skipped due to quota cooldown.", emptyList(), stage1Model)
+        if (modelUsed == "All models busy" || raw.isBlank()) {
+            return PostRunReflectionResult("Skipped due to cooldown.", emptyList(), "CooldownGuard")
         }
 
-        val combinedModelTag = "$stage1Model+$stage2Model"
         val extractedRules = mutableListOf<LearnedFixRecord>()
-        var summaryText = "Autonomous Audit ने हर स्टेप की जाँच करके Reusable Skills और सटीक XY कोऑर्डिनेट्स खुद लागू कर लिए हैं।"
+        var summaryText = "ऑडिट पूरा हुआ।"
 
         try {
             val j = parseCleanJson(raw)
-            summaryText = j.optString("reflectionSummary", j.optString("diagnosisSummary", summaryText))
+            summaryText = j.optString("reflectionSummary", summaryText)
             val arr = j.optJSONArray("rules") ?: JSONArray()
             for (i in 0 until arr.length()) {
                 val item = arr.getJSONObject(i)
                 val record = LearnedFixRecord(
                     id = "refl_${System.currentTimeMillis()}_$i",
                     appCategory = appCategory,
-                    sourceType = "PRO_ROBOTICS_SKILL ($combinedModelTag)",
+                    sourceType = "PRO_ROBOTICS_SKILL ($modelUsed)",
                     screenSignature = "universal_skill_$i",
                     problemDescription = item.optString("screenWhen", "[UNIVERSAL_SKILL] Step ${i + 1} in $appCategory"),
                     solutionRule = item.optString("actionInstruction", "Follow autonomous skill coordinate"),
                     tapXRatio = item.optDouble("tapXRatio", 0.5).toFloat(),
                     tapYRatio = item.optDouble("tapYRatio", 0.5).toFloat(),
-                    timestamp = "Pro+Robotics"
+                    timestamp = "AutoFix"
                 )
                 if (isValidReusableSkill(record)) {
                     extractedRules.add(record)
@@ -1161,12 +1193,10 @@ class GeminiBrain(private var apiKey: String) {
             }
         } catch (_: Exception) {}
 
-        onBrainLog?.invoke("✨ [$combinedModelTag] Autonomous Audit Complete! Saved ${extractedRules.size} verified skills for $appCategory.")
-
         return PostRunReflectionResult(
             reflectionSummary = summaryText,
             learnedRules = extractedRules,
-            modelUsed = combinedModelTag
+            modelUsed = modelUsed
         )
     }
 
@@ -1186,7 +1216,7 @@ class GeminiBrain(private var apiKey: String) {
         val pinnedXy = extractPinnedXyFromUserMessage(userCorrectionMessage)
 
         val prompt = """
-            You are Gemini Robotics-ER & 3.1 Pro Run-Correction Architect inside AuraDroid OS.
+            You are Gemini 3.8 Flash Run-Correction Architect inside AuraDroid OS.
             The user is reviewing past run "${runRecord.title}" in app "${runRecord.appCategory}".
             Steps Taken: ${runRecord.stepsSummary.mapIndexed { i, s -> "Step ${i + 1}: $s" }.joinToString(" | ")}
             User Correction: "$userCorrectionMessage"
@@ -1246,7 +1276,7 @@ class GeminiBrain(private var apiKey: String) {
     ): MemoryChatReply {
         val pinnedXy = extractPinnedXyFromUserMessage(userMessage)
         val prompt = """
-            You are Gemini Robotics-ER & 3.1 Pro Video-Memory Coach for app "${videoSession.appCategory}".
+            You are Gemini 3.8 Flash Video-Memory Coach for app "${videoSession.appCategory}".
             Initial Note: ${videoSession.userNote}
             Rules So Far: ${videoSession.extractedRulesSummary.joinToString(" | ")}
             User Message: "$userMessage"
@@ -1320,7 +1350,7 @@ class GeminiBrain(private var apiKey: String) {
         val normY = (humanTapYRatio * 1000).toInt()
 
         val prompt = """
-            You are Gemini Robotics-ER Spatial Skill Learner.
+            You are Gemini 3.8 Flash Spatial Skill Learner.
             During "$goal" in "$appCategory", the human tapped at 0..1000 XY($normX, $normY) on [$cleanDesc].
             Image 1 = BEFORE, Image 2 = AFTER.
             Generalize this tap into a Reusable App Skill (so it works for any future search/song/friend in $appCategory).
@@ -1366,7 +1396,7 @@ class GeminiBrain(private var apiKey: String) {
         framesBase64: List<String>
     ): List<LearnedFixRecord> {
         val prompt = """
-            You are Gemini Robotics-ER & 3.1 Pro Video Skill Extractor for app "$appCategory" (Note: "$userInstruction").
+            You are Gemini 3.8 Flash Video Skill Extractor for app "$appCategory" (Note: "$userInstruction").
             Inspect all ${framesBase64.size} sequential frames, measure exact 0.0..1.0 "tapXRatio" & "tapYRatio", and extract reusable modular skills (Search, Play, Like, Comment, Share to Friend) that work on any future topic/friend!
             Return ONLY JSON:
             {
@@ -1416,24 +1446,51 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * Generates Flow 9:16 Video Prompt + Viral Title + Full SEO Description & Hashtags
+     * Strips raw timestamps/filenames like `flow_1792855090413` or `VID_2026...` so numbers NEVER appear in YouTube titles!
+     */
+    fun sanitizeRawVideoTopic(rawTopicOrFileName: String): String {
+        val withoutExt = rawTopicOrFileName
+            .substringBeforeLast(".")
+            .replace(Regex("(?i)\\b(flow|vid|video|lv|inshot|capcut|vn|km)[_\\-\\s]*\\d{5,}\\b"), "")
+            .replace(Regex("\\b\\d{7,}\\b"), "")
+            .replace("_", " ")
+            .replace("-", " ")
+            .trim()
+        return withoutExt.ifBlank { "Amazing Cinematic Viral Short Video" }
+    }
+
+    /**
+     * Generates Flow 9:16 Video Prompt + Viral Title + Full SEO Description & Hashtags.
+     * If `videoFrameBitmap` is provided, AI looks directly at the actual video frame to write a 100% matching Title & Description!
      */
     suspend fun generateFlowPromptTitleAndDescription(
         topic: String,
-        customDescriptionNote: String = ""
+        customDescriptionNote: String = "",
+        videoFrameBitmap: Bitmap? = null
     ): FlowVideoMetadata {
-        val cleanTopic = topic.trim().ifEmpty { "Beautiful cinematic vertical video" }
+        val cleanTopic = sanitizeRawVideoTopic(topic)
         val descHint = if (customDescriptionNote.isNotBlank()) {
             "Also include or follow this user description note: '$customDescriptionNote'."
         } else {
             "Write an engaging 3-line viral description with trending hashtags (#shorts #viral #trending)."
         }
 
+        val frameB64List = if (videoFrameBitmap != null) {
+            listOf(bitmapToHdWebpBase64(videoFrameBitmap, maxHeight = 640))
+        } else {
+            emptyList()
+        }
+
+        val visualInstruction = if (frameB64List.isNotEmpty()) {
+            "Look at the attached video frame image and write a catchy, 100% matching viral YouTube Shorts / Instagram Reels title and description for what is shown in the video (Hint: '$cleanTopic'). NEVER include random file numbers or timestamps in the title!"
+        } else {
+            "Create a vertical 9:16 video generation prompt, a viral YouTube Shorts / Instagram Reels title, and a full engaging description strictly for: '$cleanTopic'. NEVER include random file numbers or timestamps in the title!"
+        }
+
         val prompt = """
-            Create a vertical 9:16 video generation prompt, a viral YouTube Shorts / Instagram Reels title, and a full engaging description strictly for: "$cleanTopic".
+            $visualInstruction
             $descHint
-            Stay 100% faithful to "$cleanTopic".
-            Return ONLY JSON:
+            Return ONLY valid JSON:
             {
               "videoPrompt": "Cinematic 8k vertical 9:16 video of...",
               "youtubeTitle": "Catchy Viral Title! ✨ #shorts #viral",
@@ -1443,8 +1500,9 @@ class GeminiBrain(private var apiKey: String) {
 
         val (raw, _) = callWithLadder(
             prompt = prompt,
-            useDeep38Flash = false,
-            preferredGear = "GEMMA_TEXT",
+            imagesBase64 = frameB64List,
+            useDeep38Flash = true,
+            preferredGear = if (frameB64List.isNotEmpty()) "COPILOT_38_ROBOTICS" else "GEMMA_TEXT",
             callPurpose = "Flow Prompt + Viral Title & Description"
         )
         return try {
