@@ -311,6 +311,9 @@ class AutoTouchService : AccessibilityService() {
 
     override fun onInterrupt() {}
 
+    /**
+     * Saves run screenshots locally (0 API calls) and NEVER wastes 11,000 tokens auditing a run that already succeeded!
+     */
     internal fun finalizeRunAndTriggerAutoReflection(finalStatus: String) {
         if (activeRunFinalized || activeRunId.isEmpty()) return
         activeRunFinalized = true
@@ -332,9 +335,16 @@ class AutoTouchService : AccessibilityService() {
             capturedBitmaps = rBitmaps
         )
 
-        if (rBitmaps.isNotEmpty() || rSteps.isNotEmpty()) {
+        // ZERO-WASTE QUOTA GUARD: If the task succeeded or was manually stopped, do NOT make extra Post-Run API calls!
+        if (finalStatus.equals("SUCCESS", ignoreCase = true) || finalStatus.equals("STOPPED", ignoreCase = true)) {
+            log("🛡️ Quota Saver: '$rTitle' [$finalStatus] saved locally (0 extra Audit API tokens used!).")
+            return
+        }
+
+        // Only run lightweight 1-pass diagnosis if a task actually FAILED
+        if (finalStatus.equals("FAILED", ignoreCase = true) && (rBitmaps.isNotEmpty() || rSteps.isNotEmpty())) {
             serviceScope.launch(Dispatchers.IO) {
-                log("🧠 Post-Run Auto-Reflection started for '$rTitle' [$finalStatus]...")
+                log("🧠 Failed-Run Diagnosis started for '$rTitle'...")
                 val reflection = geminiBrain.autoReflectAndImproveAfterRun(
                     appCategory = rCat,
                     goal = rGoal,
@@ -346,7 +356,7 @@ class AutoTouchService : AccessibilityService() {
 
                 memoryVault.appendChatToAutomationRun(
                     runId = rId,
-                    sender = "Auto-Reflection (${reflection.modelUsed})",
+                    sender = "Auto-Diagnosis (${reflection.modelUsed})",
                     message = reflection.reflectionSummary
                 )
 
@@ -361,7 +371,6 @@ class AutoTouchService : AccessibilityService() {
                         sourceType = rule.sourceType
                     )
                 }
-                log("✨ Auto-Reflection Complete! Saved ${reflection.learnedRules.size} optimized rules in Memory/$rCat.")
             }
         }
     }
