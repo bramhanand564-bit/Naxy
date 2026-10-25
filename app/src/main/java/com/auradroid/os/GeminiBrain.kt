@@ -32,7 +32,9 @@ data class AgentStepDecision(
     val text: String = "",
     val packageNameOrSetting: String = "",
     val reason: String = "",
-    val modelUsed: String = ""
+    val modelUsed: String = "",
+    val isFinalAction: Boolean = false,
+    val expectedNextScreen: String = ""
 )
 
 data class MemoryChatReply(
@@ -72,28 +74,24 @@ class GeminiBrain(private var apiKey: String) {
 
     private val rateLock = Any()
 
-    // Supports FreeLLMAPI (localhost:3001), OmniRoute, and Google Gemini (1 or more AIza... backup keys)
+    // Supports FreeLLMAPI (localhost:3001) and 1 Official Google Gemini API Key (100% Google ToS Safe)
     @Volatile
     private var freeLlmBaseUrl: String = "http://127.0.0.1:3001"
     @Volatile
     private var freeLlmApiKey: String = ""
     @Volatile
     private var googleGeminiKey: String = ""
-    @Volatile
-    private var googleBackupKeys: List<String> = emptyList()
-    @Volatile
-    private var activeGoogleKeyIndex: Int = 0
 
-    // ONLY Google's 3 Official, High-Reliability, Fast Models (Removed gemma-4 500s & 3.1-pro 429s!)
+    // Proven High-Speed Official Trio: 3.5-flash-lite (#1 fastest & highest quota), 3.8-flash (#2), robotics (#3)
     private val smartVisionLadder = listOf(
-        "gemini-3.8-flash",
         "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
         "gemini-robotics-er-2-preview"
     )
 
     private val textAndMetadataLadder = listOf(
-        "gemini-3.8-flash",
-        "gemini-3.5-flash-lite"
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash"
     )
 
     private val modelRequestTimestamps = mutableMapOf<String, MutableList<Long>>()
@@ -101,7 +99,10 @@ class GeminiBrain(private var apiKey: String) {
     private val blockedModels = mutableSetOf<String>()
     private val quotaCooldownModels = mutableMapOf<String, Long>()
 
-    // Minimum safe inter-call gap so two calls NEVER hit Google with 0.01s gap!
+    // 3-Minute Cooldown Lock (180,000 ms) when any model errors or is overloaded
+    private val threeMinuteCooldownLockMs = 180_000L
+
+    // Minimum safe inter-call gap so two calls NEVER hit Google with 0.01s gap
     private val minGlobalInterCallGapMs = 2_200L
 
     // Detailed API Telemetry & Timing State
@@ -137,6 +138,7 @@ class GeminiBrain(private var apiKey: String) {
     private fun parseAndApplyKeyConfig(rawInput: String) {
         val raw = rawInput.trim()
         var detectedFreeKey = ""
+        var detectedGoogleKey = ""
         var detectedUrl = "http://127.0.0.1:3001"
 
         val urlRegex = Regex("(https?://[^\\s\"'|,;]+)", RegexOption.IGNORE_CASE)
@@ -155,43 +157,22 @@ class GeminiBrain(private var apiKey: String) {
         }
 
         val googleKeyRegex = Regex("(AIza[a-zA-Z0-9_\\-]{20,})")
-        val allGoogleKeys = googleKeyRegex.findAll(raw).map { it.groupValues[1].trim() }.distinct().toList()
+        googleKeyRegex.find(raw)?.groupValues?.get(1)?.let {
+            detectedGoogleKey = it.trim()
+        }
 
-        if (detectedFreeKey.isEmpty() && allGoogleKeys.isEmpty() && raw.isNotBlank()) {
+        if (detectedFreeKey.isEmpty() && detectedGoogleKey.isEmpty() && raw.isNotBlank()) {
             if (raw.contains("3001") || raw.contains("20128") || raw.contains("freellm", ignoreCase = true) || !raw.startsWith("AIza")) {
                 val cleanedKey = raw.substringAfter("API_KEY=", raw).lineSequence().firstOrNull()?.trim() ?: raw
                 detectedFreeKey = cleanedKey
             } else {
-                googleGeminiKey = raw
-                googleBackupKeys = listOf(raw)
-                activeGoogleKeyIndex = 0
-                freeLlmBaseUrl = detectedUrl
-                freeLlmApiKey = detectedFreeKey
-                return
+                detectedGoogleKey = raw
             }
         }
 
         freeLlmBaseUrl = detectedUrl
         freeLlmApiKey = detectedFreeKey
-        googleBackupKeys = allGoogleKeys
-        activeGoogleKeyIndex = 0
-        googleGeminiKey = allGoogleKeys.firstOrNull() ?: ""
-    }
-
-    private fun getCurrentGoogleKey(): String {
-        val keys = googleBackupKeys
-        if (keys.isEmpty()) return googleGeminiKey
-        val idx = activeGoogleKeyIndex.coerceIn(0, keys.lastIndex)
-        return keys[idx]
-    }
-
-    private fun switchToNextBackupGoogleKeyIfAvailable(): Boolean {
-        val keys = googleBackupKeys
-        if (keys.size <= 1) return false
-        activeGoogleKeyIndex = (activeGoogleKeyIndex + 1) % keys.size
-        googleGeminiKey = keys[activeGoogleKeyIndex]
-        onBrainLog?.invoke("🔑 Switched safely to Backup API Key #${activeGoogleKeyIndex + 1}/${keys.size}")
-        return true
+        googleGeminiKey = detectedGoogleKey
     }
 
     private fun isFreeLlmConfigured(): Boolean = freeLlmApiKey.isNotBlank()
@@ -199,21 +180,21 @@ class GeminiBrain(private var apiKey: String) {
 
     private fun getMaxSafeRpmForModel(model: String): Int = when {
         model.startsWith("freellmapi:") -> 30
-        model.contains("3.8-flash") -> 5
         model.contains("flash-lite") -> 10
+        model.contains("3.8-flash") -> 5
         model.contains("robotics") -> 5
         else -> 5
     }
 
     private fun getMinSafeGapMsForModel(model: String): Long = when {
         model.startsWith("freellmapi:") -> 1_500L
-        model.contains("3.8-flash") -> 12_000L
         model.contains("flash-lite") -> 6_000L
+        model.contains("3.8-flash") -> 12_000L
         model.contains("robotics") -> 12_000L
         else -> 10_000L
     }
 
-    private fun isModelInHard429Cooldown(model: String, nowMs: Long = System.currentTimeMillis()): Boolean =
+    private fun isModelInHardCooldown(model: String, nowMs: Long = System.currentTimeMillis()): Boolean =
         synchronized(rateLock) {
             val cooldownUntil = quotaCooldownModels[model] ?: 0L
             cooldownUntil > nowMs
@@ -355,9 +336,6 @@ class GeminiBrain(private var apiKey: String) {
         sb.append("⚡ 1-Min Live Meter: $oneMinCalls Calls | ⏱️ $oneMinSec API Time (Wait: $oneMinWaitSec)\n")
         sb.append("📊 Session Total: $totalApiCallsSession Calls (✅ $totalSuccessCallsSession OK | ⚠️ $totalQuota429HitsSession Quota 429)\n")
         sb.append("⏱️ Total API Time: ${formatSec(totalApiTimeMsSession)} (Avg: $avgSec/call) | 🪙 Total Tokens: $totalTokensUsedSession\n")
-        if (googleBackupKeys.size > 1) {
-            sb.append("🔑 Active Key Pool: Key #${activeGoogleKeyIndex + 1} of ${googleBackupKeys.size}\n")
-        }
 
         if (perModelCallCount.isNotEmpty()) {
             sb.append("\n🤖 Model-Wise Usage Breakdown:\n")
@@ -388,18 +366,17 @@ class GeminiBrain(private var apiKey: String) {
         }
 
         if (isGoogleGeminiConfigured() || !isFreeLlmConfigured()) {
-            if (googleBackupKeys.size > 1) {
-                lines.add("🔑 Google API Keys Configured: ${googleBackupKeys.size} (Active: #${activeGoogleKeyIndex + 1})")
-            }
             smartVisionLadder.forEach { m ->
                 val used = getUsedRpmInLastMinute(m, now)
                 val maxRpm = getMaxSafeRpmForModel(m)
                 val left = (maxRpm - used).coerceAtLeast(0)
                 val gapSec = getMinSafeGapMsForModel(m) / 1000L
                 val waitMs = getWaitTimeMsForModel(m, now)
+                val isLocked = isModelInHardCooldown(m, now)
                 val status = when {
                     blockedModels.contains(m) -> "🚫 $m (Daily Quota Full)"
-                    waitMs > 0L -> "⏳ $m (Wait ${(waitMs / 1000L).coerceAtLeast(1L)}s | Used $used/$maxRpm RPM, $left left | ${gapSec}s Gap)"
+                    isLocked -> "🔒 $m (3-Min Cooldown Lock: ${(waitMs / 1000L).coerceAtLeast(1L)}s left)"
+                    waitMs > 0L -> "⏳ $m (Pacer ${(waitMs / 1000L).coerceAtLeast(1L)}s | Used $used/$maxRpm RPM, $left left | ${gapSec}s Gap)"
                     else -> "✅ $m (Ready | Used $used/$maxRpm RPM, $left left | ${gapSec}s Gap)"
                 }
                 lines.add(status)
@@ -475,9 +452,6 @@ class GeminiBrain(private var apiKey: String) {
         else -> listOf("freellmapi:auto", "freellmapi:auto:smart")
     }
 
-    /**
-     * Always prioritizes `gemini-3.8-flash` #1, backed by `gemini-3.5-flash-lite` and `gemini-robotics-er-2-preview`!
-     */
     private fun buildSmartGearLadder(preferredGear: String, hasImages: Boolean, isStuck: Boolean): List<String> {
         val freeLlmList = if (isFreeLlmConfigured()) buildFreeLlmGearCandidates(preferredGear) else emptyList()
 
@@ -488,16 +462,9 @@ class GeminiBrain(private var apiKey: String) {
         val geminiList = if (!hasImages && preferredGear == "GEMMA_TEXT") {
             textAndMetadataLadder
         } else if (isStuck) {
-            listOf("gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.5-flash-lite")
+            listOf("gemini-3.5-flash-lite", "gemini-robotics-er-2-preview", "gemini-3.8-flash")
         } else {
-            when (preferredGear) {
-                "ROBOTICS_PRECISION", "ROBOTICS_XY" ->
-                    listOf("gemini-3.8-flash", "gemini-robotics-er-2-preview", "gemini-3.5-flash-lite")
-                "FAST_LITE" ->
-                    listOf("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-robotics-er-2-preview")
-                else ->
-                    smartVisionLadder
-            }
+            smartVisionLadder
         }
 
         return if (!hasImages) {
@@ -540,40 +507,32 @@ class GeminiBrain(private var apiKey: String) {
             }
 
         val now = System.currentTimeMillis()
-        val nonCooldownModels = gearLadder.filter { !isModelInHard429Cooldown(it, now) }
+        // Strictly skip any model that is in its 3-minute cooldown lock!
+        val nonCooldownModels = gearLadder.filter { !isModelInHardCooldown(it, now) }
         val activePool = nonCooldownModels.ifEmpty { gearLadder }
 
-        // Keep gemini-3.8-flash first whenever it is ready or within a short wait (<= 6s)!
-        val primary38ReadyOrSoon = activePool.firstOrNull {
-            it == "gemini-3.8-flash" && getWaitTimeMsForModel(it, now) <= 6_000L
-        }
-
-        val orderedCandidates = if (primary38ReadyOrSoon != null) {
-            listOf(primary38ReadyOrSoon) + (activePool - primary38ReadyOrSoon)
+        val readyModels = activePool.filter { hasImmediateSafeSlot(it, now) }
+        val orderedCandidates = if (readyModels.isNotEmpty()) {
+            readyModels + (activePool - readyModels.toSet())
         } else {
-            val readyModels = activePool.filter { hasImmediateSafeSlot(it, now) }
-            if (readyModels.isNotEmpty()) {
-                readyModels + (activePool - readyModels.toSet())
-            } else {
-                val fastest = activePool.minByOrNull { getWaitTimeMsForModel(it, now) } ?: activePool.first()
-                listOf(fastest) + (activePool - fastest)
-            }
+            val fastest = activePool.minByOrNull { getWaitTimeMsForModel(it, now) } ?: activePool.first()
+            listOf(fastest) + (activePool - fastest)
         }
 
         for (model in orderedCandidates) {
             val loopNow = System.currentTimeMillis()
 
-            if (isModelInHard429Cooldown(model, loopNow) && orderedCandidates.size > 1) {
+            if (isModelInHardCooldown(model, loopNow) && orderedCandidates.size > 1) {
                 continue
             }
 
-            // 1. Always enforce a safe minimum global gap so two requests NEVER hit Google 0.01s apart!
+            // 1. Enforce minimum global gap so two requests NEVER hit Google 0.01s apart
             var actualPacerWaitMs = enforceSafeGlobalInterCallGap()
 
-            // 2. Enforce per-model RPM pacer
+            // 2. Enforce per-model RPM pacer (6s for 3.5-flash-lite, 12s for 3.8-flash/robotics)
             val waitNeeded = getWaitTimeMsForModel(model, System.currentTimeMillis())
             if (waitNeeded > 0L) {
-                if (waitNeeded <= 14_000L) {
+                if (waitNeeded <= 8_000L) {
                     onBrainLog?.invoke("⏱️ [$callPurpose] Safe Pacer: Waiting ${formatSec(waitNeeded)} for [$model]...")
                     val wStart = System.currentTimeMillis()
                     delay(waitNeeded)
@@ -609,8 +568,8 @@ class GeminiBrain(private var apiKey: String) {
             }
 
             val startMs = System.currentTimeMillis()
-            var result = executeSingleModelCall(model, prompt, imagesBase64)
-            var durMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+            val result = executeSingleModelCall(model, prompt, imagesBase64)
+            val durMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
 
             recordAndLogApiCallTelemetry(
                 purpose = callPurpose,
@@ -621,50 +580,28 @@ class GeminiBrain(private var apiKey: String) {
                 tokensInCall = result.tokensUsed
             )
 
-            // Official Google 503 Backoff Rule: 503 is transient server overload, NOT quota! Wait 2.2s and retry same model once!
-            if (result.httpCode in listOf(500, 502, 503, 504)) {
-                onBrainLog?.invoke("⏳ [$callPurpose] [$model] transient ${result.httpCode} -> Waiting 2.2s & retrying [$model] (Google Official Backoff)...")
-                delay(2_200L)
-                recordModelRequestTimestamp(model)
-                val retryStartMs = System.currentTimeMillis()
-                result = executeSingleModelCall(model, prompt, imagesBase64)
-                durMs = (System.currentTimeMillis() - retryStartMs).coerceAtLeast(1L)
-
-                recordAndLogApiCallTelemetry(
-                    purpose = "$callPurpose (Retry)",
-                    model = model,
-                    httpCode = result.httpCode,
-                    durationMs = durMs,
-                    pacerWaitMs = 2_200L,
-                    tokensInCall = result.tokensUsed
-                )
-            }
-
             when (result.httpCode) {
                 200 -> if (result.text.isNotBlank()) return@withContext Pair(result.text, model)
                 429 -> {
                     if (result.isDailyQuotaExhausted) {
-                        val switchedKey = switchToNextBackupGoogleKeyIfAvailable()
-                        if (!switchedKey) {
-                            synchronized(rateLock) {
-                                // Daily quota exhausted for this specific model -> rest it for 60 mins and use partner models
-                                quotaCooldownModels[model] = System.currentTimeMillis() + 3_600_000L
-                            }
-                            onBrainLog?.invoke("⚠️ [$callPurpose] Daily Quota (PerDay) reached on [$model] -> Using partner model...")
-                        }
-                    } else {
-                        val serverRetryMs = if (result.retryDelayMs > 0L) result.retryDelayMs + 1_500L else 35_000L
                         synchronized(rateLock) {
-                            quotaCooldownModels[model] = System.currentTimeMillis() + serverRetryMs
+                            blockedModels.add(model)
+                            quotaCooldownModels[model] = System.currentTimeMillis() + 3_600_000L
                         }
-                        onBrainLog?.invoke("⏱️ [$callPurpose] 1-Min Quota (429) on [$model] -> Resting ${serverRetryMs / 1000}s (from Google RetryInfo) & using partner model...")
+                        onBrainLog?.invoke("🚫 [$callPurpose] Daily Quota (PerDay) full on [$model] -> Locked for today, switching to partner model!")
+                    } else {
+                        synchronized(rateLock) {
+                            quotaCooldownModels[model] = System.currentTimeMillis() + threeMinuteCooldownLockMs
+                        }
+                        onBrainLog?.invoke("🔒 [$callPurpose] Quota 429 on [$model] -> Locked for 3 Minutes (180s), switching immediately to partner model!")
                     }
                 }
                 else -> {
+                    // 500 / 502 / 503 / 504 -> Immediately lock for 3 Minutes (180s) and switch to next model with ZERO wasted retry!
                     synchronized(rateLock) {
-                        quotaCooldownModels[model] = System.currentTimeMillis() + 15_000L
+                        quotaCooldownModels[model] = System.currentTimeMillis() + threeMinuteCooldownLockMs
                     }
-                    onBrainLog?.invoke("🔄 [$callPurpose] Model [$model] (${result.httpCode}) -> Shifting to partner model...")
+                    onBrainLog?.invoke("🔒 [$callPurpose] [$model] busy (${result.httpCode}) -> Locked for 3 Minutes (180s), switching immediately to partner model!")
                 }
             }
         }
@@ -716,7 +653,7 @@ class GeminiBrain(private var apiKey: String) {
                 setRequestProperty("Content-Type", "application/json")
                 setRequestProperty("Authorization", "Bearer $freeLlmApiKey")
                 connectTimeout = 8_000
-                readTimeout = 25_000
+                readTimeout = 20_000
                 doOutput = true
             }
 
@@ -762,7 +699,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * Executes Official Google Gemini REST Call + Reads `RetryInfo.retryDelay` & `quotaId` on 429
+     * Executes Official Google Gemini REST Call with fast 11s read timeout so a slow server never hangs the task!
      */
     private fun executeSingleModelCall(
         model: String,
@@ -770,13 +707,12 @@ class GeminiBrain(private var apiKey: String) {
         imagesBase64: List<String>
     ): GeminiCallResult {
         return try {
-            val activeKey = getCurrentGoogleKey()
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$activeKey")
+            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$googleGeminiKey")
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 setRequestProperty("Content-Type", "application/json")
-                connectTimeout = 9_000
-                readTimeout = 18_000
+                connectTimeout = 7_000
+                readTimeout = 11_000
                 doOutput = true
             }
             val partsArray = JSONArray().put(JSONObject().put("text", prompt))
@@ -807,12 +743,12 @@ class GeminiBrain(private var apiKey: String) {
                 val isPerDay = errBody.contains("PerDay", ignoreCase = true) ||
                     errBody.contains("RequestsPerDay", ignoreCase = true)
                 val retryMatch = Regex("\"retryDelay\"\\s*:\\s*\"(\\d+(?:\\.\\d+)?)s\"").find(errBody)
-                val retrySec = retryMatch?.groupValues?.get(1)?.toDoubleOrNull() ?: 25.0
+                val retrySec = retryMatch?.groupValues?.get(1)?.toDoubleOrNull() ?: 30.0
                 GeminiCallResult(
                     httpCode = 429,
                     text = "",
                     tokensUsed = 0,
-                    retryDelayMs = (retrySec * 1000L).toLong().coerceIn(5_000L, 65_000L),
+                    retryDelayMs = (retrySec * 1000L).toLong(),
                     isDailyQuotaExhausted = isPerDay
                 )
             } else {
@@ -842,7 +778,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 1. Task Decider & Modular Micro-Step Planner
+     * 1. Universal Task Decider & Modular Micro-Step Planner (Works for ANY App or Website in the Universe!)
      */
     suspend fun chatAndBuildDetailedPlan(
         userMessage: String,
@@ -852,7 +788,7 @@ class GeminiBrain(private var apiKey: String) {
         val isCasual = isCasualGreetingOrChitchat(userMessage)
 
         val sysPrompt = """
-            You are AuraDroid OS, an intelligent Hinglish AI Companion, Modular Skill Task Decider & Planner.
+            You are AuraDroid OS, an intelligent Hinglish Universal AI Companion & Planner for ANY Android App or Website.
             User's saved profile rules: $userProfileRules
             Recent conversation: $chatHistory
             User just said: "$userMessage"
@@ -864,10 +800,9 @@ class GeminiBrain(private var apiKey: String) {
             4. Folder to YouTube -> "executionMode": "YOUTUBE_FOLDER_UPLOAD", "readyToExecute": true.
             5. Google Flow to YouTube -> "executionMode": "GOOGLE_FLOW_UPLOAD", "readyToExecute": true.
             6. Background web mode -> "executionMode": "BACKGROUND_WEB", "readyToExecute": true.
-            7. For phone automation, break every action into SEPARATE, CONFIRMABLE micro-steps:
-               - Never combine "Tap bottom search icon" and "Type query in top search bar" into one step! Make them 2 separate steps so each click is confirmed!
-               - Never combine "Select friend" and "Tap bottom blue Send button" into one step! Make them 2 separate steps!
-               Tag each step with its specialist model gear: "[FAST_LITE]", "[ROBOTICS_XY]", or "[DEEP_3.8]".
+            7. For ANY phone app or website automation, break every action into SEPARATE, CONFIRMABLE "Road-Crossing" micro-steps:
+               - Never combine "Open search tab" and "Type query" into one step!
+               - Never combine "Select recipient/item" and "Tap final Send/Submit/Buy button" into one step!
             
             Return ONLY valid JSON:
             {
@@ -876,15 +811,10 @@ class GeminiBrain(private var apiKey: String) {
               "taskTitle": "Short title",
               "executionMode": "LIVE_PHONE",
               "steps": [
-                "Step 1 [FAST_LITE] [SKILL_OPEN]: Open Instagram app",
-                "Step 2 [ROBOTICS_XY] [SKILL_SEARCH_TAB]: Tap bottom Search magnifying glass icon to open Explore page",
-                "Step 3 [FAST_LITE] [SKILL_SEARCH_TYPE]: Tap top 'Search with Meta AI' bar, type target query, and submit search",
-                "Step 4 [DEEP_3.8] [SKILL_SELECT_VIDEO]: Confirm search results loaded and tap the first matching video",
-                "Step 5 [ROBOTICS_XY] [SKILL_LIKE]: Tap the Like heart icon on the right side of the Reel",
-                "Step 6 [ROBOTICS_XY] [SKILL_COMMENT]: Tap Comment icon, type comment in 'Join the conversation...', tap post arrow, then press BACK",
-                "Step 7 [ROBOTICS_XY] [SKILL_SHARE_OPEN]: Tap Share paper-plane icon to open Share sheet",
-                "Step 8 [ROBOTICS_XY] [SKILL_SHARE_SELECT]: Tap friend's profile once to select them (blue checkmark)",
-                "Step 9 [FAST_LITE] [SKILL_SHARE_SEND]: Confirm blue 'Send' button appeared at bottom and tap 'Send'"
+                "Step 1 [FAST_LITE]: Open target app or website",
+                "Step 2 [ROBOTICS_XY]: Navigate to search or target section",
+                "Step 3 [FAST_LITE]: Type query/input and submit",
+                "Step 4 [DEEP_3.8]: Select target item/result and complete final action"
               ]
             }
         """.trimIndent()
@@ -909,66 +839,54 @@ class GeminiBrain(private var apiKey: String) {
         }
     }
 
+    /**
+     * Universal Deterministic Road-Crossing Confirmation:
+     * Detects when recipient is selected ("Write a message..." / bottom "Send" button visible)
+     * and clicks the exact bottom blue Send button (500, 940) without ever hitting a mid-screen container!
+     */
     private fun checkDeterministicClickConfirmation(
         goal: String,
         currentStepHistory: List<String>,
         numberedNodesList: String
     ): AgentStepDecision? {
-        val recentJoined = currentStepHistory.takeLast(6).joinToString(" | ").lowercase(Locale.ROOT)
-        val lastStepText = currentStepHistory.lastOrNull()?.lowercase(Locale.ROOT) ?: ""
         val lines = numberedNodesList.lines()
+        val hasWriteMessage = lines.any { it.contains("Write a message", ignoreCase = true) }
+        val hasAddToStoryOrCopyLink = lines.any {
+            it.contains("Add to story", ignoreCase = true) || it.contains("Copy link", ignoreCase = true)
+        }
 
+        // Match "[12] Send (Button)" or "Send separately" without requiring quotes!
         val sendButtonLine = lines.firstOrNull { line ->
-            (line.contains("\"Send\"", ignoreCase = true) ||
-                line.contains("\"Send separately\"", ignoreCase = true) ||
-                line.contains("text=Send", ignoreCase = true) ||
-                line.contains("desc=Send", ignoreCase = true)) &&
-                !line.contains("Send a", ignoreCase = true) &&
-                !line.contains("Send message", ignoreCase = true) &&
-                !line.contains("Send to", ignoreCase = true)
+            val afterBracket = line.substringAfter("]", "").trim()
+            (afterBracket.startsWith("Send (", ignoreCase = true) ||
+                afterBracket.startsWith("Send separately", ignoreCase = true)) &&
+                !afterBracket.startsWith("Send a", ignoreCase = true) &&
+                !afterBracket.startsWith("Send message", ignoreCase = true) &&
+                !afterBracket.startsWith("Send to", ignoreCase = true)
         }
 
-        if (sendButtonLine != null && (recentJoined.contains("rahul") || recentJoined.contains("select") || recentJoined.contains("share") || lines.any { it.contains("Write a message", ignoreCase = true) })) {
-            val tagMatch = Regex("\\[(\\d+)]").find(sendButtonLine)
-            val tagId = tagMatch?.groupValues?.get(1)?.toIntOrNull() ?: -1
+        // PROOF #1: If "Write a message..." is visible (or "Send" button is visible and "Add to story/Copy link" is gone),
+        // the friend IS 100% SELECTED with a blue checkmark!
+        if ((hasWriteMessage && !hasAddToStoryOrCopyLink) || sendButtonLine != null) {
+            val xyMatch = sendButtonLine?.let { Regex("Center\\((\\d+),\\s*(\\d+)\\)").find(it) }
+            val rawX = xyMatch?.groupValues?.get(1)?.toIntOrNull() ?: 500
+            val rawY = xyMatch?.groupValues?.get(2)?.toIntOrNull() ?: 940
 
-            val xyMatch = Regex("\\((\\d+),\\s*(\\d+)\\)").find(sendButtonLine)
-            val sendX = xyMatch?.groupValues?.get(1)?.toIntOrNull() ?: 500
-            val sendY = xyMatch?.groupValues?.get(2)?.toIntOrNull() ?: 932
+            // Area Guard: Ensure Y is strictly in the bottom Send bar (not in the middle of the friend grid!)
+            val safeSendX = if (rawX in 100..2000) rawX else 500
+            val safeSendY = if (rawY > 1800 || rawY in 880..985) rawY else 940
 
-            val alreadyTriedTag = lastStepText.contains("send") && lastStepText.contains("click_tag")
-
-            onBrainLog?.invoke("✅ [0.00s Instant Confirm]: Friend selected & 'Send' button detected (Zero API Quota used)!")
-            return if (tagId >= 0 && !alreadyTriedTag) {
-                AgentStepDecision(
-                    action = "CLICK_TAG",
-                    tagId = tagId,
-                    x = sendX,
-                    y = sendY,
-                    reason = "Confirmed & Tapping Send button",
-                    modelUsed = "ConfirmEngine"
-                )
-            } else {
-                AgentStepDecision(
-                    action = "CLICK_XY",
-                    x = sendX,
-                    y = sendY,
-                    reason = "Confirmed & Tapping Send XY directly",
-                    modelUsed = "ConfirmEngine"
-                )
-            }
-        }
-
-        if (currentStepHistory.takeLast(2).any { it.contains("Tapping Send", ignoreCase = true) || it.contains("Send separately", ignoreCase = true) || it.contains("Send XY", ignoreCase = true) }) {
-            val shareSheetStillOpen = lines.any {
-                it.contains("Write a message", ignoreCase = true) ||
-                    it.contains("Send separately", ignoreCase = true) ||
-                    it.contains("Chat not selected", ignoreCase = true)
-            }
-            if (!shareSheetStillOpen) {
-                onBrainLog?.invoke("🎉 [0.00s Instant Confirm]: Video shared & Share sheet closed! Task DONE.")
-                return AgentStepDecision(action = "DONE", reason = "Confirmed video shared!", modelUsed = "ConfirmEngine")
-            }
+            onBrainLog?.invoke("✅ [0.00s Road-Crossing Proof]: Friend checkmark & 'Write a message / Send' confirmed! Tapping bottom Send bar...")
+            return AgentStepDecision(
+                action = "CLICK_XY",
+                tagId = -1,
+                x = safeSendX,
+                y = safeSendY,
+                reason = "Confirmed recipient selected -> Tapping bottom blue Send button",
+                modelUsed = "ConfirmEngine",
+                isFinalAction = true,
+                expectedNextScreen = "Share sheet closes and returns to main screen"
+            )
         }
 
         return null
@@ -989,9 +907,8 @@ class GeminiBrain(private var apiKey: String) {
 
         val now = System.currentTimeMillis()
         val elapsed = now - lastLiveStepTimestampMs
-        if (lastLiveStepTimestampMs > 0L && elapsed in 1L..4_999L) {
-            val waitMs = 5_000L - elapsed
-            onBrainLog?.invoke("⏳ Screen Load Delay: Waiting ${formatSec(waitMs)} before next step...")
+        if (lastLiveStepTimestampMs > 0L && elapsed in 1L..3_999L) {
+            val waitMs = 4_000L - elapsed
             delay(waitMs)
         }
         lastLiveStepTimestampMs = System.currentTimeMillis()
@@ -1011,15 +928,15 @@ class GeminiBrain(private var apiKey: String) {
 
         val mandatorySkillTransferBlock = if (sortedFixes.isNotEmpty()) {
             """
-            🚨 CONFIRMED UNIVERSAL APP SKILLS & MANDATORY XY COORDINATES (CROSS-TASK TRANSFER!):
-            Apply these verified coordinates from previous runs to the current goal "$goal" (substitute the new search query or friend name as needed):
+            🚨 CONFIRMED UNIVERSAL APP SKILLS & MANDATORY XY COORDINATES:
+            Apply these verified coordinates from previous runs to "$goal":
             """.trimIndent() + "\n" +
-                sortedFixes.take(12).joinToString("\n") { fix ->
+                sortedFixes.take(10).joinToString("\n") { fix ->
                     val px = (fix.tapXRatio * bodySpecs.screenWidth).toInt()
                     val py = (fix.tapYRatio * bodySpecs.screenHeight).toInt()
                     val normX = (fix.tapXRatio * 1000).toInt()
                     val normY = (fix.tapYRatio * 1000).toInt()
-                    "👉 [CONFIRMED SKILL - ${fix.sourceType}] When on [${fix.problemDescription}]: ${fix.solutionRule} -> CLICK_XY x=$normX, y=$normY (Pixels: $px, $py)"
+                    "👉 [CONFIRMED SKILL] When on [${fix.problemDescription}]: ${fix.solutionRule} -> CLICK_XY x=$normX, y=$normY (Pixels: $px, $py)"
                 }
         } else ""
 
@@ -1029,35 +946,36 @@ class GeminiBrain(private var apiKey: String) {
 
         val currentStepIndex = currentStepHistory.size
         val stepNum = currentStepIndex + 1
-
         val navTop = bodySpecs.screenHeight - bodySpecs.navBarHeight
+
         val prompt = """
-            You are AuraDroid OS Autonomous Vision + Click Confirmation Engine (Gemini 3.8 Flash Primary).
+            You are AuraDroid OS Universal Autonomous Vision & Road-Crossing Engine for ANY Android App or Website.
             
             DEVICE BODY SPECS: ${bodySpecs.modelName} (${bodySpecs.screenWidth}x${bodySpecs.screenHeight} px), Safe Top Y>${bodySpecs.cutoutSafeTop}, Nav Y>$navTop
             OVERALL GOAL: $goal
             PLANNED WORKFLOW: ${planSteps.joinToString(" -> ")}
-            COMPLETED ACTIONS SO FAR (VERIFY & DO NOT REPEAT!):
+            COMPLETED ACTIONS & MILESTONES SO FAR (DO NOT REPEAT COMPLETED STEPS!):
             ${currentStepHistory.takeLast(12).joinToString(" | ")}
             $monitorRule
             
             INTERACTIVE ELEMENTS CURRENTLY ON SCREEN:
             $numberedNodesList
             
-            MANDATORY CLICK-CONFIRMATION & VERIFICATION RULES (READ CAREFULLY!):
-            1. STEP-BY-STEP VISUAL CONFIRMATION BEFORE CLICKING:
-               - Look at the attached screenshot and INTERACTIVE ELEMENTS CURRENTLY ON SCREEN to confirm whether the previous click actually succeeded!
-            2. INSTAGRAM SEARCH CONFIRMATION (DO NOT PICK RANDOM EXPLORE VIDEOS!):
-               - When on the Explore page (where "Search with Meta AI" or "Search" bar is at the top), check if the target search query from "$goal" has ALREADY been typed and searched!
-               - If "Search with Meta AI" is visible and you have NOT typed the search query yet, YOU MUST use action "TYPE" (with the search bar's tagId or x=450, y=115 and text="<search query>")! NEVER click a random video from the Explore grid before typing the search query!
-            3. INSTAGRAM COMMENT CONFIRMATION:
-               - When the Comment sheet is open ("Join the conversation..." or "Add a comment..."), if you have NOT typed the comment yet, use action "TYPE" on the comment box (x=420, y=935) with a nice comment text.
-               - Once the comment is posted, press "BACK" to close the comment sheet so the main Reel buttons (Like, Comment, Share) are visible again.
-            4. INSTAGRAM SHARE SHEET CONFIRMATION (NEVER UNSELECT THE FRIEND!):
-               - When the Share sheet is open:
-                 a) If the blue "Send" or "Send separately" button (or "Write a message...") is visible at the bottom of the screen, THAT CONFIRMS THE FRIEND IS ALREADY SELECTED (blue checkmark)!
-                 b) NEVER tap the friend's profile/avatar a second time (tapping again unselects them)! Immediately tap the bottom blue "Send" / "Send separately" button (x=500, y=932)!
-                 c) If the friend (e.g. Rahul) is visible in the Share grid and "Send" is NOT visible yet, tap the friend's profile ONCE.
+            UNIVERSAL ROAD-CROSSING & VERIFICATION LAWS (FOR ANY APP OR WEBSITE):
+            1. PRE-STEP VERIFICATION (CHECK WHICH ROAD YOU ARE ON):
+               - Look at the attached screenshot and INTERACTIVE ELEMENTS to verify if the previous click succeeded before moving to the next step.
+               - If the previous step was to select a person/item or open a page, check if the screen actually changed!
+            2. SEARCH BAR LAW (ANY APP OR WEBSITE):
+               - When on a search page where the search bar is visible and you have NOT typed the search query yet, use action "TYPE" on the search bar with text="<target query>". Never click random items before searching!
+            3. COMMENT / MESSAGE INPUT LAW:
+               - Never click "Share on Threads" or old user comments! Always tap/type in the bottom input box ("Join the conversation...", "Add a comment...", "Message...", etc. at y=935).
+            4. SHARE / SEND / SUBMIT CONFIRMATION LAW:
+               - When selecting a recipient in a Share sheet:
+                 a) If the recipient is NOT visible in the grid, use "TYPE" on the Share sheet's "Search" box to find them.
+                 b) Once a recipient is selected (blue checkmark + "Write a message..." or blue "Send" bar appears at bottom y=940), NEVER tap the recipient's avatar again (tapping again unselects them!).
+                 c) To click the bottom blue "Send" / "Submit" / "Continue" bar, ALWAYS use action "CLICK_XY" with x=500, y=940 and set "isFinalAction": true!
+            5. FINAL STEP ROAD-CROSSING:
+               - Set "isFinalAction": true ONLY when you are clicking the VERY LAST button required to finish the entire OVERALL GOAL (e.g., clicking the final "Send", "Submit", "Upload", or "Save" button).
             
             $mandatorySkillTransferBlock
             
@@ -1071,7 +989,9 @@ class GeminiBrain(private var apiKey: String) {
               "endY": 200,
               "text": "",
               "packageNameOrSetting": "",
-              "reason": "Confirmed state & exact action"
+              "reason": "Confirmed current screen & exact action",
+              "isFinalAction": false,
+              "expectedNextScreen": "What the screen should look like after this action"
             }
         """.trimIndent()
 
@@ -1096,16 +1016,15 @@ class GeminiBrain(private var apiKey: String) {
                 text = j.optString("text", ""),
                 packageNameOrSetting = j.optString("packageNameOrSetting", ""),
                 reason = j.optString("reason", "Working..."),
-                modelUsed = modelUsed
+                modelUsed = modelUsed,
+                isFinalAction = j.optBoolean("isFinalAction", false),
+                expectedNextScreen = j.optString("expectedNextScreen", "")
             )
         } catch (_: Exception) {
             AgentStepDecision(action = "WAIT", reason = "Re-scanning screen...", modelUsed = modelUsed)
         }
     }
 
-    /**
-     * Single-Pass Lightweight Reflection (ONLY called when a live task FAILED, never on SUCCESS!)
-     */
     suspend fun autoReflectAndImproveAfterRun(
         appCategory: String,
         goal: String,
@@ -1116,7 +1035,6 @@ class GeminiBrain(private var apiKey: String) {
     ): PostRunReflectionResult {
         isLiveTaskCurrentlyRunning = false
 
-        // ZERO-WASTE RULE: Never burn 11,000 tokens auditing a run that already succeeded or was manually stopped!
         if (finalStatus.equals("SUCCESS", ignoreCase = true) || finalStatus.equals("STOPPED", ignoreCase = true)) {
             return PostRunReflectionResult(
                 reflectionSummary = "टास्क सफलतापूर्वक पूरा हुआ (Quota Saver: फालतू ऑडिट स्किप किया गया)।",
@@ -1134,7 +1052,7 @@ class GeminiBrain(private var apiKey: String) {
         val stepByStepLog = actualStepsTaken.mapIndexed { idx, s -> "Step ${idx + 1}: $s" }.joinToString("\n")
 
         val singlePassPrompt = """
-            You are Gemini 3.8 Flash Autonomous Auditor for AuraDroid OS.
+            You are AuraDroid OS Universal Autonomous Auditor.
             A run in app "$appCategory" ended with status "$finalStatus" for goal "$goal".
             Planned: ${plannedSteps.joinToString(" -> ")}
             Actual Steps Taken:
@@ -1216,17 +1134,17 @@ class GeminiBrain(private var apiKey: String) {
         val pinnedXy = extractPinnedXyFromUserMessage(userCorrectionMessage)
 
         val prompt = """
-            You are Gemini 3.8 Flash Run-Correction Architect inside AuraDroid OS.
+            You are AuraDroid OS Run-Correction Architect.
             The user is reviewing past run "${runRecord.title}" in app "${runRecord.appCategory}".
             Steps Taken: ${runRecord.stepsSummary.mapIndexed { i, s -> "Step ${i + 1}: $s" }.joinToString(" | ")}
             User Correction: "$userCorrectionMessage"
             
             1. Inspect the attached screenshots yourself and measure the exact 0.00..1.00 "tapXRatio" and "tapYRatio" of the correct button!
-            2. Generalize "solutionRule" as a Reusable Skill so it works both for re-running "${runRecord.title}" AND for any future task in "${runRecord.appCategory}".
+            2. Generalize "solutionRule" as a Reusable Skill so it works for any future task in "${runRecord.appCategory}".
             
             Return ONLY valid JSON:
             {
-              "replyText": "Hinglish reply explaining the exact step & coordinate you measured and confirming it will work on all similar tasks",
+              "replyText": "Hinglish reply explaining the exact step & coordinate you measured",
               "problemScreen": "[UNIVERSAL_SKILL] Screen/Step in ${runRecord.appCategory}",
               "solutionRule": "MANDATORY SKILL OVERRIDE: Exact action and coordinate to tap",
               "tapXRatio": 0.50,
@@ -1276,7 +1194,7 @@ class GeminiBrain(private var apiKey: String) {
     ): MemoryChatReply {
         val pinnedXy = extractPinnedXyFromUserMessage(userMessage)
         val prompt = """
-            You are Gemini 3.8 Flash Video-Memory Coach for app "${videoSession.appCategory}".
+            You are AuraDroid OS Video-Memory Coach for app "${videoSession.appCategory}".
             Initial Note: ${videoSession.userNote}
             Rules So Far: ${videoSession.extractedRulesSummary.joinToString(" | ")}
             User Message: "$userMessage"
@@ -1350,11 +1268,10 @@ class GeminiBrain(private var apiKey: String) {
         val normY = (humanTapYRatio * 1000).toInt()
 
         val prompt = """
-            You are Gemini 3.8 Flash Spatial Skill Learner.
+            You are AuraDroid OS Spatial Skill Learner.
             During "$goal" in "$appCategory", the human tapped at 0..1000 XY($normX, $normY) on [$cleanDesc].
             Image 1 = BEFORE, Image 2 = AFTER.
-            Generalize this tap into a Reusable App Skill (so it works for any future search/song/friend in $appCategory).
-            Do NOT hardcode a specific person's username if it's a share list; make it a general rule.
+            Generalize this tap into a Reusable App Skill for $appCategory.
             Return ONLY JSON:
             {
               "problem": "[UNIVERSAL_SKILL] Reusable screen state in $appCategory",
@@ -1396,8 +1313,8 @@ class GeminiBrain(private var apiKey: String) {
         framesBase64: List<String>
     ): List<LearnedFixRecord> {
         val prompt = """
-            You are Gemini 3.8 Flash Video Skill Extractor for app "$appCategory" (Note: "$userInstruction").
-            Inspect all ${framesBase64.size} sequential frames, measure exact 0.0..1.0 "tapXRatio" & "tapYRatio", and extract reusable modular skills (Search, Play, Like, Comment, Share to Friend) that work on any future topic/friend!
+            You are AuraDroid OS Video Skill Extractor for app "$appCategory" (Note: "$userInstruction").
+            Inspect all ${framesBase64.size} sequential frames, measure exact 0.0..1.0 "tapXRatio" & "tapYRatio", and extract reusable modular skills that work on any future task!
             Return ONLY JSON:
             {
               "rules": [
@@ -1445,9 +1362,6 @@ class GeminiBrain(private var apiKey: String) {
         return extracted
     }
 
-    /**
-     * Strips raw timestamps/filenames like `flow_1792855090413` or `VID_2026...` so numbers NEVER appear in YouTube titles!
-     */
     fun sanitizeRawVideoTopic(rawTopicOrFileName: String): String {
         val withoutExt = rawTopicOrFileName
             .substringBeforeLast(".")
@@ -1459,10 +1373,6 @@ class GeminiBrain(private var apiKey: String) {
         return withoutExt.ifBlank { "Amazing Cinematic Viral Short Video" }
     }
 
-    /**
-     * Generates Flow 9:16 Video Prompt + Viral Title + Full SEO Description & Hashtags.
-     * If `videoFrameBitmap` is provided, AI looks directly at the actual video frame to write a 100% matching Title & Description!
-     */
     suspend fun generateFlowPromptTitleAndDescription(
         topic: String,
         customDescriptionNote: String = "",
