@@ -69,14 +69,9 @@ class MemoryVault(private val context: Context) {
     private val profileFile: File = File(rootDir, "user_profile_rules.json")
     private val persistentLogsFile: File = File(rootDir, "system_action_logs.txt")
     private val hermesLedgerFile: File = File(rootDir, "hermes_posted_ledger.json")
-    private val notebookSkillsFile: File = File(rootDir, "notebook_book_skills.json")
 
     private val cachedLogs = ArrayDeque<String>()
     private var logsInitialized = false
-
-    init {
-        AuraPluginStore.syncFromContext(context)
-    }
 
     fun resolveCategoryFolder(packageName: String, taskGoal: String): String {
         val combined = "$packageName $taskGoal".lowercase(Locale.ROOT)
@@ -321,22 +316,6 @@ class MemoryVault(private val context: Context) {
         } catch (_: Exception) {
             false
         }
-    }
-
-    fun saveNotebookSkillChunk(topicTitle: String, condensedSkillRule: String) = synchronized(vaultLock) {
-        val arr = try {
-            if (notebookSkillsFile.exists()) JSONArray(notebookSkillsFile.readText()) else JSONArray()
-        } catch (_: Exception) {
-            JSONArray()
-        }
-        arr.put(
-            JSONObject().apply {
-                put("topic", topicTitle.trim())
-                put("skill", condensedSkillRule.trim())
-                put("time", SimpleDateFormat("dd MMM HH:mm", Locale.getDefault()).format(Date()))
-            }
-        )
-        writeTextSafely(notebookSkillsFile, arr.toString(2))
     }
 
     @Suppress("DEPRECATION")
@@ -595,7 +574,7 @@ class MemoryVault(private val context: Context) {
                 rulesArr.put(newRuleAdded)
                 j.put("extractedRulesSummary", rulesArr)
             }
-            writeTextSafely(metaFile, j.toString(2))
+            writeTextSafely(metaFile, json.toString(2))
         } catch (_: Exception) {}
     }
 
@@ -707,12 +686,10 @@ class MemoryVault(private val context: Context) {
     }
 
     fun saveUserProfileRules(rulesText: String) = synchronized(vaultLock) {
-        AuraPluginStore.syncFromContext(context)
         writeTextSafely(profileFile, rulesText.trim())
     }
 
     fun getUserProfileRules(): String = synchronized(vaultLock) {
-        AuraPluginStore.syncFromContext(context)
         return try {
             if (profileFile.exists()) profileFile.readText() else ""
         } catch (_: Exception) {
