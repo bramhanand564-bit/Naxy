@@ -81,6 +81,7 @@ class AiOverlayHud(
 
     private var webCardContainer: LinearLayout? = null
     private var backgroundWebView: WebView? = null
+    private var webLiveUrlBadge: TextView? = null
     private var isWebExpandedFull = false
     private var isWebDesktopUa = true
     private var isUserDrivingWebDot = false
@@ -97,7 +98,7 @@ class AiOverlayHud(
     private var currentProgressPercent = 0
     private var isVideoDownloadedInSession = false
 
-    // Holds the video URI for 100% silent background WebView file-chooser injection (YouTube/Instagram web upload)
+    // Holds the video URI for 100% silent background WebView file-chooser injection
     var pendingUploadFileUri: Uri? = null
     var onQuickActionSelected: ((String) -> Unit)? = null
 
@@ -112,11 +113,9 @@ class AiOverlayHud(
     )
 
     private val autoCollapseAndDockRunnable = Runnable {
-        if (!isNotchExpandedByUser && !isUserDrivingWebDot) {
+        // Do NOT auto-hide if the user opened the Live Browser via Emoji tap!
+        if (!isNotchExpandedByUser && !isUserDrivingWebDot && webCardContainer?.visibility != View.VISIBLE) {
             notchCapsuleContainer?.visibility = View.GONE
-            if (webCardContainer?.visibility == View.VISIBLE && !isTaskActivelyRunning) {
-                setWebCardVisibility(false)
-            }
             if (!isTaskActivelyRunning) {
                 val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
                 baymaxFaceView?.setMood(if (hour >= 23 || hour < 5) BotMood.SLEEPY else BotMood.IDLE)
@@ -184,8 +183,7 @@ class AiOverlayHud(
     }
 
     /**
-     * OpenDots "Take Control (You are driving)" toggle:
-     * Only enables keyboard focus inside the floating WebView when the user explicitly taps [🎮 Drive]!
+     * Allows user to manually type inside the floating background browser ONLY when they tap [🎮 Touch]
      */
     private fun setUserDrivingWebDotMode(enableDrive: Boolean) {
         mainHandler.post {
@@ -193,7 +191,7 @@ class AiOverlayHud(
             val root = podRootLayout ?: return@post
             isUserDrivingWebDot = enableDrive
             if (enableDrive) {
-                driveModeToggleBtn?.text = "🎮 Driving"
+                driveModeToggleBtn?.text = "🎮 Touch ON"
                 driveModeToggleBtn?.setTextColor(Color.parseColor("#FACC15"))
                 root.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
                 backgroundWebView?.isFocusable = true
@@ -252,11 +250,16 @@ class AiOverlayHud(
                 (prefs.getInt("hud_idle_alpha_percent", 38).coerceIn(5, 100)) / 100f
             }
 
-            val targetAlpha = if (isNotchExpandedByUser) 1.0f else idleAlphaFloat
+            val targetAlpha = if (isNotchExpandedByUser || webCardContainer?.visibility == View.VISIBLE) {
+                1.0f
+            } else {
+                idleAlphaFloat
+            }
 
             if (stealthHideBot) {
                 baymaxFaceView?.visibility = View.GONE
                 notchCapsuleContainer?.visibility = View.GONE
+                webCardContainer?.visibility = View.GONE
             } else {
                 baymaxFaceView?.visibility = View.VISIBLE
                 baymaxFaceView?.alpha = targetAlpha
@@ -270,7 +273,7 @@ class AiOverlayHud(
     private fun dockBotToNearestCornerEdge() {
         val params = podParams ?: return
         val root = podRootLayout ?: return
-        if (!isAdded) return
+        if (!isAdded || webCardContainer?.visibility == View.VISIBLE) return
 
         val dm = context.resources.displayMetrics
         val screenW = dm.widthPixels
@@ -312,8 +315,14 @@ class AiOverlayHud(
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         }
 
-        val targetX = if (params.x < screenW / 2) dp(10) else (screenW - dp(68)).coerceAtLeast(dp(10))
-        if (params.x < 0 || params.x > screenW - dp(56)) {
+        // Keep X near left margin when opening web card so the 310dp card fits comfortably on screen
+        val targetX = if (webCardContainer?.visibility == View.VISIBLE) {
+            dp(10)
+        } else {
+            if (params.x < screenW / 2) dp(10) else (screenW - dp(68)).coerceAtLeast(dp(10))
+        }
+
+        if (params.x < 0 || params.x > screenW - dp(56) || webCardContainer?.visibility == View.VISIBLE) {
             params.x = targetX
             try {
                 windowManager.updateViewLayout(root, params)
@@ -445,15 +454,15 @@ class AiOverlayHud(
                 currentProgressPercent = 85
                 isVideoDownloadedInSession = true
                 prefs.edit()
-                    .putString("last_download_status", "📥 Video Downloaded ✅ ($todayStr $timeStr)")
+                    .putString("last_download_status", "📥 Video Saved to Folder ✅ ($todayStr $timeStr)")
                     .apply()
             }
             s.contains("opening youtube") || s.contains("next") -> currentProgressPercent = 90
-            s.contains("caption") || s.contains("upload short") -> currentProgressPercent = 95
+            s.contains("caption") || s.contains("description") || s.contains("upload short") -> currentProgressPercent = 95
             s.contains("success") || s.contains("complete") -> {
                 currentProgressPercent = 100
                 val summary = if (s.contains("upload")) {
-                    "✅ $todayStr ($timeStr): Video Uploaded Successfully!"
+                    "✅ $todayStr ($timeStr): Video Uploaded with Title & Desc!"
                 } else {
                     "✅ $todayStr ($timeStr): Task Completed!"
                 }
@@ -465,20 +474,24 @@ class AiOverlayHud(
         }
 
         notchProgressBar?.progress = if (taskRunning) currentProgressPercent.coerceAtLeast(15) else 100
-        val savedDl = prefs.getString("last_download_status", "📥 Video Download: अभी कोई नया डाउनलोड नहीं")
+        val savedDl = prefs.getString("last_download_status", "📥 Video Status: अभी कोई नया डाउनलोड नहीं")
         downloadBadgeView?.text = if (isVideoDownloadedInSession) {
-            "📥 Video Status: Downloaded & Ready ✅"
+            "📥 Video Status: Saved in Folder & Ready ✅"
         } else {
             savedDl
         }
 
         val schedOn = prefs.getBoolean("scheduler_enabled", false)
-        val schedTime = prefs.getString("schedule_time_hm", "19:00") ?: "19:00"
+        val flowCreateTime = prefs.getString("flow_create_time_hm", prefs.getString("schedule_time_hm", "18:00")) ?: "18:00"
+        val uploadTime = prefs.getString("folder_upload_time_hm", prefs.getString("schedule_time_hm", "19:00")) ?: "19:00"
+        val flowMode = if (prefs.getString("flow_execution_mode", "BACKGROUND") == "BACKGROUND") "BG Web" else "Real Chrome"
+        val uploadMode = if (prefs.getBoolean("bg_youtube_upload", false)) "BG Web" else "Real App"
         val lastDaily = prefs.getString("last_daily_action_log", "📅 आज अभी कोई टास्क पूरा नहीं हुआ")
+
         dailyLogBadgeView?.text = if (schedOn) {
-            "$lastDaily\n⏰ Daily Auto-Schedule: ON ($schedTime)"
+            "$lastDaily\n🎬 Flow Auto-Create: $flowCreateTime ($flowMode)\n📤 Folder Auto-Upload: $uploadTime ($uploadMode)"
         } else {
-            "$lastDaily\n⏰ Daily Auto-Schedule: OFF"
+            "$lastDaily\n⏰ Auto-Schedule: OFF (Flow: $flowCreateTime | Upload: $uploadTime)"
         }
     }
 
@@ -489,6 +502,7 @@ class AiOverlayHud(
             val smartMood = resolveSmartExpression20(statusText, mood)
             baymaxFaceView?.setMood(smartMood)
             statusTextView?.text = statusText
+            webLiveUrlBadge?.text = "⚡ ${statusText.take(36)}"
             updateNotchTelemetryFromStatus(statusText, taskRunning)
             if (!isUserDrivingWebDot) {
                 enforceKeyboardFriendlyFocusFlags()
@@ -500,6 +514,7 @@ class AiOverlayHud(
             if (stealth) {
                 baymaxFaceView?.visibility = View.GONE
                 notchCapsuleContainer?.visibility = View.GONE
+                webCardContainer?.visibility = View.GONE
                 return@post
             }
 
@@ -553,9 +568,12 @@ class AiOverlayHud(
                 "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
             }
             backgroundWebView?.loadUrl(url)
+            webLiveUrlBadge?.text = "🌐 ${url.removePrefix("https://").removePrefix("http://").take(34)}"
             if (showCard) {
-                undockBotFromEdgeToVisible()
+                isNotchExpandedByUser = true
+                notchCapsuleContainer?.visibility = View.VISIBLE
                 setWebCardVisibility(true)
+                undockBotFromEdgeToVisible()
             }
         }
     }
@@ -624,7 +642,7 @@ class AiOverlayHud(
             y = dp(95)
         }
 
-        // CRITICAL KEYBOARD FIX: Block descendant focus by default so no child view ever steals Gboard!
+        // Block descendant focus by default so no child view ever steals Gboard!
         podRootLayout = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             isFocusable = false
@@ -667,16 +685,21 @@ class AiOverlayHud(
         }
 
         statusTextView = TextView(context).apply {
-            text = "AuraDroid Ready"
+            text = "AuraDroid Ready (Tap Emoji for Live Web)"
             setTextColor(Color.parseColor("#F8FAFC"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             typeface = Typeface.DEFAULT_BOLD
             maxWidth = dp(190)
             maxLines = 2
+            setOnClickListener {
+                // Tapping status text toggles telemetry details
+                val detailsVis = notchDetailsSection?.visibility == View.VISIBLE
+                notchDetailsSection?.visibility = if (detailsVis) View.GONE else View.VISIBLE
+            }
         }
 
         peekWebButton = TextView(context).apply {
-            text = " 🟣 Dot "
+            text = " 🌐 Web "
             setTextColor(Color.parseColor("#38BDF8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = Typeface.DEFAULT_BOLD
@@ -716,7 +739,7 @@ class AiOverlayHud(
         }
 
         downloadBadgeView = TextView(context).apply {
-            text = "📥 Video Download: Ready"
+            text = "📥 Video Status: Ready"
             setTextColor(Color.parseColor("#10B981"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             setPadding(0, 0, 0, dp(3))
@@ -795,9 +818,9 @@ class AiOverlayHud(
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#121316"))
                 cornerRadius = dp(16).toFloat()
-                setStroke(dp(1), Color.parseColor("#334155"))
+                setStroke(dp(1), Color.parseColor("#3B82F6"))
             }
-            layoutParams = LinearLayout.LayoutParams(dp(310), dp(440)).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(315), dp(450)).apply {
                 topMargin = dp(8)
             }
         }
@@ -805,18 +828,17 @@ class AiOverlayHud(
         val webHeader = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(4), dp(2), dp(4), dp(4))
+            setPadding(dp(4), dp(2), dp(4), dp(2))
         }
 
         val webTitle = TextView(context).apply {
-            text = "🟣 OpenDots Live Workspace"
+            text = "🌐 Live Background Project"
             setTextColor(Color.parseColor("#E2E8F0"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        // OpenDots "Take Control / You are driving" toggle button
         driveModeToggleBtn = TextView(context).apply {
             text = "🤖 AI Auto"
             setTextColor(Color.parseColor("#10B981"))
@@ -841,8 +863,8 @@ class AiOverlayHud(
                     lp?.height = dp(620)
                     text = "[ ↙ ]"
                 } else {
-                    lp?.width = dp(310)
-                    lp?.height = dp(440)
+                    lp?.width = dp(315)
+                    lp?.height = dp(450)
                     text = "[ ⛶ ]"
                 }
                 webCardContainer?.layoutParams = lp
@@ -851,12 +873,17 @@ class AiOverlayHud(
         }
 
         val hideBtn = TextView(context).apply {
-            text = "[ ✕ ]"
-            setTextColor(Color.parseColor("#94A3B8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            text = "[ ✕ Hide ]"
+            setTextColor(Color.parseColor("#F87171"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(6), dp(2), dp(4), dp(2))
             setOnClickListener {
+                isNotchExpandedByUser = false
                 setWebCardVisibility(false)
+                notchDetailsSection?.visibility = View.GONE
+                notchCapsuleContainer?.visibility = View.GONE
+                if (!isTaskActivelyRunning) dockBotToNearestCornerEdge()
             }
         }
 
@@ -865,7 +892,14 @@ class AiOverlayHud(
         webHeader.addView(expandBtn)
         webHeader.addView(hideBtn)
 
-        // OpenDots Quick Dot Switcher Strip (YT Studio, FreeLLM :3001, Flow, Qwen, Desktop)
+        webLiveUrlBadge = TextView(context).apply {
+            text = "⚡ Emoji पर दोबारा टैप करने से यह छुप (Hide) जाएगा"
+            setTextColor(Color.parseColor("#38BDF8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            setPadding(dp(4), 0, dp(4), dp(4))
+            maxLines = 1
+        }
+
         val dotStripScroll = HorizontalScrollView(context).apply {
             isHorizontalScrollBarEnabled = false
             setPadding(0, 0, 0, dp(4))
@@ -892,18 +926,22 @@ class AiOverlayHud(
                 }
             })
         }
+        addDotChip("🌊 Google Flow", "https://labs.google/fx/tools/flow", true)
         addDotChip("📺 YT Studio", "https://studio.youtube.com", true)
-        addDotChip("🔓 FreeLLM :3001", "http://localhost:3001/models/chat", false)
-        addDotChip("🌊 Flow", "https://labs.google/fx/tools/flow", true)
-        addDotChip("🎨 Qwen AI", "https://chat.qwen.ai", false)
-        addDotChip("🎥 Synthesia", "https://www.synthesia.io/features/text-to-video", true)
+        addDotChip("✨ Gemini", "https://gemini.google.com", false)
+        addDotChip("📸 Insta Web", "https://www.instagram.com", false)
+        addDotChip("🔄 Reload", "javascript:window.location.reload()", true)
         dotStripScroll.addView(dotStripRow)
 
-        // CRITICAL KEYBOARD FIX: Only allow text editor focus when user explicitly turns ON [🎮 Driving] mode!
+        // NEVER-PAUSE BACKGROUND WEBVIEW: Keeps running Flow/YouTube even when hidden!
         backgroundWebView = object : WebView(context) {
             override fun onCheckIsTextEditor(): Boolean = isUserDrivingWebDot
             override fun requestFocus(direction: Int, previouslyFocusedRect: Rect?): Boolean {
                 return if (isUserDrivingWebDot) super.requestFocus(direction, previouslyFocusedRect) else false
+            }
+            override fun onWindowVisibilityChanged(visibility: Int) {
+                // Always trick Chromium into thinking the window is visible so background tasks never pause!
+                super.onWindowVisibilityChanged(View.VISIBLE)
             }
         }.apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -925,7 +963,15 @@ class AiOverlayHud(
 
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-            webViewClient = WebViewClient()
+            webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    if (!url.isNullOrBlank()) {
+                        webLiveUrlBadge?.text = "🌐 Live: ${url.removePrefix("https://").removePrefix("http://").take(38)}"
+                    }
+                    CookieManager.getInstance().flush()
+                }
+            }
             webChromeClient = object : WebChromeClient() {
                 override fun onShowFileChooser(
                     webView: WebView?,
@@ -949,6 +995,7 @@ class AiOverlayHud(
         }
 
         webCardContainer?.addView(webHeader)
+        webCardContainer?.addView(webLiveUrlBadge)
         webCardContainer?.addView(dotStripScroll)
         webCardContainer?.addView(backgroundWebView)
 
@@ -966,7 +1013,16 @@ class AiOverlayHud(
 
     private fun setWebCardVisibility(show: Boolean) {
         webCardContainer?.visibility = if (show) View.VISIBLE else View.GONE
-        if (!show) {
+        peekWebButton?.text = if (show) " 🔽 Hide " else " 🌐 Web "
+        if (show) {
+            // If no page is loaded yet, automatically load the saved Flow/Project URL so the user sees their workspace
+            val currentUrl = backgroundWebView?.url
+            if (currentUrl.isNullOrBlank() || currentUrl == "about:blank") {
+                val savedUrl = prefs.getString("saved_flow_url", "https://labs.google/fx/tools/flow")
+                    ?: "https://labs.google/fx/tools/flow"
+                backgroundWebView?.loadUrl(savedUrl)
+            }
+        } else {
             // Always restore keyboard-safe non-focusable mode when closing the web card!
             enforceKeyboardFriendlyFocusFlags()
         }
@@ -1023,7 +1079,7 @@ class AiOverlayHud(
                 MotionEvent.ACTION_UP -> {
                     if (!isDragging) {
                         onBaymaxFaceTapped()
-                    } else {
+                    } else if (webCardContainer?.visibility != View.VISIBLE) {
                         mainHandler.postDelayed(autoCollapseAndDockRunnable, 4000L)
                     }
                     true
@@ -1033,38 +1089,41 @@ class AiOverlayHud(
         }
     }
 
+    /**
+     * 1-TAP TOGGLE ON BOT EMOJI:
+     * - Tap 1: Opens the Live Background Browser + Status Capsule so user sees the running project live!
+     * - Tap 2: Hides the Live Background Browser + Status Capsule while the background project keeps running!
+     */
     private fun onBaymaxFaceTapped() {
         mainHandler.removeCallbacks(autoCollapseAndDockRunnable)
-        undockBotFromEdgeToVisible()
 
         if (!isTaskActivelyRunning) {
             manualTapMoodIndex = (manualTapMoodIndex + 1) % chanchalPlayfulMoods.size
             baymaxFaceView?.setMood(chanchalPlayfulMoods[manualTapMoodIndex])
         }
 
-        val isCapsuleVisible = notchCapsuleContainer?.visibility == View.VISIBLE
-        val isDetailsVisible = notchDetailsSection?.visibility == View.VISIBLE
+        val isWebCurrentlyOpen = webCardContainer?.visibility == View.VISIBLE
 
-        if (isCapsuleVisible && isDetailsVisible) {
+        if (isWebCurrentlyOpen) {
+            // Second Tap -> HIDE everything cleanly while backgroundWebView continues running in background!
             isNotchExpandedByUser = false
+            setWebCardVisibility(false)
             notchDetailsSection?.visibility = View.GONE
             notchCapsuleContainer?.visibility = View.GONE
-            setWebCardVisibility(false)
-            dockBotToNearestCornerEdge()
+            if (!isTaskActivelyRunning) {
+                dockBotToNearestCornerEdge()
+            } else {
+                applyUserTransparencyAndStealthSettings()
+            }
         } else {
+            // First Tap -> OPEN Live Background Browser + Status Capsule!
             isNotchExpandedByUser = true
             updateNotchTelemetryFromStatus(statusTextView?.text?.toString() ?: "Ready", isTaskActivelyRunning)
             notchCapsuleContainer?.visibility = View.VISIBLE
             notchDetailsSection?.visibility = View.VISIBLE
+            setWebCardVisibility(true)
+            undockBotFromEdgeToVisible()
             if (!isUserDrivingWebDot) enforceKeyboardFriendlyFocusFlags()
-            mainHandler.postDelayed({
-                if (!isUserDrivingWebDot) {
-                    isNotchExpandedByUser = false
-                    notchDetailsSection?.visibility = View.GONE
-                    notchCapsuleContainer?.visibility = View.GONE
-                    if (!isTaskActivelyRunning) dockBotToNearestCornerEdge()
-                }
-            }, 7000L)
         }
     }
 
