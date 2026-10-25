@@ -50,6 +50,24 @@ data class PostRunReflectionResult(
     val modelUsed: String
 )
 
+data class FlowVideoMetadata(
+    val videoPrompt: String,
+    val viralTitle: String,
+    val viralDescription: String
+)
+
+data class ApiCallTelemetryRecord(
+    val callNumber: Int,
+    val purpose: String,
+    val model: String,
+    val httpCode: Int,
+    val durationMs: Long,
+    val pacerWaitMs: Long,
+    val gapSincePrevMs: Long,
+    val tokensUsed: Int,
+    val timestampMs: Long
+)
+
 class GeminiBrain(private var apiKey: String) {
 
     private val rateLock = Any()
@@ -85,6 +103,20 @@ class GeminiBrain(private var apiKey: String) {
     private val blockedModels = mutableSetOf<String>()
     private val quotaCooldownModels = mutableMapOf<String, Long>()
 
+    // Detailed API Telemetry & Timing State
+    @Volatile
+    var detailedApiLoggingEnabled: Boolean = true
+    private var totalApiCallsSession = 0
+    private var totalSuccessCallsSession = 0
+    private var totalQuota429HitsSession = 0
+    private var totalTokensUsedSession = 0L
+    private var totalApiTimeMsSession = 0L
+    private var lastGlobalApiCallFinishMs = 0L
+    private val recentApiCallHistory = mutableListOf<ApiCallTelemetryRecord>()
+    private val perModelCallCount = mutableMapOf<String, Int>()
+    private val perModelTokensUsed = mutableMapOf<String, Long>()
+    private val perModelTotalTimeMs = mutableMapOf<String, Long>()
+
     @Volatile
     var isLiveTaskCurrentlyRunning: Boolean = false
     @Volatile
@@ -99,19 +131,6 @@ class GeminiBrain(private var apiKey: String) {
     fun updateApiKey(newKey: String) {
         apiKey = newKey.trim()
         parseAndApplyKeyConfig(apiKey)
-    }
-
-    /**
-     * Automatically pulls installed skills from AuraPluginStore (safe even if AuraPluginStore.kt is committed later)
-     */
-    private fun fetchInstalledStoreSkills(): String {
-        return try {
-            val clazz = Class.forName("com.auradroid.os.AuraPluginStore")
-            val method = clazz.getMethod("getActiveSkillsForBrain")
-            (method.invoke(null) as? String) ?: ""
-        } catch (_: Throwable) {
-            ""
-        }
     }
 
     private fun parseAndApplyKeyConfig(rawInput: String) {
@@ -221,25 +240,147 @@ class GeminiBrain(private var apiKey: String) {
         lastModelCallTimeMs[model] = nowMs
     }
 
+    private fun formatSec(ms: Long): String {
+        return String.format(Locale.US, "%.2fs", ms / 1000.0)
+    }
+
+    private fun recordAndLogApiCallTelemetry(
+        purpose: String,
+        model: String,
+        httpCode: Int,
+        durationMs: Long,
+        pacerWaitMs: Long,
+        tokensInCall: Int
+    ) {
+        val now = System.currentTimeMillis()
+        var callNum: Int
+        var gapMs: Long
+        var oneMinCalls: Int
+        var oneMinDurationMs: Long
+        var usedRpm: Int
+        var maxRpm: Int
+        var totalTokSession: Long
+
+        synchronized(rateLock) {
+            totalApiCallsSession++
+            callNum = totalApiCallsSession
+            if (httpCode == 200) totalSuccessCallsSession++
+            if (httpCode == 429) totalQuota429HitsSession++
+
+            gapMs = if (lastGlobalApiCallFinishMs > 0L) (now - durationMs - lastGlobalApiCallFinishMs).coerceAtLeast(0L) else 0L
+            lastGlobalApiCallFinishMs = now
+
+            totalTokensUsedSession += tokensInCall
+            totalApiTimeMsSession += durationMs
+            totalTokSession = totalTokensUsedSession
+
+            perModelCallCount[model] = (perModelCallCount[model] ?: 0) + 1
+            perModelTokensUsed[model] = (perModelTokensUsed[model] ?: 0L) + tokensInCall
+            perModelTotalTimeMs[model] = (perModelTotalTimeMs[model] ?: 0L) + durationMs
+
+            val rec = ApiCallTelemetryRecord(
+                callNumber = callNum,
+                purpose = purpose,
+                model = model,
+                httpCode = httpCode,
+                durationMs = durationMs,
+                pacerWaitMs = pacerWaitMs,
+                gapSincePrevMs = gapMs,
+                tokensUsed = tokensInCall,
+                timestampMs = now
+            )
+            recentApiCallHistory.add(rec)
+            recentApiCallHistory.removeAll { now - it.timestampMs > 300_000L } // Keep 5 mins window
+
+            val lastMinRecords = recentApiCallHistory.filter { now - it.timestampMs <= 60_000L }
+            oneMinCalls = lastMinRecords.size
+            oneMinDurationMs = lastMinRecords.sumOf { it.durationMs }
+
+            val baseModelKey = if (model.startsWith("FreeLLM")) "freellmapi:auto" else model
+            usedRpm = getUsedRpmInLastMinute(baseModelKey, now)
+            maxRpm = getMaxSafeRpmForModel(baseModelKey)
+        }
+
+        if (detailedApiLoggingEnabled) {
+            val leftRpm = (maxRpm - usedRpm).coerceAtLeast(0)
+            val statusLabel = if (httpCode == 200) "200 OK" else "HTTP $httpCode"
+            val logLine = "📊 [API #$callNum | $statusLabel] काम: $purpose | Model: $model | " +
+                "⏱️ Time: ${formatSec(durationMs)} (Wait: ${formatSec(pacerWaitMs)} | Gap: ${formatSec(gapMs)}) | " +
+                "📈 1-Min: $oneMinCalls calls (${formatSec(oneMinDurationMs)} लगा) | " +
+                "🔋 Quota: $usedRpm/$maxRpm RPM ($leftRpm left) | " +
+                "🪙 Tokens: $tokensInCall (Total: $totalTokSession)"
+            onBrainLog?.invoke(logLine)
+        }
+    }
+
+    fun resetApiTelemetryStats() = synchronized(rateLock) {
+        totalApiCallsSession = 0
+        totalSuccessCallsSession = 0
+        totalQuota429HitsSession = 0
+        totalTokensUsedSession = 0L
+        totalApiTimeMsSession = 0L
+        lastGlobalApiCallFinishMs = 0L
+        recentApiCallHistory.clear()
+        perModelCallCount.clear()
+        perModelTokensUsed.clear()
+        perModelTotalTimeMs.clear()
+    }
+
+    /**
+     * Full Live Test Report for Engine Tab showing exact per-minute calls, seconds spent, quota left & per-model breakdown
+     */
+    fun getDetailedApiTelemetryReport(): String = synchronized(rateLock) {
+        val now = System.currentTimeMillis()
+        val lastMinList = recentApiCallHistory.filter { now - it.timestampMs <= 60_000L }
+        val oneMinCalls = lastMinList.size
+        val oneMinSec = formatSec(lastMinList.sumOf { it.durationMs })
+        val oneMinWaitSec = formatSec(lastMinList.sumOf { it.pacerWaitMs })
+        val avgSec = if (totalApiCallsSession > 0) formatSec(totalApiTimeMsSession / totalApiCallsSession) else "0.00s"
+
+        val sb = StringBuilder()
+        sb.append("⚡ 1-Min Live Meter: $oneMinCalls Calls | ⏱️ $oneMinSec API Time (Wait: $oneMinWaitSec)\n")
+        sb.append("📊 Session Total: $totalApiCallsSession Calls (✅ $totalSuccessCallsSession OK | ⚠️ $totalQuota429HitsSession Quota 429)\n")
+        sb.append("⏱️ Total API Time: ${formatSec(totalApiTimeMsSession)} (Avg: $avgSec/call) | 🪙 Total Tokens: $totalTokensUsedSession\n")
+
+        if (perModelCallCount.isNotEmpty()) {
+            sb.append("\n🤖 Model-Wise Usage Breakdown:\n")
+            for ((m, cnt) in perModelCallCount) {
+                val tMs = perModelTotalTimeMs[m] ?: 0L
+                val tok = perModelTokensUsed[m] ?: 0L
+                sb.append(" • $m: $cnt calls | ⏱️ ${formatSec(tMs)} | 🪙 $tok tok\n")
+            }
+        }
+
+        val last3 = recentApiCallHistory.takeLast(4).reversed()
+        if (last3.isNotEmpty()) {
+            sb.append("\n🕒 Recent API Calls (किस काम में कितना समय लगा):\n")
+            for (r in last3) {
+                sb.append(" • #${r.callNumber} [${r.purpose}] ➔ ${formatSec(r.durationMs)} (Gap: ${formatSec(r.gapSincePrevMs)}, ${r.tokensUsed} tok, ${r.model})\n")
+            }
+        }
+        return sb.toString().trim()
+    }
+
     fun getActiveModelListStatus(): String {
         val now = System.currentTimeMillis()
         val lines = mutableListOf<String>()
 
         if (isFreeLlmConfigured()) {
             val used = getUsedRpmInLastMinute("freellmapi:auto", now)
-            lines.add("🚀 FreeLLM / OmniRoute ($freeLlmBaseUrl/v1 | Ready | $used RPM used)")
+            lines.add("🚀 FreeLLM / OmniRoute ($freeLlmBaseUrl/v1 | Ready | $used/30 RPM used)")
         }
 
         if (isGoogleGeminiConfigured() || !isFreeLlmConfigured()) {
             smartVisionLadder.forEach { m ->
                 val used = getUsedRpmInLastMinute(m, now)
                 val maxRpm = getMaxSafeRpmForModel(m)
+                val left = (maxRpm - used).coerceAtLeast(0)
                 val gapSec = getMinSafeGapMsForModel(m) / 1000L
                 val waitMs = getWaitTimeMsForModel(m, now)
                 val status = when {
                     blockedModels.contains(m) -> "🚫 $m (Unavailable)"
-                    waitMs > 0L -> "⏳ $m (Pacer ${(waitMs / 1000L).coerceAtLeast(1L)}s | $used/$maxRpm RPM | ${gapSec}s Gap)"
-                    else -> "✅ $m (Ready | $used/$maxRpm Safe RPM | ${gapSec}s Gap)"
+                    waitMs > 0L -> "⏳ $m (Wait ${(waitMs / 1000L).coerceAtLeast(1L)}s | Used $used/$maxRpm RPM, $left left | ${gapSec}s Gap)"
+                    else -> "✅ $m (Ready | Used $used/$maxRpm RPM, $left left | ${gapSec}s Gap)"
                 }
                 lines.add(status)
             }
@@ -362,9 +503,11 @@ class GeminiBrain(private var apiKey: String) {
         imagesBase64: List<String> = emptyList(),
         useDeep38Flash: Boolean = true,
         preferredGear: String = if (useDeep38Flash) "COPILOT_38_ROBOTICS" else "FAST_LITE",
-        isStuck: Boolean = false
+        isStuck: Boolean = false,
+        callPurpose: String = "AI Call"
     ): Pair<String, String> = withContext(Dispatchers.IO) {
         if (!isFreeLlmConfigured() && !isGoogleGeminiConfigured()) {
+            onBrainLog?.invoke("⚠️ [$callPurpose] API Call Skipped: No API Key configured!")
             return@withContext Pair("", "No API Key")
         }
 
@@ -395,10 +538,13 @@ class GeminiBrain(private var apiKey: String) {
             }
 
             val waitNeeded = getWaitTimeMsForModel(model, loopNow)
+            var actualPacerWaitMs = 0L
             if (waitNeeded > 0L) {
                 if (waitNeeded <= 15_000L) {
-                    onBrainLog?.invoke("⏱️ Smart Quota Pacer: Waiting ${(waitNeeded / 1000L).coerceAtLeast(1L)}s for [$model]...")
+                    onBrainLog?.invoke("⏱️ [$callPurpose] Quota Pacer: Waiting ${formatSec(waitNeeded)} for [$model]...")
+                    val wStart = System.currentTimeMillis()
                     delay(waitNeeded)
+                    actualPacerWaitMs = System.currentTimeMillis() - wStart
                 } else {
                     continue
                 }
@@ -409,17 +555,41 @@ class GeminiBrain(private var apiKey: String) {
 
             if (model.startsWith("freellmapi:")) {
                 val routeMode = model.removePrefix("freellmapi:")
+                val startMs = System.currentTimeMillis()
                 val freeResult = executeFreeLlmApiCall(routeMode, prompt, imagesBase64)
+                val durMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+
+                recordAndLogApiCallTelemetry(
+                    purpose = callPurpose,
+                    model = freeResult.third,
+                    httpCode = freeResult.first,
+                    durationMs = durMs,
+                    pacerWaitMs = actualPacerWaitMs,
+                    tokensInCall = freeResult.fourth
+                )
+
                 if (freeResult.first == 200 && freeResult.second.isNotBlank()) {
                     return@withContext Pair(freeResult.second, freeResult.third)
                 } else {
-                    onBrainLog?.invoke("🔄 FreeLLMAPI [$routeMode] (${freeResult.first}) -> Trying next route...")
+                    onBrainLog?.invoke("🔄 [$callPurpose] FreeLLMAPI [$routeMode] (${freeResult.first}) -> Trying next route...")
                     continue
                 }
             }
 
             val modelImages = if (model.startsWith("gemma")) emptyList() else imagesBase64
+            val startMs = System.currentTimeMillis()
             val result = executeSingleModelCall(model, prompt, modelImages)
+            val durMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+
+            recordAndLogApiCallTelemetry(
+                purpose = callPurpose,
+                model = model,
+                httpCode = result.first,
+                durationMs = durMs,
+                pacerWaitMs = actualPacerWaitMs,
+                tokensInCall = result.third
+            )
+
             when (result.first) {
                 200 -> if (result.second.isNotBlank()) return@withContext Pair(result.second, model)
                 429 -> {
@@ -427,30 +597,37 @@ class GeminiBrain(private var apiKey: String) {
                     synchronized(rateLock) {
                         quotaCooldownModels[model] = System.currentTimeMillis() + lockDuration
                     }
-                    onBrainLog?.invoke("⚠️ Quota 429 on [$model] -> Shifting gear (${lockDuration / 1000}s cooldown)...")
+                    onBrainLog?.invoke("⚠️ [$callPurpose] Quota 429 on [$model] after ${formatSec(durMs)} -> Shifting gear (${lockDuration / 1000}s cooldown)...")
                 }
                 500, 502, 503, 504 -> {
                     synchronized(rateLock) {
                         quotaCooldownModels[model] = System.currentTimeMillis() + 25_000L
                     }
-                    onBrainLog?.invoke("🔄 Model [$model] busy (${result.first}) -> 25s cooldown & shifting gear...")
+                    onBrainLog?.invoke("🔄 [$callPurpose] Model [$model] busy (${result.first}) after ${formatSec(durMs)} -> Shifting gear...")
                 }
                 else -> {
                     synchronized(rateLock) {
                         quotaCooldownModels[model] = System.currentTimeMillis() + 30_000L
                     }
-                    onBrainLog?.invoke("🔄 Model [$model] (${result.first}) -> Shifting gear...")
+                    onBrainLog?.invoke("🔄 [$callPurpose] Model [$model] (${result.first}) -> Shifting gear...")
                 }
             }
         }
         Pair("", "All models busy")
     }
 
+    private data class FreeLlmResponse(
+        val first: Int,
+        val second: String,
+        val third: String,
+        val fourth: Int
+    )
+
     private fun executeFreeLlmApiCall(
         routeModel: String,
         prompt: String,
         imagesBase64: List<String>
-    ): Triple<Int, String, String> {
+    ): FreeLlmResponse {
         val validImages = imagesBase64.filter { it.isNotBlank() }
 
         if (validImages.isNotEmpty()) {
@@ -468,7 +645,7 @@ class GeminiBrain(private var apiKey: String) {
         routeModel: String,
         prompt: String,
         imagesBase64: List<String>
-    ): Triple<Int, String, String> {
+    ): FreeLlmResponse {
         return try {
             val endpoint = "$freeLlmBaseUrl/v1/chat/completions"
             val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
@@ -509,16 +686,23 @@ class GeminiBrain(private var apiKey: String) {
                 val actualModel = json.optString("model", routeModel).takeIf { it.isNotBlank() } ?: routeModel
                 val message = json.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
                 val text = message?.optString("content", "")?.trim() ?: ""
-                Triple(200, text, "FreeLLM[$actualModel]")
+                val usageObj = json.optJSONObject("usage")
+                val totalTok = usageObj?.optInt("total_tokens", 0)?.takeIf { it > 0 }
+                    ?: ((prompt.length + text.length) / 4 + imagesBase64.size * 258)
+                FreeLlmResponse(200, text, "FreeLLM[$actualModel]", totalTok)
             } else {
-                Triple(code, "", "FreeLLM[$routeModel]")
+                FreeLlmResponse(code, "", "FreeLLM[$routeModel]", 0)
             }
         } catch (_: Exception) {
-            Triple(500, "", "FreeLLM[$routeModel]")
+            FreeLlmResponse(500, "", "FreeLLM[$routeModel]", 0)
         }
     }
 
-    private fun executeSingleModelCall(model: String, prompt: String, imagesBase64: List<String>): Pair<Int, String> {
+    private fun executeSingleModelCall(
+        model: String,
+        prompt: String,
+        imagesBase64: List<String>
+    ): Triple<Int, String, Int> {
         return try {
             val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$googleGeminiKey")
             val conn = (url.openConnection() as HttpURLConnection).apply {
@@ -542,14 +726,20 @@ class GeminiBrain(private var apiKey: String) {
                 })
             }
             conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-            if (conn.responseCode == 200) {
+            val code = conn.responseCode
+            if (code == 200) {
                 val json = JSONObject(conn.inputStream.bufferedReader().readText())
                 val text = json.optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")
                     ?.optJSONArray("parts")?.optJSONObject(0)?.optString("text", "") ?: ""
-                Pair(200, text.trim())
-            } else Pair(conn.responseCode, "")
+                val usageMeta = json.optJSONObject("usageMetadata")
+                val totalTokens = usageMeta?.optInt("totalTokenCount", 0)?.takeIf { it > 0 }
+                    ?: ((prompt.length + text.length) / 4 + imagesBase64.size * 258)
+                Triple(200, text.trim(), totalTokens)
+            } else {
+                Triple(code, "", 0)
+            }
         } catch (_: Exception) {
-            Pair(500, "")
+            Triple(500, "", 0)
         }
     }
 
@@ -572,7 +762,7 @@ class GeminiBrain(private var apiKey: String) {
     }
 
     /**
-     * 1. Task Decider & Modular Micro-Step Planner (Automatically includes installed AuraStore skills!)
+     * 1. Task Decider & Modular Micro-Step Planner
      */
     suspend fun chatAndBuildDetailedPlan(
         userMessage: String,
@@ -580,12 +770,10 @@ class GeminiBrain(private var apiKey: String) {
         userProfileRules: String
     ): JSONObject {
         val isCasual = isCasualGreetingOrChitchat(userMessage)
-        val storeSkills = fetchInstalledStoreSkills()
-        val combinedProfileAndStoreRules = "$userProfileRules\n$storeSkills".trim()
 
         val sysPrompt = """
             You are AuraDroid OS, an intelligent Hinglish AI Companion, Modular Skill Task Decider & Planner.
-            User's saved profile & Installed AuraStore Plugins: $combinedProfileAndStoreRules
+            User's saved profile rules: $userProfileRules
             Recent conversation: $chatHistory
             User just said: "$userMessage"
             
@@ -595,7 +783,7 @@ class GeminiBrain(private var apiKey: String) {
             3. Run only when phone is free -> "executionMode": "IDLE_PHONE_MODE", "readyToExecute": true.
             4. Folder to YouTube -> "executionMode": "YOUTUBE_FOLDER_UPLOAD", "readyToExecute": true.
             5. Google Flow to YouTube -> "executionMode": "GOOGLE_FLOW_UPLOAD", "readyToExecute": true.
-            6. Background web / OpenDots mode -> "executionMode": "BACKGROUND_WEB", "readyToExecute": true.
+            6. Background web mode -> "executionMode": "BACKGROUND_WEB", "readyToExecute": true.
             7. For phone automation, break every action into SEPARATE, CONFIRMABLE micro-steps:
                - Never combine "Tap bottom search icon" and "Type query in top search bar" into one step! Make them 2 separate steps so each click is confirmed!
                - Never combine "Select friend" and "Tap bottom blue Send button" into one step! Make them 2 separate steps!
@@ -622,7 +810,13 @@ class GeminiBrain(private var apiKey: String) {
         """.trimIndent()
 
         val gear = if (isCasual) "GEMMA_TEXT" else "FAST_LITE"
-        val (raw, model) = callWithLadder(sysPrompt, useDeep38Flash = !isCasual, preferredGear = gear)
+        val purposeName = if (isCasual) "Chat Reply" else "Task Plan Builder"
+        val (raw, model) = callWithLadder(
+            prompt = sysPrompt,
+            useDeep38Flash = !isCasual,
+            preferredGear = gear,
+            callPurpose = purposeName
+        )
         return try {
             parseCleanJson(raw).put("modelUsed", model)
         } catch (_: Exception) {
@@ -664,7 +858,7 @@ class GeminiBrain(private var apiKey: String) {
 
             val alreadyTriedTag = lastStepText.contains("send") && lastStepText.contains("click_tag")
 
-            onBrainLog?.invoke("✅ Click Confirmed: Friend selected & 'Send' button detected! Clicking 'Send' immediately...")
+            onBrainLog?.invoke("✅ [0.00s Instant Confirm]: Friend selected & 'Send' button detected (Zero API Quota used)!")
             return if (tagId >= 0 && !alreadyTriedTag) {
                 AgentStepDecision(
                     action = "CLICK_TAG",
@@ -692,7 +886,7 @@ class GeminiBrain(private var apiKey: String) {
                     it.contains("Chat not selected", ignoreCase = true)
             }
             if (!shareSheetStillOpen) {
-                onBrainLog?.invoke("🎉 Post-Click Confirmed: Video shared & Share sheet closed! Task DONE.")
+                onBrainLog?.invoke("🎉 [0.00s Instant Confirm]: Video shared & Share sheet closed! Task DONE.")
                 return AgentStepDecision(action = "DONE", reason = "Confirmed video shared!", modelUsed = "ConfirmEngine")
             }
         }
@@ -717,7 +911,7 @@ class GeminiBrain(private var apiKey: String) {
         val elapsed = now - lastLiveStepTimestampMs
         if (lastLiveStepTimestampMs > 0L && elapsed in 1L..4_999L) {
             val waitMs = 5_000L - elapsed
-            onBrainLog?.invoke("⏳ Phone & Internet Load Delay: Waiting ${waitMs / 1000.0}s for screen to load...")
+            onBrainLog?.invoke("⏳ Screen Load Delay: Waiting ${formatSec(waitMs)} before next step...")
             delay(waitMs)
         }
         lastLiveStepTimestampMs = System.currentTimeMillis()
@@ -754,6 +948,7 @@ class GeminiBrain(private var apiKey: String) {
         } else ""
 
         val currentStepIndex = currentStepHistory.size
+        val stepNum = currentStepIndex + 1
         val activePlannedStep = planSteps.getOrNull(currentStepIndex) ?: planSteps.lastOrNull() ?: goal
 
         val isFirstTimeForApp = sortedFixes.isEmpty()
@@ -816,7 +1011,8 @@ class GeminiBrain(private var apiKey: String) {
             imagesBase64 = imgList,
             useDeep38Flash = (preferredGear != "FAST_LITE"),
             preferredGear = preferredGear,
-            isStuck = isStuck
+            isStuck = isStuck,
+            callPurpose = "Step #$stepNum Screen Decision"
         )
 
         return try {
@@ -886,7 +1082,8 @@ class GeminiBrain(private var apiKey: String) {
             prompt = stage1ProPrompt,
             imagesBase64 = imgsBase64,
             useDeep38Flash = true,
-            preferredGear = "PRO_DEEP_DIAGNOSIS"
+            preferredGear = "PRO_DEEP_DIAGNOSIS",
+            callPurpose = "Post-Run Audit Stage 1 ($appCategory)"
         )
 
         if (stage1Model == "All models busy" || stage1Raw.isBlank()) {
@@ -928,7 +1125,8 @@ class GeminiBrain(private var apiKey: String) {
             prompt = stage2RoboticsPrompt,
             imagesBase64 = imgsBase64,
             useDeep38Flash = true,
-            preferredGear = "ROBOTICS_PRECISION"
+            preferredGear = "ROBOTICS_PRECISION",
+            callPurpose = "Post-Run Audit Stage 2 XY ($appCategory)"
         )
 
         if (stage2Model == "All models busy" || raw.isBlank()) {
@@ -1010,7 +1208,8 @@ class GeminiBrain(private var apiKey: String) {
             prompt = prompt,
             imagesBase64 = screenshotsBase64,
             useDeep38Flash = true,
-            preferredGear = "ROBOTICS_PRECISION"
+            preferredGear = "ROBOTICS_PRECISION",
+            callPurpose = "Run Correction Chat (${runRecord.appCategory})"
         )
         onBrainLog?.invoke("💬 [$modelUsed] Saved Universal Skill Override for ${runRecord.appCategory}")
 
@@ -1063,7 +1262,13 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        val (raw, modelUsed) = callWithLadder(prompt, videoFramesBase64, true, "ROBOTICS_PRECISION")
+        val (raw, modelUsed) = callWithLadder(
+            prompt = prompt,
+            imagesBase64 = videoFramesBase64,
+            useDeep38Flash = true,
+            preferredGear = "ROBOTICS_PRECISION",
+            callPurpose = "Video Training Chat (${videoSession.appCategory})"
+        )
         return try {
             val j = parseCleanJson(raw)
             MemoryChatReply(
@@ -1127,7 +1332,13 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        val (raw, modelUsed) = callWithLadder(prompt, imgs, true, "ROBOTICS_PRECISION")
+        val (raw, modelUsed) = callWithLadder(
+            prompt = prompt,
+            imagesBase64 = imgs,
+            useDeep38Flash = true,
+            preferredGear = "ROBOTICS_PRECISION",
+            callPurpose = "Human Touch Learning ($appCategory)"
+        )
 
         if (modelUsed == "All models busy" || raw.isBlank()) {
             onBrainLog?.invoke("⏸️ Skipped Touch Skill save because models are cooling down.")
@@ -1170,7 +1381,13 @@ class GeminiBrain(private var apiKey: String) {
             }
         """.trimIndent()
 
-        val (raw, modelUsed) = callWithLadder(prompt, framesBase64, true, "ROBOTICS_PRECISION")
+        val (raw, modelUsed) = callWithLadder(
+            prompt = prompt,
+            imagesBase64 = framesBase64,
+            useDeep38Flash = true,
+            preferredGear = "ROBOTICS_PRECISION",
+            callPurpose = "Video Frame Extractor ($appCategory, ${framesBase64.size} frames)"
+        )
         if (modelUsed == "All models busy" || raw.isBlank()) return emptyList()
 
         onBrainLog?.invoke("🎬 [$modelUsed] Extracted Reusable Video Skills (${framesBase64.size} frames)")
@@ -1198,30 +1415,67 @@ class GeminiBrain(private var apiKey: String) {
         return extracted
     }
 
-    suspend fun generateFlowSafePromptAndTitle(topic: String): Pair<String, String> {
+    /**
+     * Generates Flow 9:16 Video Prompt + Viral Title + Full SEO Description & Hashtags
+     */
+    suspend fun generateFlowPromptTitleAndDescription(
+        topic: String,
+        customDescriptionNote: String = ""
+    ): FlowVideoMetadata {
         val cleanTopic = topic.trim().ifEmpty { "Beautiful cinematic vertical video" }
+        val descHint = if (customDescriptionNote.isNotBlank()) {
+            "Also include or follow this user description note: '$customDescriptionNote'."
+        } else {
+            "Write an engaging 3-line viral description with trending hashtags (#shorts #viral #trending)."
+        }
+
         val prompt = """
-            Create a vertical 9:16 video generation prompt and viral YouTube Shorts title strictly for: "$cleanTopic".
-            Stay 100% faithful to "$cleanTopic" (do NOT add forced sci-fi).
+            Create a vertical 9:16 video generation prompt, a viral YouTube Shorts / Instagram Reels title, and a full engaging description strictly for: "$cleanTopic".
+            $descHint
+            Stay 100% faithful to "$cleanTopic".
             Return ONLY JSON:
             {
               "videoPrompt": "Cinematic 8k vertical 9:16 video of...",
-              "youtubeTitle": "Catchy Title! #shorts #viral"
+              "youtubeTitle": "Catchy Viral Title! ✨ #shorts #viral",
+              "youtubeDescription": "Full engaging description with hashtags..."
             }
         """.trimIndent()
 
-        val (raw, _) = callWithLadder(prompt, useDeep38Flash = false, preferredGear = "GEMMA_TEXT")
+        val (raw, _) = callWithLadder(
+            prompt = prompt,
+            useDeep38Flash = false,
+            preferredGear = "GEMMA_TEXT",
+            callPurpose = "Flow Prompt + Viral Title & Description"
+        )
         return try {
             val j = parseCleanJson(raw)
-            Pair(
-                j.optString("videoPrompt", "Cinematic 8k vertical 9:16 video of $cleanTopic, natural lighting, expressive motion, ultra detailed"),
-                j.optString("youtubeTitle", "${cleanTopic.take(45)} ✨ #shorts #viral")
+            val fallbackTitle = "${cleanTopic.take(45)} ✨ #shorts #viral"
+            val fallbackDesc = buildString {
+                append(cleanTopic)
+                if (customDescriptionNote.isNotBlank()) append("\n\n").append(customDescriptionNote)
+                append("\n\n#shorts #viral #trending #youtubeshorts #reels")
+            }
+            FlowVideoMetadata(
+                videoPrompt = j.optString("videoPrompt", "Cinematic 8k vertical 9:16 video of $cleanTopic, natural lighting, expressive motion, ultra detailed"),
+                viralTitle = j.optString("youtubeTitle", fallbackTitle),
+                viralDescription = j.optString("youtubeDescription", fallbackDesc)
             )
         } catch (_: Exception) {
-            Pair(
-                "Cinematic 8k vertical 9:16 video of $cleanTopic, natural lighting, smooth camera movement, ultra detailed",
-                "${cleanTopic.take(45)} ✨ #shorts #viral"
+            val fallbackDesc = buildString {
+                append(cleanTopic)
+                if (customDescriptionNote.isNotBlank()) append("\n\n").append(customDescriptionNote)
+                append("\n\n#shorts #viral #trending #youtubeshorts #reels")
+            }
+            FlowVideoMetadata(
+                videoPrompt = "Cinematic 8k vertical 9:16 video of $cleanTopic, natural lighting, smooth camera movement, ultra detailed",
+                viralTitle = "${cleanTopic.take(45)} ✨ #shorts #viral",
+                viralDescription = fallbackDesc
             )
         }
+    }
+
+    suspend fun generateFlowSafePromptAndTitle(topic: String): Pair<String, String> {
+        val meta = generateFlowPromptTitleAndDescription(topic)
+        return Pair(meta.videoPrompt, meta.viralTitle)
     }
 }
