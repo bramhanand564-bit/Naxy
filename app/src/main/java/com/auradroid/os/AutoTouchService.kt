@@ -311,9 +311,6 @@ class AutoTouchService : AccessibilityService() {
 
     override fun onInterrupt() {}
 
-    /**
-     * Saves run screenshots locally (0 API calls) and NEVER wastes 11,000 tokens auditing a run that already succeeded!
-     */
     internal fun finalizeRunAndTriggerAutoReflection(finalStatus: String) {
         if (activeRunFinalized || activeRunId.isEmpty()) return
         activeRunFinalized = true
@@ -335,13 +332,11 @@ class AutoTouchService : AccessibilityService() {
             capturedBitmaps = rBitmaps
         )
 
-        // ZERO-WASTE QUOTA GUARD: If the task succeeded or was manually stopped, do NOT make extra Post-Run API calls!
         if (finalStatus.equals("SUCCESS", ignoreCase = true) || finalStatus.equals("STOPPED", ignoreCase = true)) {
             log("🛡️ Quota Saver: '$rTitle' [$finalStatus] saved locally (0 extra Audit API tokens used!).")
             return
         }
 
-        // Only run lightweight 1-pass diagnosis if a task actually FAILED
         if (finalStatus.equals("FAILED", ignoreCase = true) && (rBitmaps.isNotEmpty() || rSteps.isNotEmpty())) {
             serviceScope.launch(Dispatchers.IO) {
                 log("🧠 Failed-Run Diagnosis started for '$rTitle'...")
@@ -375,12 +370,19 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
+    /**
+     * Single-Stop Guard: Prevents printing "Task Stopped: Stopped by User" multiple times!
+     */
     fun stopCurrentTask(reason: String = "Stopped") {
-        if (isAgentRunning) {
+        val wasRunning = isAgentRunning
+        val jobWasActive = currentTaskJob?.isActive == true
+        if (!wasRunning && !jobWasActive) return
+
+        isAgentRunning = false
+        if (wasRunning) {
             val status = if (reason.contains("Complete", true)) "SUCCESS" else "STOPPED"
             finalizeRunAndTriggerAutoReflection(status)
         }
-        isAgentRunning = false
         currentTaskJob?.cancel()
         releaseWakeLock()
         hud.updateStatus(reason, BotMood.IDLE, taskRunning = false)
@@ -396,7 +398,116 @@ class AutoTouchService : AccessibilityService() {
     }
 
     /**
-     * Universal Autonomous Goal-Based Executor + Idle Mode + Chat Scheduler & Multi-Platform Trigger
+     * Universal Auto-Popup Killer (0 API calls!):
+     * Automatically dismisses unwanted popups like "Share this on Threads?", "Discard changes?", "Turn on notifications?"
+     */
+    private suspend fun dismissUnwantedPopupsIfPresent(
+        elements: List<TaggedUiElement>,
+        specs: DeviceBodySpecs
+    ): Boolean {
+        val hasThreadsPopup = elements.any {
+            it.label.contains("Share this on Threads", true) || it.label.equals("Share now", true)
+        }
+        val hasDiscardPopup = elements.any {
+            it.label.contains("Discard changes", true) || it.label.contains("not be saved", true)
+        }
+        val hasNotifPopup = elements.any {
+            it.label.contains("Turn on notifications", true)
+        }
+
+        if (hasThreadsPopup || hasDiscardPopup || hasNotifPopup) {
+            val cancelOrNotNow = elements.find {
+                it.label.equals("Cancel", true) ||
+                    it.label.equals("Not now", true) ||
+                    it.label.equals("Dismiss", true) ||
+                    it.label.equals("रद्द करें", true)
+            }
+            if (cancelOrNotNow != null) {
+                log("🛡️ Auto-Popup Killer: Dismissed unwanted popup by tapping [${cancelOrNotNow.label}]!")
+                tapElementSmartly(cancelOrNotNow, forceAccessibilityClick = true)
+            } else {
+                performGlobalAction(GLOBAL_ACTION_BACK)
+            }
+            delay(1300L)
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Universal Loading Spinner Wait (0 API calls!):
+     * If screen shows "Searching for..." or "Loading...", waits 1.6s so results finish loading before taking a screenshot.
+     */
+    private suspend fun waitIfScreenIsActivelyLoading(elements: List<TaggedUiElement>): Boolean {
+        val isLoading = elements.any {
+            it.label.startsWith("Searching for", true) ||
+                it.label.equals("Loading...", true) ||
+                it.label.equals("लोड हो रहा है...", true)
+        }
+        if (isLoading) {
+            log("⏳ Screen is actively loading results -> Waiting 1.6s for content to appear...")
+            delay(1600L)
+            return true
+        }
+        return false
+    }
+
+    /**
+     * 3-Step Post-Click Road-Crossing Verifier:
+     * When the final action (e.g. tapping the bottom blue "Send" / "Submit" button) is executed,
+     * waits 2.4s, re-scans the screen, and verifies that the Share/Action sheet actually closed!
+     * If the sheet is still open (meaning the tap missed!), it taps the exact bottom button again and re-verifies!
+     */
+    private suspend fun verifyFinalActionRoadCrossedOrRetry(
+        specs: DeviceBodySpecs,
+        preTapElements: List<TaggedUiElement>,
+        tapX: Int,
+        tapY: Int
+    ): Boolean {
+        val hadWriteMessageBefore = preTapElements.any { it.label.contains("Write a message", true) }
+        val hadSendButtonBefore = preTapElements.any {
+            it.label.equals("Send", true) || it.label.contains("Send separately", true)
+        }
+
+        delay(2400L)
+        val afterElements = scanScreenInteractiveElements(specs)
+
+        val stillHasWriteMessage = afterElements.any { it.label.contains("Write a message", true) }
+        val stillHasSendButton = afterElements.any {
+            (it.label.equals("Send", true) || it.label.contains("Send separately", true)) &&
+                it.centerY > (specs.screenHeight * 0.82f)
+        }
+
+        if ((hadWriteMessageBefore || hadSendButtonBefore) && (stillHasWriteMessage || stillHasSendButton)) {
+            log("⚠️ Post-Click Proof: Share/Send sheet is STILL open (tap missed)! Retrying exact bottom Send button...")
+            if (isSoftKeyboardOpen()) {
+                performGlobalAction(GLOBAL_ACTION_BACK)
+                delay(1000L)
+            }
+            val exactSendNode = scanScreenInteractiveElements(specs).find {
+                (it.label.equals("Send", true) || it.label.contains("Send separately", true)) &&
+                    it.centerY > (specs.screenHeight * 0.84f)
+            }
+            val retryX = exactSendNode?.centerX ?: (specs.screenWidth / 2)
+            val retryY = exactSendNode?.centerY ?: (specs.screenHeight * 0.938f).toInt()
+            performPhysicalTap(retryX, retryY)
+            delay(2400L)
+
+            val checkAgain = scanScreenInteractiveElements(specs)
+            val stillOpenAfterRetry = checkAgain.any { it.label.contains("Write a message", true) }
+            if (!stillOpenAfterRetry) {
+                log("🎉 3-Step Road-Crossing Confirmed on Retry: Sheet closed & action completed!")
+                return true
+            }
+            return false
+        }
+
+        log("🎉 3-Step Road-Crossing Confirmed: Screen transitioned to next road after final action!")
+        return true
+    }
+
+    /**
+     * Universal Autonomous Goal-Based Executor (Works for ANY App or Website in the Universe!)
      */
     fun startUniversalTask(
         goal: String,
@@ -499,7 +610,7 @@ class AutoTouchService : AccessibilityService() {
                 if (autoTargetApp != null) {
                     hud.updateStatus("🚀 Opening $autoTargetApp...", BotMood.WORKING, taskRunning = true)
                     launchAppByNameOrPackage(autoTargetApp)
-                    stepHistory.add("Opened $autoTargetApp app")
+                    stepHistory.add("MILESTONE_APP_OPENED: Opened $autoTargetApp app")
                     currentRunSteps.add("Step 0: Directly opened $autoTargetApp app")
                     delay(3200L)
                 }
@@ -515,7 +626,18 @@ class AutoTouchService : AccessibilityService() {
                         delay(1500L)
                     }
 
-                    val taggedElements = scanScreenInteractiveElements(specs)
+                    var taggedElements = scanScreenInteractiveElements(specs)
+
+                    // 1. Universal Auto-Popup Killer (0 API calls)
+                    if (dismissUnwantedPopupsIfPresent(taggedElements, specs)) {
+                        taggedElements = scanScreenInteractiveElements(specs)
+                    }
+
+                    // 2. Universal Loading Spinner Wait (0 API calls)
+                    if (waitIfScreenIsActivelyLoading(taggedElements)) {
+                        taggedElements = scanScreenInteractiveElements(specs)
+                    }
+
                     val currentSig = buildScreenSignature(activePkg, taggedElements)
 
                     if (currentSig == lastScreenSignature && stepNumber > 1) {
@@ -528,8 +650,7 @@ class AutoTouchService : AccessibilityService() {
                     if (hasAlreadyCommentedInThisRun && activePkg.contains("instagram")) {
                         val commentSheetStillOpen = taggedElements.any {
                             it.label.contains("Join the conversation", true) ||
-                                it.label.contains("Add a comment", true) ||
-                                it.label.equals("Reply", true)
+                                it.label.contains("Add a comment", true)
                         }
                         if (commentSheetStillOpen) {
                             log("⌨️ Comment already posted! Auto-closing Comment Sheet to expose Share button...")
@@ -537,7 +658,7 @@ class AutoTouchService : AccessibilityService() {
                             closeKeyboardCompletely()
                             performGlobalAction(GLOBAL_ACTION_BACK)
                             delay(1400L)
-                            stepHistory.add("Closed comment sheet to return to Reel screen")
+                            stepHistory.add("MILESTONE_COMMENT_SHEET_CLOSED: Returned to main Reel screen")
                             continue
                         }
                     }
@@ -555,8 +676,8 @@ class AutoTouchService : AccessibilityService() {
                             it.label.contains("comments are limited", true)
                     }
                     if (hasLimitedComments) {
-                        log("⚠️ Detected limited comments! Swiping to next Reel...")
-                        hud.updateStatus("Comments limited -> Next Reel", BotMood.WORKING, taskRunning = true)
+                        log("⚠️ Detected limited comments! Swiping to next video...")
+                        hud.updateStatus("Comments limited -> Next Video", BotMood.WORKING, taskRunning = true)
                         performGlobalAction(GLOBAL_ACTION_BACK)
                         delay(1200L)
                         performPhysicalSwipe(
@@ -565,8 +686,8 @@ class AutoTouchService : AccessibilityService() {
                             specs.screenWidth / 2,
                             (specs.screenHeight * 0.22f).toInt()
                         )
-                        stepHistory.add("Closed limited comment sheet and swiped to next Reel")
-                        currentRunSteps.add("Step $stepNumber: Skipped limited comments reel")
+                        stepHistory.add("Closed limited comment sheet and swiped to next video")
+                        currentRunSteps.add("Step $stepNumber: Skipped limited comments video")
                         delay(2200L)
                         continue
                     }
@@ -583,8 +704,8 @@ class AutoTouchService : AccessibilityService() {
                     }
 
                     val elapsedSinceLastAi = System.currentTimeMillis() - lastAiCallTimestamp
-                    if (elapsedSinceLastAi in 1..2500L) {
-                        delay(2500L - elapsedSinceLastAi)
+                    if (elapsedSinceLastAi in 1..2200L) {
+                        delay(2200L - elapsedSinceLastAi)
                     }
 
                     hud.updateStatus("🧠 Step $stepNumber Thinking...", BotMood.THINKING, taskRunning = true)
@@ -596,7 +717,7 @@ class AutoTouchService : AccessibilityService() {
                         stepHistory
                     }
 
-                    val decision = withTimeoutOrNull(24000L) {
+                    val decision = withTimeoutOrNull(25000L) {
                         geminiBrain.decideNextStep(
                             goal = goal,
                             planSteps = plannedSteps,
@@ -613,6 +734,46 @@ class AutoTouchService : AccessibilityService() {
                     log("⚡ Step $stepNumber [${decision.modelUsed}] -> ${decision.action}: ${decision.reason}")
                     hud.updateStatus("Step $stepNumber • ${decision.reason}", BotMood.WORKING, taskRunning = true)
                     currentRunSteps.add("Step $stepNumber: ${decision.action} (${decision.reason})")
+
+                    // Check if AI is trying to click the final Share/Send button on a Share sheet!
+                    val reasonLower = decision.reason.lowercase(Locale.ROOT)
+                    val isShareSheetOpenNow = taggedElements.any {
+                        it.label.contains("Write a message", true) ||
+                            it.label.contains("Send separately", true)
+                    }
+                    val wantsToTapFinalSend = isShareSheetOpenNow ||
+                        (reasonLower.contains("tapping send") ||
+                            reasonLower.contains("tap send") ||
+                            reasonLower.contains("send button") ||
+                            reasonLower.contains("already selected"))
+
+                    if (wantsToTapFinalSend && (decision.action == "CLICK_TAG" || decision.action == "CLICK_XY")) {
+                        if (isSoftKeyboardOpen()) {
+                            performGlobalAction(GLOBAL_ACTION_BACK)
+                            delay(900L)
+                        }
+                        val bottomSendNode = taggedElements.find {
+                            (it.label.equals("Send", true) || it.label.contains("Send separately", true)) &&
+                                it.centerY > (specs.screenHeight * 0.84f)
+                        }
+                        val sendX = bottomSendNode?.centerX ?: (specs.screenWidth / 2)
+                        val sendY = bottomSendNode?.centerY ?: (specs.screenHeight * 0.938f).toInt()
+
+                        log("🎯 Area Guard Lock: Tapping exact bottom blue Send button at ($sendX, $sendY)!")
+                        performPhysicalTap(sendX, sendY)
+                        stepHistory.add("MILESTONE_FINAL_SEND_TAPPED: Tapped bottom blue Send button at ($sendX, $sendY)")
+
+                        // 3-Step Post-Click Road-Crossing Proof!
+                        val roadCrossed = verifyFinalActionRoadCrossedOrRetry(specs, taggedElements, sendX, sendY)
+                        if (roadCrossed && !isContinuousMonitor) {
+                            hud.updateStatus("🎉 Task Complete!", BotMood.HAPPY, taskRunning = false)
+                            log("✅ Task Completed & Verified via 3-Step Road-Crossing Proof!")
+                            finalizeRunAndTriggerAutoReflection("SUCCESS")
+                            isAgentRunning = false
+                            break
+                        }
+                        continue
+                    }
 
                     when (decision.action) {
                         "DONE" -> {
@@ -636,7 +797,7 @@ class AutoTouchService : AccessibilityService() {
 
                         "LAUNCH_APP" -> {
                             launchAppByNameOrPackage(decision.packageNameOrSetting.ifBlank { decision.text })
-                            stepHistory.add("Launched ${decision.packageNameOrSetting}")
+                            stepHistory.add("MILESTONE_APP_OPENED: Launched ${decision.packageNameOrSetting}")
                             delay(3200L)
                         }
 
@@ -648,30 +809,58 @@ class AutoTouchService : AccessibilityService() {
 
                         "CLICK_TAG" -> {
                             val target = taggedElements.find { it.tagId == decision.tagId }
+                            val tapX: Int
+                            val tapY: Int
                             if (target != null) {
+                                tapX = target.centerX
+                                tapY = target.centerY
                                 tapElementSmartly(target, forceAccessibilityClick = isStuck)
                                 stepHistory.add("Tapped [${target.tagId}] ${target.label}")
                             } else {
-                                val px = convertNormalizedX(decision.x, specs)
-                                val py = convertNormalizedY(decision.y, specs)
-                                performPhysicalTap(px, py)
-                                stepHistory.add("Tapped XY($px,$py)")
+                                tapX = convertNormalizedX(decision.x, specs)
+                                tapY = convertNormalizedY(decision.y, specs)
+                                performPhysicalTap(tapX, tapY)
+                                stepHistory.add("Tapped XY($tapX,$tapY)")
                             }
-                            delay(2200L + Random.nextLong(150L, 350L))
+
+                            if (decision.isFinalAction && !isContinuousMonitor) {
+                                val crossed = verifyFinalActionRoadCrossedOrRetry(specs, taggedElements, tapX, tapY)
+                                if (crossed) {
+                                    hud.updateStatus("🎉 Task Complete!", BotMood.HAPPY, taskRunning = false)
+                                    log("✅ Final Step Verified via Road-Crossing Proof!")
+                                    finalizeRunAndTriggerAutoReflection("SUCCESS")
+                                    isAgentRunning = false
+                                    break
+                                }
+                            } else {
+                                delay(2200L + Random.nextLong(150L, 350L))
+                            }
                         }
 
                         "CLICK_XY" -> {
                             val px = convertNormalizedX(decision.x, specs)
                             val py = convertNormalizedY(decision.y, specs)
                             val snapped = findNearestElementToSnap(px, py, taggedElements)
-                            if (snapped != null && !isStuck) {
+                            if (snapped != null && !isStuck && !decision.isFinalAction) {
                                 tapElementSmartly(snapped, forceAccessibilityClick = false)
                                 stepHistory.add("Tapped ${snapped.label} at ($px,$py)")
                             } else {
                                 performPhysicalTap(px, py)
                                 stepHistory.add("Tapped XY($px,$py)")
                             }
-                            delay(2200L + Random.nextLong(150L, 350L))
+
+                            if (decision.isFinalAction && !isContinuousMonitor) {
+                                val crossed = verifyFinalActionRoadCrossedOrRetry(specs, taggedElements, px, py)
+                                if (crossed) {
+                                    hud.updateStatus("🎉 Task Complete!", BotMood.HAPPY, taskRunning = false)
+                                    log("✅ Final Step Verified via Road-Crossing Proof!")
+                                    finalizeRunAndTriggerAutoReflection("SUCCESS")
+                                    isAgentRunning = false
+                                    break
+                                }
+                            } else {
+                                delay(2200L + Random.nextLong(150L, 350L))
+                            }
                         }
 
                         "LONG_PRESS_XY" -> {
@@ -683,17 +872,25 @@ class AutoTouchService : AccessibilityService() {
                         }
 
                         "TYPE" -> {
-                            val target = taggedElements.find { it.tagId == decision.tagId }
+                            // Smart Comment/Input Box Finder: If on a comment sheet, always target the bottom input box!
+                            val bottomCommentBox = taggedElements.find {
+                                (it.label.contains("Join the conversation", true) ||
+                                    it.label.contains("Add a comment", true) ||
+                                    it.className.contains("EditText", true)) &&
+                                    it.centerY > (specs.screenHeight * 0.75f)
+                            }
+                            val target = bottomCommentBox ?: taggedElements.find { it.tagId == decision.tagId }
                             val targetLabel = target?.label ?: ""
+
                             if (target != null) {
                                 tapElementSmartly(target, forceAccessibilityClick = false)
-                                delay(900L)
+                                delay(950L)
                             } else if (decision.x > 0 && decision.y > 0) {
                                 performPhysicalTap(
                                     convertNormalizedX(decision.x, specs),
                                     convertNormalizedY(decision.y, specs)
                                 )
-                                delay(900L)
+                                delay(950L)
                             }
 
                             val typedOk = typeAndPasteTextReliably(decision.text, target?.node)
@@ -701,8 +898,8 @@ class AutoTouchService : AccessibilityService() {
 
                             if (activePkg.contains("whatsapp") || isContinuousMonitor) {
                                 clickWhatsAppSendIfPresent()
-                                stepHistory.add("Typed and sent '${decision.text}'")
-                            } else if (activePkg.contains("instagram") || activePkg.contains("youtube")) {
+                                stepHistory.add("MILESTONE_SENT_MESSAGE: Typed and sent '${decision.text}'")
+                            } else {
                                 val wasCommentSubmitted = handleSmartPostOrSearchAfterType(
                                     typedText = decision.text,
                                     targetLabel = targetLabel,
@@ -711,12 +908,10 @@ class AutoTouchService : AccessibilityService() {
                                 )
                                 if (wasCommentSubmitted) {
                                     hasAlreadyCommentedInThisRun = true
-                                    stepHistory.add("COMPLETED COMMENT: Typed and posted comment '${decision.text}' and closed comment sheet!")
+                                    stepHistory.add("MILESTONE_COMMENT_POSTED: Typed and posted comment '${decision.text}' and closed comment sheet!")
                                 } else {
-                                    stepHistory.add("Typed '${decision.text}' and submitted")
+                                    stepHistory.add("MILESTONE_TYPED_AND_SUBMITTED: Typed '${decision.text}' and submitted")
                                 }
-                            } else {
-                                stepHistory.add("Typed '${decision.text}'")
                             }
                             delay(1800L)
                         }
@@ -733,7 +928,7 @@ class AutoTouchService : AccessibilityService() {
 
                         "WAIT" -> {
                             hud.updateStatus("⏳ ${decision.reason}", BotMood.THINKING, taskRunning = true)
-                            delay(2800L)
+                            delay(2500L)
                         }
 
                         else -> delay(2000L)
@@ -874,11 +1069,6 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
-    /**
-     * 24/7 Dual-Time Scheduler Loop:
-     * - Time 1 (`flow_create_time_hm`): Creates Flow Video (in Background Browser OR Real Chrome App) and saves to Folder!
-     * - Time 2 (`folder_upload_time_hm`): Picks saved video from Folder and uploads to YouTube/Insta with Title + Description!
-     */
     private fun startDailySchedulerLoop() {
         schedulerJob?.cancel()
         schedulerJob = serviceScope.launch {
@@ -937,7 +1127,6 @@ class AutoTouchService : AccessibilityService() {
 
                 val isSameTimeForBoth = flowCreateTimeHm == folderUploadTimeHm
 
-                // STAGE 1: Scheduled Time to Create Video from Flow & Save in Folder
                 if (nowHm == flowCreateTimeHm && lastTriggeredFlowMinute != nowHm) {
                     lastTriggeredFlowMinute = nowHm
                     if (isSameTimeForBoth) lastTriggeredUploadMinute = nowHm
@@ -966,7 +1155,6 @@ class AutoTouchService : AccessibilityService() {
                     continue
                 }
 
-                // STAGE 2: Scheduled Time to Auto-Upload Video from Folder with Title + Description
                 if (!isSameTimeForBoth && nowHm == folderUploadTimeHm && lastTriggeredUploadMinute != nowHm) {
                     lastTriggeredUploadMinute = nowHm
                     val bgUpload = prefs.getBoolean("bg_youtube_upload", false)
@@ -995,6 +1183,11 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
+    /**
+     * Universal Interactive Element Scanner:
+     * Filters out giant full-sheet container boxes (like `@2131955775`) and "Share on Threads" links
+     * so `CLICK_TAG` never taps the middle of a container box instead of a real button!
+     */
     internal fun scanScreenInteractiveElements(specs: DeviceBodySpecs): List<TaggedUiElement> {
         val result = mutableListOf<TaggedUiElement>()
         val seenBoundsLabels = mutableSetOf<String>()
@@ -1011,6 +1204,10 @@ class AutoTouchService : AccessibilityService() {
             val isValidSize = rect.width() > 14 && rect.height() > 14 &&
                 rect.bottom > specs.cutoutSafeTop && rect.top < specs.screenHeight
 
+            // Universal Big-Container Trap Filter: Ignore giant layout wrappers that cover >65% width AND >35% height!
+            val isGiantContainerBox = rect.width() > (specs.screenWidth * 0.65f) &&
+                rect.height() > (specs.screenHeight * 0.35f)
+
             val text = node.text?.toString()?.trim() ?: ""
             val desc = node.contentDescription?.toString()?.trim() ?: ""
             val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1022,11 +1219,16 @@ class AutoTouchService : AccessibilityService() {
                 text.isNotEmpty() -> text
                 desc.isNotEmpty() -> desc
                 hint.isNotEmpty() -> hint
-                viewId.isNotEmpty() -> viewId
+                viewId.isNotEmpty() && !viewId.startsWith("@213") -> viewId
                 else -> ""
             }
 
-            if (isValidSize && (node.isClickable || node.isEditable || node.isCheckable || node.isFocused || label.isNotEmpty())) {
+            // Never include "Share on Threads" links inside comment lists
+            val isThreadsLink = label.equals("Share on Threads", ignoreCase = true)
+
+            if (isValidSize && !isGiantContainerBox && !isThreadsLink &&
+                (node.isClickable || node.isEditable || node.isCheckable || node.isFocused || label.isNotEmpty())
+            ) {
                 val cleanLabel = label.ifEmpty { "Button" }.replace("\n", " ").take(55)
                 val dedupKey = "${cleanLabel}_${rect.centerX() / 12}_${rect.centerY() / 12}"
                 if (seenBoundsLabels.add(dedupKey)) {
@@ -1253,7 +1455,7 @@ class AutoTouchService : AccessibilityService() {
 
         val isShareSearchContext = combinedContext.contains("share") ||
             combinedContext.contains("friend") ||
-            elements.any { it.label.contains("Send separately", true) || it.label.contains("Add a message", true) }
+            elements.any { it.label.contains("Send separately", true) || it.label.contains("Write a message", true) }
 
         if (isShareSearchContext) {
             closeKeyboardCompletely()
@@ -1269,8 +1471,15 @@ class AutoTouchService : AccessibilityService() {
             }
             if (postBtn != null) {
                 tapElementSmartly(postBtn, forceAccessibilityClick = false)
-            } else if (isSoftKeyboardOpen()) {
-                performPhysicalTap((specs.screenWidth * 0.91f).toInt(), (specs.screenHeight * 0.91f).toInt())
+            } else {
+                // Tap the blue upward-arrow Post button on the right side of the comment input bar
+                val inputNode = elements.find {
+                    it.className.contains("EditText", true) ||
+                        it.label.contains("Join the conversation", true) ||
+                        it.label.contains(typedText.take(10), true)
+                }
+                val arrowY = inputNode?.centerY ?: (specs.screenHeight * 0.56f).toInt()
+                performPhysicalTap((specs.screenWidth * 0.91f).toInt(), arrowY)
             }
             delay(1800L)
 
@@ -1322,19 +1531,7 @@ class AutoTouchService : AccessibilityService() {
 
     internal suspend fun dismissDiscardDialogIfPresent(specs: DeviceBodySpecs) {
         val els = scanScreenInteractiveElements(specs)
-        val hasDiscardPopup = els.any {
-            it.label.contains("Discard changes", true) || it.label.contains("not be saved", true)
-        }
-        if (hasDiscardPopup) {
-            val cancelBtn = els.find { it.label.equals("Cancel", true) || it.label.equals("रद्द करें", true) }
-            if (cancelBtn != null) {
-                log("⚠️ Dismissing 'Discard changes?' popup by tapping Cancel!")
-                tapElementSmartly(cancelBtn, forceAccessibilityClick = true)
-            } else {
-                performPhysicalTap((specs.screenWidth * 0.55f).toInt(), (specs.screenHeight * 0.57f).toInt())
-            }
-            delay(1200L)
-        }
+        dismissUnwantedPopupsIfPresent(els, specs)
     }
 
     internal fun isSoftKeyboardOpen(): Boolean {
