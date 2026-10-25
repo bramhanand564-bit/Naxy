@@ -121,7 +121,7 @@ internal fun MainActivity.buildTab2AutomationsAndScheduler(): View {
             .putString("yt_folder_path", customSaveDir)
             .putString("custom_video_description", customDesc)
             .apply()
-        if ( ::folderPathEditText.isInitialized ) folderPathEditText.setText(customSaveDir)
+        try { folderPathEditText.setText(customSaveDir) } catch (_: Exception) {}
         AutoTouchService.instance?.startGoogleFlowToYouTubePipeline(
             topic = finalTopic,
             maxVideosToCreate = count,
@@ -142,7 +142,7 @@ internal fun MainActivity.buildTab2AutomationsAndScheduler(): View {
             .putString("yt_folder_path", customSaveDir)
             .putString("custom_video_description", customDesc)
             .apply()
-        if ( ::folderPathEditText.isInitialized ) folderPathEditText.setText(customSaveDir)
+        try { folderPathEditText.setText(customSaveDir) } catch (_: Exception) {}
         AutoTouchService.instance?.startGoogleFlowToYouTubePipeline(
             topic = finalTopic,
             maxVideosToCreate = count,
@@ -742,12 +742,12 @@ internal fun MainActivity.refreshMemoryEverything() {
 }
 
 private fun MainActivity.refreshMemoryFoldersList() {
-    if (!::memoryCategoriesLayout.isInitialized) return
-    memoryCategoriesLayout.removeAllViews()
+    val layout = try { memoryCategoriesLayout } catch (_: Exception) { return }
+    layout.removeAllViews()
     val vault = getActiveVault()
     val summary = vault.getAllCategoriesSummary()
     if (summary.isEmpty()) {
-        memoryCategoriesLayout.addView(TextView(this).apply {
+        layout.addView(TextView(this).apply {
             text = "अभी कोई Learned Fix नहीं है।"
             setTextColor(textMuted)
         })
@@ -804,17 +804,17 @@ private fun MainActivity.refreshMemoryFoldersList() {
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             })
         }
-        memoryCategoriesLayout.addView(row)
+        layout.addView(row)
     }
 }
 
 private fun MainActivity.refreshAutomationRunsList() {
-    if (!::automationRunsListLayout.isInitialized) return
-    automationRunsListLayout.removeAllViews()
+    val layout = try { automationRunsListLayout } catch (_: Exception) { return }
+    layout.removeAllViews()
     val vault = getActiveVault()
     val runs = vault.getAllAutomationRuns()
     if (runs.isEmpty()) {
-        automationRunsListLayout.addView(TextView(this).apply {
+        layout.addView(TextView(this).apply {
             text = "अभी कोई Automation Run सेव नहीं हुआ है।"
             setTextColor(textMuted)
         })
@@ -868,7 +868,7 @@ private fun MainActivity.refreshAutomationRunsList() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(6) }
         })
-        automationRunsListLayout.addView(card)
+        layout.addView(card)
     }
 }
 
@@ -969,11 +969,11 @@ private fun MainActivity.openAutomationRunChatDialog(runRecord: AutomationRunRec
 }
 
 private fun MainActivity.refreshVideoTrainingSessionsList() {
-    if (!::videoSessionsListLayout.isInitialized) return
-    videoSessionsListLayout.removeAllViews()
+    val layout = try { videoSessionsListLayout } catch (_: Exception) { return }
+    layout.removeAllViews()
     val sessions = getActiveVault().getAllVideoTrainingSessions()
     if (sessions.isEmpty()) {
-        videoSessionsListLayout.addView(TextView(this).apply {
+        layout.addView(TextView(this).apply {
             text = "अभी कोई वीडियो ट्रेनिंग सेशन नहीं है।"
             setTextColor(textMuted)
         })
@@ -1002,7 +1002,7 @@ private fun MainActivity.refreshVideoTrainingSessionsList() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(6) }
         })
-        videoSessionsListLayout.addView(card)
+        layout.addView(card)
     }
 }
 
@@ -1321,25 +1321,25 @@ internal fun MainActivity.buildTab5EngineAndLogs(): View {
 
 internal fun MainActivity.refreshEngineTabDetails() {
     refreshLiveLogsBox()
-    if (::apiTelemetryTextView.isInitialized) {
+    try {
         apiTelemetryTextView.text = getActiveBrain().getDetailedApiTelemetryReport()
-    }
-    if (::ladderInfoTextView.isInitialized) {
+    } catch (_: Exception) {}
+    try {
         ladderInfoTextView.text = getActiveBrain().getActiveModelListStatus()
-    }
-    if (::calibratedSpecsTextView.isInitialized) {
+    } catch (_: Exception) {}
+    try {
         val specs = AutoTouchService.instance?.getCalibratedDeviceBodySpecs()
         calibratedSpecsTextView.text = if (specs != null) {
             "• Phone: ${specs.modelName} (${specs.screenWidth}×${specs.screenHeight} px)\n• Cutout Safe Zone: ${specs.cutoutSafeTop} px | Nav: ${specs.navBarHeight} px"
         } else {
             "Enable Accessibility Service below to calibrate your screen."
         }
-    }
+    } catch (_: Exception) {}
 }
 
 private fun MainActivity.refreshLiveLogsBox() {
-    if (!::liveLogsTextView.isInitialized) return
+    val tv = try { liveLogsTextView } catch (_: Exception) { return }
     val inMemory = synchronized(AutoTouchService.liveLogs) { AutoTouchService.liveLogs.toList() }
     val lines = if (inMemory.isNotEmpty()) inMemory.take(50) else getActiveVault().getPersistentLogs().take(50)
-    liveLogsTextView.text = if (lines.isEmpty()) "No logs yet." else lines.joinToString("\n")
+    tv.text = if (lines.isEmpty()) "No logs yet." else lines.joinToString("\n")
 }
