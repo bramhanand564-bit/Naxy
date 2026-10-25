@@ -5,7 +5,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Rect
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Environment
 import android.os.StrictMode
@@ -27,6 +29,34 @@ import java.io.FileOutputStream
 import java.net.URL
 import java.util.Locale
 import kotlin.coroutines.resume
+
+/**
+ * Extracts 1 clear frame from the middle of a video so Gemini 3.8 Flash can see what the video is actually about
+ * and write a 100% matching Viral Title & Description (never putting raw file numbers like flow_1792... in the title!).
+ */
+private fun AutoTouchService.extractSinglePreviewFrameFromVideo(
+    videoUri: Uri? = null,
+    videoFile: File? = null
+): Bitmap? {
+    val retriever = MediaMetadataRetriever()
+    return try {
+        if (videoFile != null && videoFile.exists()) {
+            retriever.setDataSource(videoFile.absolutePath)
+        } else if (videoUri != null) {
+            retriever.setDataSource(this, videoUri)
+        } else {
+            return null
+        }
+        val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 3000L
+        val sampleTimeUs = ((durationMs * 0.40).toLong().coerceIn(500L, 4000L)) * 1000L
+        retriever.getFrameAtTime(sampleTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            ?: retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+    } catch (_: Exception) {
+        null
+    } finally {
+        try { retriever.release() } catch (_: Exception) {}
+    }
+}
 
 fun AutoTouchService.startSinglePickedVideoYouTubeUpload(videoUri: Uri, rawDisplayName: String) {
     currentTaskJob?.cancel()
@@ -55,11 +85,27 @@ fun AutoTouchService.startSinglePickedVideoYouTubeUpload(videoUri: Uri, rawDispl
         try {
             isAgentRunning = true
             acquireWakeLock()
-            hud.updateStatus("Generating Title & Description...", BotMood.THINKING, taskRunning = true)
+            hud.updateStatus("Analyzing Video for Title & Desc...", BotMood.THINKING, taskRunning = true)
 
-            val cleanTopic = rawDisplayName.substringBeforeLast(".").replace("_", " ").ifBlank { "Amazing Viral Short Video" }
+            val sanitizedName = geminiBrain.sanitizeRawVideoTopic(rawDisplayName)
+            val savedFlowTopic = prefs.getString("flow_topic", "")?.trim() ?: ""
+            val topicHint = if (rawDisplayName.startsWith("flow_", true) && savedFlowTopic.isNotBlank()) {
+                savedFlowTopic
+            } else {
+                sanitizedName
+            }
+
             val customDesc = prefs.getString("custom_video_description", "") ?: ""
-            val meta = geminiBrain.generateFlowPromptTitleAndDescription(cleanTopic, customDesc)
+            val previewFrame = withContext(Dispatchers.IO) {
+                extractSinglePreviewFrameFromVideo(videoUri = videoUri)
+            }
+
+            val meta = geminiBrain.generateFlowPromptTitleAndDescription(
+                topic = topicHint,
+                customDescriptionNote = customDesc,
+                videoFrameBitmap = previewFrame
+            )
+            try { previewFrame?.recycle() } catch (_: Exception) {}
 
             AutoTouchService.log("✨ Viral Title: ${meta.viralTitle}")
             AutoTouchService.log("📝 Description: ${meta.viralDescription.replace("\n", " ").take(90)}...")
@@ -112,6 +158,10 @@ fun AutoTouchService.startYouTubeFolderAutoUpload(folderInputRaw: String, pickOl
             val resolvedDir = resolveSmartFolderPath(folderInputRaw)
             val uploadedSet = prefs.getStringSet("uploaded_videos_set", emptySet())?.toMutableSet() ?: mutableSetOf()
             val customDesc = prefs.getString("custom_video_description", "") ?: ""
+            val fallbackFlowTopic = prefs.getString("last_flow_generated_topic", "")?.takeIf { it.isNotBlank() }
+                ?: prefs.getString("flow_topic", "")?.takeIf { it.isNotBlank() }
+                ?: "Amazing Viral Short Video"
+
             AutoTouchService.log("📂 Scanning Folder for Upload: ${resolvedDir.absolutePath}")
 
             val videos = findVideoFilesInDirectory(resolvedDir, uploadedSet)
@@ -121,8 +171,25 @@ fun AutoTouchService.startYouTubeFolderAutoUpload(folderInputRaw: String, pickOl
                 if (mediaUriPair != null) {
                     val (uri, name) = mediaUriPair
                     AutoTouchService.log("🎬 Found Video via MediaStore: $name")
-                    hud.updateStatus("Generating Title & Description...", BotMood.THINKING, taskRunning = true)
-                    val meta = geminiBrain.generateFlowPromptTitleAndDescription(name.substringBeforeLast("."), customDesc)
+                    hud.updateStatus("Analyzing Video for Title & Desc...", BotMood.THINKING, taskRunning = true)
+
+                    val cleanName = geminiBrain.sanitizeRawVideoTopic(name)
+                    val topicHint = if (name.startsWith("flow_", true) || cleanName.contains("Viral Short Video")) {
+                        fallbackFlowTopic
+                    } else {
+                        cleanName
+                    }
+
+                    val previewFrame = withContext(Dispatchers.IO) {
+                        extractSinglePreviewFrameFromVideo(videoUri = uri)
+                    }
+                    val meta = geminiBrain.generateFlowPromptTitleAndDescription(
+                        topic = topicHint,
+                        customDescriptionNote = customDesc,
+                        videoFrameBitmap = previewFrame
+                    )
+                    try { previewFrame?.recycle() } catch (_: Exception) {}
+
                     dispatchVideoToLinkedPlatforms(uri, meta.viralTitle, meta.viralDescription)
                     uploadedSet.add(uri.toString())
                     prefs.edit().putStringSet("uploaded_videos_set", uploadedSet).apply()
@@ -144,11 +211,24 @@ fun AutoTouchService.startYouTubeFolderAutoUpload(folderInputRaw: String, pickOl
             }
 
             AutoTouchService.log("🎬 Selected Video from Folder: ${chosenVideo.name}")
-            hud.updateStatus("Generating Title & Description...", BotMood.THINKING, taskRunning = true)
+            hud.updateStatus("Analyzing Video for Title & Desc...", BotMood.THINKING, taskRunning = true)
 
-            val savedTopicHint = prefs.getString("last_flow_generated_topic", "")?.takeIf { it.isNotBlank() }
-                ?: chosenVideo.nameWithoutExtension.replace("_", " ")
-            val meta = geminiBrain.generateFlowPromptTitleAndDescription(savedTopicHint, customDesc)
+            val cleanFileName = geminiBrain.sanitizeRawVideoTopic(chosenVideo.name)
+            val topicHint = if (chosenVideo.name.startsWith("flow_", true) || cleanFileName.contains("Viral Short Video")) {
+                fallbackFlowTopic
+            } else {
+                cleanFileName
+            }
+
+            val previewFrame = withContext(Dispatchers.IO) {
+                extractSinglePreviewFrameFromVideo(videoFile = chosenVideo)
+            }
+            val meta = geminiBrain.generateFlowPromptTitleAndDescription(
+                topic = topicHint,
+                customDescriptionNote = customDesc,
+                videoFrameBitmap = previewFrame
+            )
+            try { previewFrame?.recycle() } catch (_: Exception) {}
 
             AutoTouchService.log("✨ AI Viral Title: ${meta.viralTitle}")
             AutoTouchService.log("📝 AI Description: ${meta.viralDescription.replace("\n", " ").take(90)}...")
@@ -285,7 +365,6 @@ private suspend fun AutoTouchService.evaluateWebStudioUploadStep(
 ): String = suspendCancellableCoroutine { cont ->
     val js = """
         (function() {
-            // 1. Handle "We're still checking your content" -> "Publish anyway" button
             const allButtons = Array.from(document.querySelectorAll('ytcp-button, button, [role="button"]'));
             const publishAnywayBtn = allButtons.find(b => {
                 const txt = (b.innerText || b.getAttribute('aria-label') || '').toLowerCase();
@@ -296,7 +375,6 @@ private suspend fun AutoTouchService.evaluateWebStudioUploadStep(
                 return 'CLICKED_PUBLISH_ANYWAY';
             }
 
-            // 2. File input injection
             const fileInput = document.querySelector('input[type="file"]');
             if (fileInput && !window.__auraFileInjected) {
                 window.__auraFileInjected = true;
@@ -309,7 +387,6 @@ private suspend fun AutoTouchService.evaluateWebStudioUploadStep(
                 return 'CLICKED_SELECT_FILES';
             }
 
-            // 3. Title Box
             const titleBox = document.querySelector('#textbox[aria-label*="title" i], #title-textarea #textbox');
             if (titleBox && (!titleBox.innerText || titleBox.innerText.length < 5)) {
                 titleBox.focus();
@@ -317,7 +394,6 @@ private suspend fun AutoTouchService.evaluateWebStudioUploadStep(
                 titleBox.dispatchEvent(new InputEvent('input', { bubbles: true }));
             }
 
-            // 4. Description Box
             const descBox = document.querySelector('#textbox[aria-label*="tell viewers" i], #description-textarea #textbox');
             if (descBox && (!descBox.innerText || descBox.innerText.length < 5)) {
                 descBox.focus();
@@ -325,11 +401,9 @@ private suspend fun AutoTouchService.evaluateWebStudioUploadStep(
                 descBox.dispatchEvent(new InputEvent('input', { bubbles: true }));
             }
 
-            // 5. Audience: Not Made For Kids
             const notForKids = document.querySelector('tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], #audience tp-yt-paper-radio-button:nth-child(2)');
             if (notForKids) notForKids.click();
 
-            // 6. Visibility: Public + Publish (#done-button)
             const doneBtn = document.querySelector('#done-button, ytcp-button#done-button');
             if (doneBtn && !doneBtn.disabled && doneBtn.getBoundingClientRect().width > 10) {
                 const publicRadio = document.querySelector('tp-yt-paper-radio-button[name="PUBLIC"]');
@@ -338,7 +412,6 @@ private suspend fun AutoTouchService.evaluateWebStudioUploadStep(
                 return 'PUBLISHED_DONE';
             }
 
-            // 7. Step Next button
             const nextBtn = document.querySelector('#next-button, ytcp-button#next-button');
             if (nextBtn && !nextBtn.disabled && nextBtn.getBoundingClientRect().width > 10) {
                 nextBtn.click();
@@ -714,7 +787,6 @@ internal suspend fun AutoTouchService.uploadVideoUriToYouTubeShorts(
     currentRunSteps.add("Tapped Caption Box at ($capX, $capY)")
     delay(1500L)
 
-    // For Shorts caption (which combines title & tags), if there is no separate Add description row, combine concisely
     val textForMainBox = if (isRegularUploadScreen) {
         viralTitle.take(98)
     } else {
@@ -727,7 +799,6 @@ internal suspend fun AutoTouchService.uploadVideoUriToYouTubeShorts(
     currentRunSteps.add("Pasted Viral Title ($pastedSuccess): $textForMainBox")
     delay(1100L)
 
-    // If a separate "Add description" row exists on the YouTube upload screen, fill full viralDescription there too!
     val descRowNode = scanScreenInteractiveElements(specs).find {
         it.label.contains("Add description", true) || it.label.contains("विवरण जोड़ें", true)
     }
@@ -1229,7 +1300,6 @@ private suspend fun AutoTouchService.generateFlowVideoViaRealChromeApp(
         history.add("${decision.action}: ${decision.reason}")
         delay(3500L)
 
-        // Check if Chrome downloaded a new MP4 file into Downloads
         val dlDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val newestMp4 = dlDir.listFiles()?.filter {
             it.isFile && it.name.endsWith(".mp4", true) && it.lastModified() >= startTimeMs
@@ -1511,7 +1581,6 @@ private suspend fun AutoTouchService.downloadVideoFromUrlToStorage(videoUrl: Str
                     input.copyTo(output)
                 }
             }
-            // Also sync yt_folder_path if user hasn't set a separate one, so Stage 2 auto-upload finds it immediately!
             if (prefs.getString("yt_folder_path", "").isNullOrBlank()) {
                 prefs.edit().putString("yt_folder_path", outDir.absolutePath).apply()
             }
