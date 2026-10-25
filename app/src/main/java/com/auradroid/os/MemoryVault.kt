@@ -346,7 +346,7 @@ class MemoryVault(private val context: Context) {
 
         val timestamp = SimpleDateFormat("dd MMM HH:mm:ss", Locale.getDefault()).format(Date())
         val metaFile = File(runFolder, "run_meta.json")
-        val json = JSONObject().apply {
+        val metaJson = JSONObject().apply {
             put("runId", runId)
             put("title", title)
             put("appCategory", canonicalCat)
@@ -356,7 +356,7 @@ class MemoryVault(private val context: Context) {
             put("screenshotPaths", JSONArray(savedPaths))
             put("chatHistory", JSONArray(existingChat))
         }
-        writeTextSafely(metaFile, json.toString(2))
+        writeTextSafely(metaFile, metaJson.toString(2))
 
         pruneOldFolders(runsDir, maxKeep = 25)
 
@@ -542,7 +542,7 @@ class MemoryVault(private val context: Context) {
     fun saveVideoTrainingSessionMeta(session: VideoTrainingSession) = synchronized(vaultLock) {
         val sessionFolder = File(videosDir, session.sessionId).apply { if (!exists()) mkdirs() }
         val metaFile = File(sessionFolder, "video_meta.json")
-        val json = JSONObject().apply {
+        val metaJson = JSONObject().apply {
             put("sessionId", session.sessionId)
             put("appCategory", resolveCategoryFolder(session.appCategory, session.userNote))
             put("userNote", session.userNote)
@@ -551,7 +551,7 @@ class MemoryVault(private val context: Context) {
             put("extractedRulesSummary", JSONArray(session.extractedRulesSummary))
             put("chatHistory", JSONArray(session.chatHistory))
         }
-        writeTextSafely(metaFile, json.toString(2))
+        writeTextSafely(metaFile, metaJson.toString(2))
     }
 
     fun appendChatToVideoSession(
@@ -574,7 +574,7 @@ class MemoryVault(private val context: Context) {
                 rulesArr.put(newRuleAdded)
                 j.put("extractedRulesSummary", rulesArr)
             }
-            writeTextSafely(metaFile, json.toString(2))
+            writeTextSafely(metaFile, j.toString(2))
         } catch (_: Exception) {}
     }
 
