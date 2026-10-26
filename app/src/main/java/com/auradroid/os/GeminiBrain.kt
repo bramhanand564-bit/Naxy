@@ -574,7 +574,6 @@ class GeminiBrain(private var apiKey: String) {
             }
 
         val now = System.currentTimeMillis()
-        // Strictly skip any model that is in its 3-minute cooldown lock!
         val nonCooldownModels = gearLadder.filter { !isModelInHardCooldown(it, now) }
         val activePool = nonCooldownModels.ifEmpty { gearLadder }
 
@@ -593,10 +592,8 @@ class GeminiBrain(private var apiKey: String) {
                 continue
             }
 
-            // 1. Enforce minimum global gap so two requests NEVER hit Google 0.01s apart
             var actualPacerWaitMs = enforceSafeGlobalInterCallGap()
 
-            // 2. Enforce per-model RPM pacer (6s for 3.5-flash-lite, 12s for 3.8-flash/robotics)
             val waitNeeded = getWaitTimeMsForModel(model, System.currentTimeMillis())
             if (waitNeeded > 0L) {
                 if (waitNeeded <= 8_000L) {
@@ -764,9 +761,6 @@ class GeminiBrain(private var apiKey: String) {
         }
     }
 
-    /**
-     * Executes Official Google Gemini REST Call with fast 11s read timeout so a slow server never hangs the task!
-     */
     private fun executeSingleModelCall(
         model: String,
         prompt: String,
@@ -843,24 +837,16 @@ class GeminiBrain(private var apiKey: String) {
         return true
     }
 
-    /**
-     * Checks if user message is ONLY setting time/schedule (like "3:36 per video banana aur YouTube par upload karna")
-     * without providing a new story plot, so we NEVER overwrite their existing story in the prompt box!
-     */
     fun isTimeOrScheduleOnlyCommand(userMsg: String): Boolean {
         val lower = userMsg.trim().lowercase(Locale.ROOT)
         val hasTimePattern = Regex("\\b\\d{1,2}[:.]\\d{2}\\b").containsMatchIn(lower) ||
             lower.contains("baje") || lower.contains("बजे") || lower.contains("minut") ||
             lower.contains("roj karna") || lower.contains("upar story") || lower.contains("ऊपर स्टोरी")
         val hasDetailedNewStory = lower.length > 110 &&
-            (lower.contains("girl") || lower.contains("boy") || lower.contains("story:") || lower.contains("designer"))
+            (lower.contains("girl") || lower.contains("boy") || lower.contains("story") || lower.contains("0.1") || lower.contains("1.1"))
         return hasTimePattern && !hasDetailedNewStory
     }
 
-    /**
-     * 1. Universal Task Decider & Modular Micro-Step Planner (Works for ANY App or Website in the Universe!)
-     * Also parses schedule times & direct-upload mode without wiping the user's existing story!
-     */
     suspend fun chatAndBuildDetailedPlan(
         userMessage: String,
         chatHistory: String,
@@ -871,6 +857,8 @@ class GeminiBrain(private var apiKey: String) {
 
         val sysPrompt = """
             You are AuraDroid OS, an intelligent Hinglish Universal AI Companion & Planner for ANY Android App or Website.
+            Active Installed AuraStore Skills:
+            ${AuraPluginStore.getActiveSkillsForBrain()}
             User's saved profile rules: $userProfileRules
             Recent conversation: $chatHistory
             User just said: "$userMessage"
@@ -880,7 +868,7 @@ class GeminiBrain(private var apiKey: String) {
             2. If user mentions a time (e.g., "3:36 per video banana", "7 baje upload"):
                - Extract 24-hour time in "createTimeHm" (e.g. "03:36" or "15:36" depending on context; if simple "3:36", output "03:36").
                - If user says "vahi video fir YouTube par upload karna direct / turant upload", set "directUploadAfterCreate": true and set "uploadTimeHm" to 3 minutes after createTimeHm (e.g., if createTimeHm is "03:36", set uploadTimeHm to "03:39").
-               - IMPORTANT: If the user is only talking about time/schedule or says "upar jo story hai usko kar do", set "keepExistingStory": true and DO NOT invent a generic taskTitle like "Daily Video Creation and YouTube Upload"! Leave "storyTopicPrompt": "" so the existing story in the box stays untouched!
+               - IMPORTANT: If the user is only talking about time/schedule or says "upar jo story hai usko kar do", set "keepExistingStory": true and DO NOT invent a generic taskTitle! Leave "storyTopicPrompt": "" so the existing story in the box stays untouched!
             3. Daily upload schedule -> "executionMode": "SCHEDULE_YT_HH:mm", "readyToExecute": true.
             4. Run only when phone is free -> "executionMode": "IDLE_PHONE_MODE", "readyToExecute": true.
             5. Folder to YouTube -> "executionMode": "YOUTUBE_FOLDER_UPLOAD", "readyToExecute": true.
@@ -919,7 +907,6 @@ class GeminiBrain(private var apiKey: String) {
             if (keepExistingStory) {
                 parsed.put("keepExistingStory", true)
             }
-            // Deterministic fallback regex extraction for time if user spoke "3:36"
             val timeMatch = Regex("\\b(\\d{1,2})[:.](\\d{2})\\b").find(userMessage)
             if (timeMatch != null && parsed.optString("createTimeHm", "").isBlank()) {
                 val h = timeMatch.groupValues[1].toIntOrNull()?.coerceIn(0, 23) ?: 0
@@ -948,11 +935,6 @@ class GeminiBrain(private var apiKey: String) {
         }
     }
 
-    /**
-     * Universal Deterministic Road-Crossing Confirmation:
-     * Detects when recipient is selected ("Write a message..." / bottom "Send" button visible)
-     * and clicks the exact bottom blue Send button (500, 940) without ever hitting a mid-screen container!
-     */
     private fun checkDeterministicClickConfirmation(
         goal: String,
         currentStepHistory: List<String>,
@@ -1467,50 +1449,47 @@ class GeminiBrain(private var apiKey: String) {
         return extracted
     }
 
+    /**
+     * Preserves full multi-line Story Prompts (including 0.1, 0.2, 1.1, 1.2 points)
+     * while cleaning only raw video filenames (like "flow_1728392.mp4").
+     */
     fun sanitizeRawVideoTopic(rawTopicOrFileName: String): String {
-        val withoutExt = rawTopicOrFileName
-            .substringBeforeLast(".")
+        val trimmed = rawTopicOrFileName.trim()
+        if (trimmed.length > 80 || trimmed.contains("\n") || trimmed.contains("0.1") || trimmed.contains("1.1")) {
+            return trimmed
+        }
+        val withoutExt = trimmed
+            .replace(Regex("(?i)\\.(mp4|mov|mkv|webm|avi)$"), "")
             .replace(Regex("(?i)\\b(flow|vid|video|lv|inshot|capcut|vn|km)[_\\-\\s]*\\d{5,}\\b"), "")
             .replace(Regex("\\b\\d{7,}\\b"), "")
             .replace("_", " ")
-            .replace("-", " ")
             .trim()
         return withoutExt.ifBlank { "Amazing Cinematic Viral Short Video" }
     }
 
     /**
-     * Sanitizes any video generation prompt so Google Flow (Veo) NEVER rejects it with:
-     * "Failed: This prompt might violate our policies about generating prominent people."
+     * Sanitizes any video generation prompt so Google Flow (Veo) NEVER rejects it for age numbers
+     * or "prominent people" policy while keeping Character Visual DNA & Hindi Talking 100% intact!
      */
     fun sanitizePromptForGoogleFlowPolicy(rawPrompt: String, retryAttempt: Int = 0): String {
         var safe = rawPrompt
-            .replace(Regex("(?i)\\b\\d{1,2}[\\s\\-]*year[\\s\\-]*old\\s*(girl|woman|boy|man|person)?\\b"), "fictional young adult woman")
-            .replace(Regex("(?i)\\b20\\s*year\\s*girl\\b"), "fictional young adult woman")
+            .replace(Regex("(?i)\\b20[\\s\\-]*year[\\s\\-]*old\\s*(indian\\s*)?(girl|woman)\\b"), "fictional young adult Indian woman")
+            .replace(Regex("(?i)\\b16[\\s\\-]*year[\\s\\-]*old\\s*(indian\\s*)?(boy|brother)\\b"), "fictional younger adult Indian brother")
+            .replace(Regex("(?i)\\b\\d{1,2}[\\s\\-]*year[\\s\\-]*old\\s*(girl|woman|boy|man|person)?\\b"), "fictional adult character")
             .replace(Regex("(?i)\\byoung\\s+girl\\b"), "fictional young adult woman")
-            .replace(Regex("(?i)\\bteen(age|ager)?\\s*(girl|boy|woman)?\\b"), "fictional adult character")
-            .replace(Regex("(?i)\\btrying\\s+it\\s+on\\s+in\\s+front\\s+of\\s+a\\s+mirror\\b"), "showcasing the finished designer outfit in her boutique studio mirror")
-            .replace(Regex("(?i)\\btrying\\s+on\\b"), "modeling and showcasing")
-            .replace(Regex("(?i)\\bshort\\s+dress\\b"), "chic modern western designer dress")
-            .replace(Regex("(?i)\\bslim\\s+and\\s+cute\\s+face\\b"), "graceful and expressive")
-            .replace(Regex("(?i)\\bgorgeous\\b"), "graceful")
-            .replace(Regex("(?i)\\bphotorealistic\\b"), "cinematic film look")
+            .replace(Regex("(?i)\\bteen(age|ager)?\\s*(girl|boy|woman)?\\b"), "fictional young adult character")
+            .replace(Regex("(?i)\\bphotorealistic\\b"), "3D stylized cinematic Unreal Engine 5 film look")
             .trim()
 
-        if (!safe.contains("fictional", ignoreCase = true)) {
-            safe = safe.replaceFirst(
-                Regex("(?i)\\b(woman|designer|lady|character)\\b"),
-                "fictional $1"
-            )
-        }
-
-        if (retryAttempt >= 1) {
-            safe = "Cinematic 8k vertical 9:16 film shot of a fictional adult female fashion designer in a cozy creative studio with warm fairy lights, crafting and showcasing a stylish modern western couture dress on a studio form, expressive joyful mood, artistic lighting, high detail."
+        if (retryAttempt >= 1 && !safe.contains("3D stylized", ignoreCase = true)) {
+            safe = "3D stylized Pixar and Unreal Engine 5 cinematic vertical 9:16 animation: $safe"
         }
         return safe
     }
 
     /**
      * Rewrites a failed Google Flow prompt into a 100% policy-compliant cinematic prompt
+     * while preserving the user's exact story, character designs, and Indian Hindi talking dialogue!
      */
     suspend fun rewriteFailedFlowPromptSafe(
         originalTopic: String,
@@ -1520,14 +1499,15 @@ class GeminiBrain(private var apiKey: String) {
         val sysPrompt = """
             Google Flow (Veo) rejected this video prompt due to safety/prominent-people policy:
             "$failedPrompt"
-            Original story idea: "$originalTopic"
+            Original story context: "${originalTopic.take(800)}"
             
-            Rewrite it into a 100% policy-safe, cinematic vertical 9:16 video prompt:
-            - Use "fictional adult woman fashion designer" (NEVER use age numbers like "20-year-old", "girl", "trying on short dress", or "photorealistic").
-            - Keep the same story mood, studio setting, and modern western fashion design creation.
+            Rewrite it into a 100% policy-safe, 3D stylized cinematic vertical 9:16 video prompt:
+            - NEVER use exact age numbers (like "20-year-old", "16-year-old", "girl", "boy", "minor", or "photorealistic").
+            - Instead use "3D stylized cinematic fictional young adult Indian woman (cute chubby round face, electric-blue hair in twin space-buns, white-and-teal futuristic space-suit)" and "fictional adult Indian family members".
+            - Keep the exact alien planet survival scene and Indian Hindi talking dialogue with lip-sync intact!
             Return ONLY valid JSON:
             {
-              "safePrompt": "Cinematic 8k vertical 9:16 film shot of a fictional adult woman fashion designer..."
+              "safePrompt": "3D stylized cinematic 9:16 vertical sci-fi scene..."
             }
         """.trimIndent()
 
@@ -1540,31 +1520,27 @@ class GeminiBrain(private var apiKey: String) {
         return try {
             val j = parseCleanJson(raw)
             val candidate = j.optString("safePrompt", "").trim()
-            if (candidate.isNotBlank()) sanitizePromptForGoogleFlowPolicy(candidate, 0)
+            if (candidate.isNotBlank()) sanitizePromptForGoogleFlowPolicy(candidate, attempt)
             else sanitizePromptForGoogleFlowPolicy(failedPrompt, attempt)
         } catch (_: Exception) {
             sanitizePromptForGoogleFlowPolicy(failedPrompt, attempt)
         }
     }
 
-    /**
-     * Ensures YouTube Shorts title is ALWAYS clean, complete, and under 92 characters
-     * so YouTube Shorts' 100-character limit NEVER cuts off words at the end!
-     */
     fun formatCleanShortsTitle95(rawTitle: String, fallbackTopic: String): String {
         var clean = rawTitle
             .replace("\n", " ")
             .replace(Regex("\\s+"), " ")
             .trim()
         if (clean.isBlank()) {
-            clean = "${fallbackTopic.take(45).trim()} ✨ #shorts #viral"
+            val shortFallback = fallbackTopic.lineSequence().firstOrNull()?.take(40)?.trim() ?: "Sci-Fi Space Story"
+            clean = "$shortFallback ✨ #shorts #viral"
         }
         if (!clean.contains("#shorts", ignoreCase = true)) {
             clean = "$clean #shorts #viral"
         }
         if (clean.length <= 92) return clean
 
-        // Truncate cleanly at word boundary and append #shorts #viral
         val withoutTags = clean
             .replace(Regex("(?i)#\\S+"), "")
             .replace(Regex("\\s+"), " ")
@@ -1582,11 +1558,20 @@ class GeminiBrain(private var apiKey: String) {
     private fun isEpisodicStoryTopic(rawTopic: String): Boolean {
         val lower = rawTopic.lowercase(Locale.ROOT)
         val episodicKeywords = listOf(
-            "badalatai", "badalti", "badalta", "nest story", "next story",
+            "0.1", "1.1", "1.2", "badalatai", "badalti", "badalta", "nest story", "next story",
             "age badti", "aage badhti", "story full", "story sem", "story same",
-            "har bar", "episode", "part ", "कहानी आगे", "अगला पार्ट"
+            "har bar", "episode", "part ", "कहानी आगे", "अगला पार्ट", "स्टेप-बाय-स्टेप", "सीरीज़", "series"
         )
         return episodicKeywords.any { lower.contains(it) }
+    }
+
+    /**
+     * Extracts the specific numbered episode beat (e.g., "1.1 ...", "1.2 ...") if present in the master prompt
+     */
+    private fun extractNumberedEpisodeBeat(fullTopic: String, episodeNum: Int): String {
+        val targetMarker = "1.$episodeNum"
+        val lineMatch = fullTopic.lines().firstOrNull { it.trim().startsWith(targetMarker) }
+        return lineMatch?.trim() ?: ""
     }
 
     suspend fun generateFlowPromptTitleAndDescription(
@@ -1601,7 +1586,7 @@ class GeminiBrain(private var apiKey: String) {
         var episodeNum = 1
         var pastScenesText = ""
         synchronized(rateLock) {
-            val sig = cleanTopic.take(40).lowercase(Locale.ROOT)
+            val sig = cleanTopic.take(65).lowercase(Locale.ROOT)
             if (isEpisodic) {
                 if (sig != lastStoryBaseSignature) {
                     lastStoryBaseSignature = sig
@@ -1610,14 +1595,16 @@ class GeminiBrain(private var apiKey: String) {
                 }
                 currentStoryEpisodeCounter++
                 episodeNum = currentStoryEpisodeCounter
-                pastScenesText = previousStoryScenesHistory.takeLast(4).joinToString(" -> ")
+                pastScenesText = previousStoryScenesHistory.takeLast(5).joinToString(" -> ")
             }
         }
+
+        val specificBeatForThisEpisode = extractNumberedEpisodeBeat(cleanTopic, episodeNum)
 
         val descHint = if (customDescriptionNote.isNotBlank()) {
             "Also include or follow this user description note: '$customDescriptionNote'."
         } else {
-            "Write an engaging 3-line viral description with trending hashtags (#shorts #viral #trending)."
+            "Write an engaging 3-line Hindi/Hinglish viral description with trending hashtags (#shorts #viral #trending #scifi #hindistory)."
         }
 
         val frameB64List = if (videoFrameBitmap != null) {
@@ -1629,27 +1616,31 @@ class GeminiBrain(private var apiKey: String) {
         val episodicInstruction = if (isEpisodic && frameB64List.isEmpty()) {
             """
             EPISODIC STORY CONTINUATION MODE (CURRENT EPISODE #$episodeNum):
-            - The user wants a continuous, evolving multi-part story!
-            - Keep the MAIN CHARACTER 100% consistent in every episode (same fictional young adult female fashion designer, same facial features, hairstyle, and aesthetic).
-            - Previous episodes already created: ${pastScenesText.ifBlank { "None yet (This is Episode 1 - The Beginning!)" }}
-            - For THIS Episode #$episodeNum, advance the story forward to the NEXT logical scene (e.g., Ep 1: sketching & dreaming -> Ep 2: cutting shimmering fabric & stitching a chic modern western dress -> Ep 3: showcasing & admiring the finished stylish western dress in the studio mirror -> Ep 4: preparing for a big fashion showcase -> Ep 5: runway success & new collection).
-            - Make sure THIS scene is fresh and different from previous episodes while continuing the same story!
+            - Master Story & Character Bible provided by user:
+              "$cleanTopic"
+            - CHARACTER LOCK (NEVER CHANGE FACES, HAIR, OR SUITS):
+              Strictly include the exact physical appearance of the characters from 0.1, 0.2, 0.3, 0.4 in the videoPrompt (especially 0.1 Main Hero Tara: cute chubby round face, big dark brown eyes, warm brown skin, vibrant electric-blue hair styled in twin space-buns with glowing cyan clips, wearing a white-and-teal futuristic cyber space-suit, along with her brother Aarav in orange-grey suit with spiky black hair & silver streak, father Vikram in navy-gold commander armor with salt-and-pepper beard, and mother Meera in crimson-red scientist suit with glowing bindi & braided hair).
+            - HINDI TALKING DIALOGUE LOCK:
+              This MUST be a talking video with natural lip-sync where the characters speak aloud in clear, emotional Indian Hindi dialogue! Include the exact Hindi line they speak in quotes inside "videoPrompt".
+            - SCENE FOR THIS EPISODE #$episodeNum:
+              ${if (specificBeatForThisEpisode.isNotBlank()) "Execute this exact story beat: '$specificBeatForThisEpisode'" else "All initial numbered beats are complete! Now advance the story to Episode #$episodeNum: invent a thrilling new alien planet location, a new alien creature or mystery, and a new attempt to repair/launch their spaceship back to Earth that gets blocked by an unexpected twist!"}
+            - Previous episodes already generated (DO NOT repeat these): ${pastScenesText.ifBlank { "None yet (This is Episode 1!)" }}
             """.trimIndent()
         } else ""
 
         val visualInstruction = if (frameB64List.isNotEmpty()) {
-            "Look at the attached video frame image and write a catchy, 100% matching viral YouTube Shorts / Instagram Reels title and description for what is shown in the video (Hint: '$cleanTopic'). NEVER include random file numbers or timestamps in the title!"
+            "Look at the attached video frame image and write a catchy, 100% matching viral YouTube Shorts / Instagram Reels title and description for what is shown in the video. NEVER include random file numbers or timestamps in the title!"
         } else {
             """
-            Create a vertical 9:16 video generation prompt for Google Flow (Veo), a viral YouTube Shorts title, and a full description based on: '$cleanTopic'.
+            Create a vertical 9:16 3D cinematic video generation prompt for Google Flow (Veo), a viral Hinglish/Hindi YouTube Shorts title, and a full description based on the user's topic:
             $episodicInstruction
+            ${if (!isEpisodic) "User Topic: '$cleanTopic'" else ""}
             
             CRITICAL GOOGLE FLOW SAFETY RULES FOR "videoPrompt":
-            1. NEVER use age numbers like "20-year-old", "girl", "young girl", "trying on short dress", or "photorealistic" because Google Flow blocks them under its "prominent people / person" policy!
-            2. Always describe the character as "a graceful fictional adult woman fashion designer in her twenties" and describe the outfit as "a stylish modern western designer dress" or "chic couture outfit".
+            1. Write "videoPrompt" in rich English visual descriptions (so Google Flow renders exact faces, hair, suits, and camera action) PLUS include the exact spoken Indian Hindi dialogue line in quotes (e.g., speaking in Hindi with expressive lip-sync: "...").
+            2. NEVER use age numbers like "20-year-old", "16-year-old", "girl", "boy", or "photorealistic" because Google Flow blocks age numbers! Always write "3D stylized cinematic fictional young adult Indian woman" and "fictional younger adult Indian brother".
             CRITICAL YOUTUBE SHORTS TITLE RULE FOR "youtubeTitle":
-            1. "youtubeTitle" MUST be a complete, punchy viral title ending with "#shorts #viral" and MUST be strictly UNDER 85 characters total so it never gets cut off at 100 characters!
-            2. Do NOT put the long description inside "youtubeTitle"!
+            1. "youtubeTitle" MUST be a punchy, curiosity-inducing Hindi/Hinglish viral title (including "Ep $episodeNum" if episodic) ending with "#shorts #viral" and strictly UNDER 85 characters total!
             """.trimIndent()
         }
 
@@ -1658,9 +1649,9 @@ class GeminiBrain(private var apiKey: String) {
             $descHint
             Return ONLY valid JSON:
             {
-              "videoPrompt": "Cinematic 8k vertical 9:16 film shot of a graceful fictional adult woman fashion designer...",
-              "youtubeTitle": "Dream Dress Ep $episodeNum! ✨👗 #shorts #viral",
-              "youtubeDescription": "Full engaging description with hashtags..."
+              "videoPrompt": "3D stylized Unreal Engine 5 cinematic 9:16 vertical shot...",
+              "youtubeTitle": "अंतरिक्ष में फंसा भारतीय परिवार Ep $episodeNum! 😱🚀 #shorts #viral",
+              "youtubeDescription": "Full engaging Hindi/Hinglish description with hashtags..."
             }
         """.trimIndent()
 
@@ -1674,25 +1665,25 @@ class GeminiBrain(private var apiKey: String) {
         return try {
             val j = parseCleanJson(raw)
             val fallbackTitle = formatCleanShortsTitle95(
-                if (isEpisodic) "Fashion Designer Story Ep $episodeNum! ✨👗 #shorts #viral"
-                else "${cleanTopic.take(42)} ✨ #shorts #viral",
+                if (isEpisodic) "एलियन ग्रह पर भारतीय परिवार Ep $episodeNum! 😱🚀 #shorts #viral"
+                else "${cleanTopic.lineSequence().firstOrNull()?.take(38) ?: "Viral Story"} ✨ #shorts #viral",
                 cleanTopic
             )
             val fallbackDesc = buildString {
-                append(cleanTopic)
+                append("अंतरिक्ष में क्रैश के बाद अनजान एलियन ग्रह पर फंसे भारतीय परिवार की कहानी - Episode $episodeNum!")
                 if (customDescriptionNote.isNotBlank()) append("\n\n").append(customDescriptionNote)
-                append("\n\n#shorts #viral #trending #youtubeshorts #reels")
+                append("\n\n#shorts #viral #trending #scifi #hindistory #youtubeshorts #reels")
             }
-            val rawVideoPrompt = j.optString(
-                "videoPrompt",
-                "Cinematic 8k vertical 9:16 film shot of a graceful fictional adult woman fashion designer crafting and showcasing a chic modern western designer dress in her cozy studio under warm fairy lights, expressive joyful mood, ultra detailed"
-            )
+            val defaultSpacePrompt =
+                "3D stylized Unreal Engine 5 cinematic 9:16 vertical sci-fi scene on a glowing alien planet: main hero Tara (fictional young adult Indian woman with a cute chubby round face, big dark brown eyes, vibrant electric-blue hair in twin space-buns with glowing cyan clips, wearing a white-and-teal futuristic space-suit) with her Indian family (brother Aarav with spiky black hair and silver streak in orange-grey suit, father Vikram with salt-and-pepper beard in navy-gold armor, mother Meera with glowing bindi and braided brown hair in crimson-red scientist suit), speaking aloud in emotional Indian Hindi dialogue with natural lip-sync: \"पापा, हमें जल्दी सुरक्षित रास्ता ढूँढना होगा!\", dramatic volumetric lighting, ultra detailed."
+
+            val rawVideoPrompt = j.optString("videoPrompt", defaultSpacePrompt).ifBlank { defaultSpacePrompt }
             val safeVideoPrompt = sanitizePromptForGoogleFlowPolicy(rawVideoPrompt, 0)
             val cleanShortTitle = formatCleanShortsTitle95(j.optString("youtubeTitle", fallbackTitle), cleanTopic)
 
             if (isEpisodic && frameB64List.isEmpty()) {
                 synchronized(rateLock) {
-                    previousStoryScenesHistory.add("Ep $episodeNum: ${safeVideoPrompt.take(120)}")
+                    previousStoryScenesHistory.add("Ep $episodeNum: ${safeVideoPrompt.take(140)}")
                 }
             }
 
@@ -1703,17 +1694,17 @@ class GeminiBrain(private var apiKey: String) {
             )
         } catch (_: Exception) {
             val fallbackDesc = buildString {
-                append(cleanTopic)
+                append("एलियन ग्रह पर फंसे भारतीय परिवार की रोमांचक कहानी - Episode $episodeNum!")
                 if (customDescriptionNote.isNotBlank()) append("\n\n").append(customDescriptionNote)
-                append("\n\n#shorts #viral #trending #youtubeshorts #reels")
+                append("\n\n#shorts #viral #trending #scifi #hindistory #youtubeshorts #reels")
             }
             val safeFallbackPrompt = sanitizePromptForGoogleFlowPolicy(
-                "Cinematic 8k vertical 9:16 film shot of a graceful fictional adult woman fashion designer crafting and showcasing a chic modern western designer dress in her cozy studio, natural warm lighting, smooth camera movement",
+                "3D stylized Unreal Engine 5 cinematic 9:16 vertical sci-fi scene on a glowing alien planet: main hero Tara (fictional young adult Indian woman with a cute chubby round face, big dark brown eyes, vibrant electric-blue hair in twin space-buns with glowing cyan clips, wearing a white-and-teal futuristic space-suit) leading her Indian family (brother in orange-grey suit with spiky black hair and silver streak, father in navy-gold commander armor, mother in crimson-red scientist suit with bindi and braided hair), speaking aloud in clear Indian Hindi dialogue with natural lip-sync, cinematic lighting",
                 0
             )
             FlowVideoMetadata(
                 videoPrompt = safeFallbackPrompt,
-                viralTitle = formatCleanShortsTitle95("${cleanTopic.take(42)} ✨ #shorts #viral", cleanTopic),
+                viralTitle = formatCleanShortsTitle95("एलियन ग्रह पर भारतीय परिवार Ep $episodeNum! 😱🚀 #shorts #viral", cleanTopic),
                 viralDescription = fallbackDesc
             )
         }
