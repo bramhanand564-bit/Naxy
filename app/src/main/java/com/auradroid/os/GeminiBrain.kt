@@ -70,21 +70,15 @@ data class ApiCallTelemetryRecord(
     val timestampMs: Long
 )
 
-/**
- * n8n-Style Multi-Time & Multi-Node Workflow Item
- * Node 1: ⏰ Time Trigger (triggerTimeHm)
- * Node 2: ➕ 🌐 Source/Link (Google Flow / Custom Web URL / Folder) + Story Prompt Mode
- * Node 3: ➕ 🚀 Target Action (Direct YouTube / Direct Insta / Both / Folder Save / Delayed Upload)
- */
 data class N8nScheduleWorkflow(
     val id: String = "wf_${System.currentTimeMillis()}_${(100..999).random()}",
     var triggerTimeHm: String = "08:00",
     var enabled: Boolean = true,
-    var sourceNodeType: String = "GOOGLE_FLOW", // "GOOGLE_FLOW", "CUSTOM_WEB_URL", "FOLDER_ONLY"
+    var sourceNodeType: String = "GOOGLE_FLOW",
     var sourceWebUrl: String = "https://flow.google.com/?pli=1",
-    var customStoryPrompt: String = "", // Blank = use main Story/Prompt box
-    var storyContinuationMode: Boolean = true, // true = Auto Next Episode (Part 1 -> Part 2 -> Part 3)
-    var targetActionNode: String = "YOUTUBE_DIRECT", // "YOUTUBE_DIRECT", "INSTA_DIRECT", "BOTH_DIRECT", "SAVE_FOLDER_ONLY", "DELAYED_UPLOAD"
+    var customStoryPrompt: String = "",
+    var storyContinuationMode: Boolean = true,
+    var targetActionNode: String = "YOUTUBE_DIRECT",
     var delayedUploadTimeHm: String = "",
     var linkedExtraSteps: MutableList<String> = mutableListOf(),
     var lastRunMinuteKey: String = ""
@@ -136,7 +130,6 @@ class GeminiBrain(private var apiKey: String) {
 
     private val rateLock = Any()
 
-    // Supports FreeLLMAPI (localhost:3001) and 1 Official Google Gemini API Key (100% Google ToS Safe)
     @Volatile
     private var freeLlmBaseUrl: String = "http://127.0.0.1:3001"
     @Volatile
@@ -144,7 +137,6 @@ class GeminiBrain(private var apiKey: String) {
     @Volatile
     private var googleGeminiKey: String = ""
 
-    // Proven High-Speed Official Trio: 3.5-flash-lite (#1 fastest & highest quota), 3.8-flash (#2), robotics (#3)
     private val smartVisionLadder = listOf(
         "gemini-3.5-flash-lite",
         "gemini-3.8-flash",
@@ -161,18 +153,13 @@ class GeminiBrain(private var apiKey: String) {
     private val blockedModels = mutableSetOf<String>()
     private val quotaCooldownModels = mutableMapOf<String, Long>()
 
-    // Episodic Story Memory (Tracks episode count & past scenes so every new video advances the story!)
     private var currentStoryEpisodeCounter = 0
     private val previousStoryScenesHistory = mutableListOf<String>()
     private var lastStoryBaseSignature = ""
 
-    // 3-Minute Cooldown Lock (180,000 ms) when any model errors or is overloaded
     private val threeMinuteCooldownLockMs = 180_000L
-
-    // Minimum safe inter-call gap so two calls NEVER hit Google with 0.01s gap
     private val minGlobalInterCallGapMs = 2_200L
 
-    // Detailed API Telemetry & Timing State
     @Volatile
     var detailedApiLoggingEnabled: Boolean = true
     private var totalApiCallsSession = 0
@@ -857,8 +844,6 @@ class GeminiBrain(private var apiKey: String) {
 
         val sysPrompt = """
             You are AuraDroid OS, an intelligent Hinglish Universal AI Companion & Planner for ANY Android App or Website.
-            Active Installed AuraStore Skills:
-            ${AuraPluginStore.getActiveSkillsForBrain()}
             User's saved profile rules: $userProfileRules
             Recent conversation: $chatHistory
             User just said: "$userMessage"
@@ -1449,10 +1434,6 @@ class GeminiBrain(private var apiKey: String) {
         return extracted
     }
 
-    /**
-     * Preserves full multi-line Story Prompts (including 0.1, 0.2, 1.1, 1.2 points)
-     * while cleaning only raw video filenames (like "flow_1728392.mp4").
-     */
     fun sanitizeRawVideoTopic(rawTopicOrFileName: String): String {
         val trimmed = rawTopicOrFileName.trim()
         if (trimmed.length > 80 || trimmed.contains("\n") || trimmed.contains("0.1") || trimmed.contains("1.1")) {
@@ -1467,10 +1448,6 @@ class GeminiBrain(private var apiKey: String) {
         return withoutExt.ifBlank { "Amazing Cinematic Viral Short Video" }
     }
 
-    /**
-     * Sanitizes any video generation prompt so Google Flow (Veo) NEVER rejects it for age numbers
-     * or "prominent people" policy while keeping Character Visual DNA & Hindi Talking 100% intact!
-     */
     fun sanitizePromptForGoogleFlowPolicy(rawPrompt: String, retryAttempt: Int = 0): String {
         var safe = rawPrompt
             .replace(Regex("(?i)\\b20[\\s\\-]*year[\\s\\-]*old\\s*(indian\\s*)?(girl|woman)\\b"), "fictional young adult Indian woman")
@@ -1487,10 +1464,6 @@ class GeminiBrain(private var apiKey: String) {
         return safe
     }
 
-    /**
-     * Rewrites a failed Google Flow prompt into a 100% policy-compliant cinematic prompt
-     * while preserving the user's exact story, character designs, and Indian Hindi talking dialogue!
-     */
     suspend fun rewriteFailedFlowPromptSafe(
         originalTopic: String,
         failedPrompt: String,
@@ -1565,9 +1538,6 @@ class GeminiBrain(private var apiKey: String) {
         return episodicKeywords.any { lower.contains(it) }
     }
 
-    /**
-     * Extracts the specific numbered episode beat (e.g., "1.1 ...", "1.2 ...") if present in the master prompt
-     */
     private fun extractNumberedEpisodeBeat(fullTopic: String, episodeNum: Int): String {
         val targetMarker = "1.$episodeNum"
         val lineMatch = fullTopic.lines().firstOrNull { it.trim().startsWith(targetMarker) }
