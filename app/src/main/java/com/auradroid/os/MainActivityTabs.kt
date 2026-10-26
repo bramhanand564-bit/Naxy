@@ -33,6 +33,91 @@ import android.widget.Toast
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.Locale
+
+/**
+ * Normalizes any time string like "3:36" or "3.36" into strict 24-Hr "03:36" format
+ * so the 24/7 background clock matcher NEVER misses a trigger!
+ */
+internal fun normalizeTimeHm24(rawTime: String, defaultHm: String = "18:00"): String {
+    val clean = rawTime.trim().replace(".", ":")
+    val match = Regex("(\\d{1,2}):(\\d{2})").find(clean) ?: return defaultHm
+    val h = (match.groupValues[1].toIntOrNull() ?: 18).coerceIn(0, 23)
+    val m = (match.groupValues[2].toIntOrNull() ?: 0).coerceIn(0, 59)
+    return String.format(Locale.US, "%02d:%02d", h, m)
+}
+
+internal fun addMinutesToHm24(baseHm: String, addMinutes: Int): String {
+    val norm = normalizeTimeHm24(baseHm)
+    val parts = norm.split(":")
+    val h = parts.getOrNull(0)?.toIntOrNull() ?: 0
+    val m = parts.getOrNull(1)?.toIntOrNull() ?: 0
+    val total = (h * 60 + m + addMinutes + 24 * 60) % (24 * 60)
+    return String.format(Locale.US, "%02d:%02d", total / 60, total % 60)
+}
+
+internal fun loadN8nWorkflowsFromPrefs(prefs: SharedPreferences): MutableList<N8nScheduleWorkflow> {
+    val raw = prefs.getString("n8n_time_workflows_json", "") ?: ""
+    val list = mutableListOf<N8nScheduleWorkflow>()
+    if (raw.isNotBlank()) {
+        try {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                list.add(N8nScheduleWorkflow.fromJson(obj))
+            }
+        } catch (_: Exception) {}
+    }
+    if (list.isEmpty()) {
+        val defaultCreate = normalizeTimeHm24(prefs.getString("flow_create_time_hm", "18:00") ?: "18:00")
+        val defaultUpload = normalizeTimeHm24(prefs.getString("folder_upload_time_hm", "19:00") ?: "19:00")
+        val savedFlowUrl = prefs.getString("saved_flow_url", "https://flow.google.com/?pli=1") ?: "https://flow.google.com/?pli=1"
+        val isStory = prefs.getBoolean("flow_story_mode", true)
+        list.add(
+            N8nScheduleWorkflow(
+                id = "wf_default_1",
+                triggerTimeHm = defaultCreate,
+                enabled = true,
+                sourceNodeType = "GOOGLE_FLOW",
+                sourceWebUrl = savedFlowUrl,
+                customStoryPrompt = "",
+                storyContinuationMode = isStory,
+                targetActionNode = if (defaultCreate == defaultUpload) "YOUTUBE_DIRECT" else "DELAYED_UPLOAD",
+                delayedUploadTimeHm = defaultUpload,
+                linkedExtraSteps = mutableListOf("💾 Save to AutoVideos Folder", "📺 YouTube Shorts Auto-Title")
+            )
+        )
+    }
+    return list
+}
+
+internal fun saveN8nWorkflowsToPrefs(prefs: SharedPreferences, workflows: List<N8nScheduleWorkflow>) {
+    val arr = JSONArray()
+    workflows.forEach { wf ->
+        wf.triggerTimeHm = normalizeTimeHm24(wf.triggerTimeHm)
+        if (wf.delayedUploadTimeHm.isNotBlank()) {
+            wf.delayedUploadTimeHm = normalizeTimeHm24(wf.delayedUploadTimeHm)
+        }
+        arr.put(wf.toJson())
+    }
+    val editor = prefs.edit().putString("n8n_time_workflows_json", arr.toString())
+    // Sync primary workflow with legacy keys so HUD & Stage 1/2 stay in sync
+    val firstActive = workflows.firstOrNull { it.enabled } ?: workflows.firstOrNull()
+    if (firstActive != null) {
+        val createHm = normalizeTimeHm24(firstActive.triggerTimeHm)
+        val uploadHm = if (firstActive.targetActionNode == "DELAYED_UPLOAD" && firstActive.delayedUploadTimeHm.isNotBlank()) {
+            normalizeTimeHm24(firstActive.delayedUploadTimeHm)
+        } else {
+            createHm
+        }
+        editor.putString("flow_create_time_hm", createHm)
+        editor.putString("folder_upload_time_hm", uploadHm)
+        editor.putString("schedule_time_hm", uploadHm)
+    }
+    editor.apply()
+}
 
 internal fun MainActivity.buildTab2AutomationsAndScheduler(): View {
     val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -42,6 +127,13 @@ internal fun MainActivity.buildTab2AutomationsAndScheduler(): View {
         setPadding(dp(16), dp(14), dp(16), dp(28))
     }
     val defaultDownloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
+
+    // Forward references so AI Configurator & n8n Builder can update all inputs live
+    lateinit var flowCreateTimeInput: EditText
+    lateinit var folderUploadTimeInput: EditText
+    lateinit var enableSchedBtn: TextView
+    lateinit var storyModeBtn: TextView
+    var refreshN8nWorkflowCardsUi: () -> Unit = {}
 
     // =========================================================================
     // 1️⃣ TASK 1: GOOGLE FLOW AI VIDEO STUDIO (BACKGROUND OR REAL CHROME APP)
@@ -64,19 +156,20 @@ internal fun MainActivity.buildTab2AutomationsAndScheduler(): View {
         btn.background = roundedBox(if (flowExecMode == "BACKGROUND") accentRoyalBlue else accentPurple, dp(12))
     }
 
-    var isStoryMode = prefs.getBoolean("flow_story_mode", false)
-    val storyModeBtn = createPrimaryButton(
-        if (isStoryMode) "📖 Video Type: Step-by-Step Story Base (कहानी के भाग 1, 2, 3 बनेंगे)"
+    var isStoryMode = prefs.getBoolean("flow_story_mode", true)
+    storyModeBtn = createPrimaryButton(
+        if (isStoryMode) "📖 Video Type: Step-by-Step Story Base (कहानी के भाग 1, 2, 3 आगे बढ़ते रहेंगे)"
         else "🎬 Video Type: Single Exact Prompt Video (जो प्रॉम्प्ट देंगे वही बनेगा)",
-        Color.parseColor("#262B36")
+        if (isStoryMode) Color.parseColor("#1E3A8A") else Color.parseColor("#262B36")
     ) { btn ->
         isStoryMode = !isStoryMode
         prefs.edit().putBoolean("flow_story_mode", isStoryMode).apply()
         btn.text = if (isStoryMode) {
-            "📖 Video Type: Step-by-Step Story Base (कहानी के भाग 1, 2, 3 बनेंगे)"
+            "📖 Video Type: Step-by-Step Story Base (कहानी के भाग 1, 2, 3 आगे बढ़ते रहेंगे)"
         } else {
             "🎬 Video Type: Single Exact Prompt Video (जो प्रॉम्प्ट देंगे वही बनेगा)"
         }
+        btn.background = roundedBox(if (isStoryMode) Color.parseColor("#1E3A8A") else Color.parseColor("#262B36"), dp(12))
     }
 
     val topicInput = createCleanInput(
@@ -105,7 +198,27 @@ internal fun MainActivity.buildTab2AutomationsAndScheduler(): View {
     ).apply { minLines = 2 }
 
     val aiTaskHelperBtn = createPrimaryButton("🤖 AI से बात करके टॉपिक, स्टोरी और टाइम सेट करें", accentPurple) {
-        showMiniTaskAiAssistantDialog(topicInput, creditLimitInput)
+        // Save whatever story the user already typed in topicInput BEFORE opening the voice dialog!
+        val currentTypedTopic = topicInput.text.toString().trim()
+        if (currentTypedTopic.isNotEmpty()) {
+            prefs.edit().putString("flow_topic", currentTypedTopic).apply()
+        }
+        showMiniTaskAiAssistantDialog(
+            topicField = topicInput,
+            countField = creditLimitInput,
+            onSettingsUpdated = { createHm, uploadHm, storyEnabled ->
+                flowCreateTimeInput.setText(createHm)
+                folderUploadTimeInput.setText(uploadHm)
+                if (storyEnabled) {
+                    isStoryMode = true
+                    storyModeBtn.text = "📖 Video Type: Step-by-Step Story Base (कहानी के भाग 1, 2, 3 आगे बढ़ते रहेंगे)"
+                    storyModeBtn.background = roundedBox(Color.parseColor("#1E3A8A"), dp(12))
+                }
+                enableSchedBtn.text = "✅ 24/7 Daily Auto-Scheduler: ON"
+                enableSchedBtn.background = roundedBox(accentEmerald, dp(12))
+                refreshN8nWorkflowCardsUi()
+            }
+        )
     }
 
     val createAndSaveOnlyBtn = createPrimaryButton("📥 अभी सिर्फ Flow से वीडियो बनाकर फोल्डर में सेव करें", accentRoyalBlue) {
@@ -265,36 +378,234 @@ internal fun MainActivity.buildTab2AutomationsAndScheduler(): View {
     ytCard.addView(pickSingleVideoBtn)
 
     // =========================================================================
-    // 3️⃣ 24/7 DUAL-TIME AUTO SCHEDULER (FLOW CREATE TIME + FOLDER UPLOAD TIME)
+    // 3️⃣ 24/7 AUTO SCHEDULE + 🔗 n8n-STYLE MULTI-TIME VISUAL WORKFLOW BUILDER
     // =========================================================================
-    val schedCard = createSectionCard("⏰ 24/7 Auto Schedule: वीडियो बनने का टाइम + अपलोड होने का टाइम")
+    val schedCard = createSectionCard("⏰ 24/7 Auto Schedule & 🔗 n8n Multi-Time Workflow Builder")
 
     schedCard.addView(TextView(this).apply {
-        text = "1️⃣ कितने बजे ऑटोमैटिक Flow से वीडियो बनकर फोल्डर में सेव हो? (24-Hr, जैसे 18:00):"
+        text = "1️⃣ मुख्य टाइम: कितने बजे ऑटोमैटिक Flow से वीडियो बनकर फोल्डर में सेव हो? (24-Hr, जैसे 03:36 या 18:00):"
         setTextColor(textPureWhite)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
         setPadding(0, 0, 0, dp(4))
     })
-    val flowCreateTimeInput = createCleanInput(
-        prefs.getString("flow_create_time_hm", "18:00") ?: "18:00",
-        "Flow Video Create Time (जैसे 18:00 = शाम 6:00 बजे)"
+    flowCreateTimeInput = createCleanInput(
+        normalizeTimeHm24(prefs.getString("flow_create_time_hm", "18:00") ?: "18:00"),
+        "Flow Video Create Time (जैसे 03:36 या 18:00)"
     )
 
     schedCard.addView(flowCreateTimeInput)
     schedCard.addView(spacer(dp(10)))
 
     schedCard.addView(TextView(this).apply {
-        text = "2️⃣ कितने बजे उस फोल्डर से वीडियो उठकर Title + Description के साथ अपलोड हो? (जैसे 19:00):"
+        text = "2️⃣ मुख्य अपलोड टाइम: कितने बजे वीडियो अपलोड हो? (तुरंत अपलोड के लिए दोनों टाइम सेम रखें):"
         setTextColor(textPureWhite)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
         setPadding(0, 0, 0, dp(4))
     })
-    val folderUploadTimeInput = createCleanInput(
-        prefs.getString("folder_upload_time_hm", prefs.getString("schedule_time_hm", "19:00")) ?: "19:00",
-        "Folder Video Upload Time (जैसे 19:00 = शाम 7:00 बजे)"
+    folderUploadTimeInput = createCleanInput(
+        normalizeTimeHm24(prefs.getString("folder_upload_time_hm", prefs.getString("schedule_time_hm", "19:00")) ?: "19:00"),
+        "Folder Video Upload Time (जैसे 03:36 या 19:00)"
     )
     schedCard.addView(folderUploadTimeInput)
-    schedCard.addView(spacer(dp(8)))
+    schedCard.addView(spacer(dp(12)))
+
+    // -------------------------------------------------------------------------
+    // 🔗 n8n VISUAL WORKFLOW BUILDER CONTAINER (+ Add Time -> + Add Link/Target)
+    // -------------------------------------------------------------------------
+    val n8nHeaderBox = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(12), dp(10), dp(12), dp(10))
+        background = roundedBox(Color.parseColor("#111827"), dp(12), accentRoyalBlue)
+    }
+
+    n8nHeaderBox.addView(TextView(this).apply {
+        text = "🔗 n8n Visual Time Workflows (हर टाइम पर ➕ से लिंक, वेबसाइट और YouTube/Insta जोड़ें):"
+        setTextColor(Color.parseColor("#38BDF8"))
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+        typeface = Typeface.DEFAULT_BOLD
+        setPadding(0, 0, 0, dp(6))
+    })
+
+    val n8nListLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+    }
+    n8nHeaderBox.addView(n8nListLayout)
+
+    refreshN8nWorkflowCardsUi = {
+        n8nListLayout.removeAllViews()
+        val workflows = loadN8nWorkflowsFromPrefs(prefs)
+        workflows.forEachIndexed { index, wf ->
+            val wfCard = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                background = roundedBox(Color.parseColor("#1E293B"), dp(10), if (wf.enabled) accentEmerald else borderSubtle)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(10) }
+            }
+
+            // Top Row: Node 1 (Time Trigger) + ON/OFF + Run + Delete
+            val topRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            topRow.addView(TextView(this).apply {
+                text = "⏰ Time #${index + 1}: ${wf.triggerTimeHm}"
+                setTextColor(textPureWhite)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                typeface = Typeface.DEFAULT_BOLD
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener {
+                    showEditWorkflowTimeDialog(wf) {
+                        val updated = loadN8nWorkflowsFromPrefs(prefs).map { if (it.id == wf.id) wf else it }
+                        saveN8nWorkflowsToPrefs(prefs, updated)
+                        flowCreateTimeInput.setText(normalizeTimeHm24(wf.triggerTimeHm))
+                        refreshN8nWorkflowCardsUi()
+                    }
+                }
+            })
+
+            // Toggle ON/OFF chip
+            topRow.addView(TextView(this).apply {
+                text = if (wf.enabled) "✅ ON" else "⚪ OFF"
+                setTextColor(textPureWhite)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+                background = roundedBox(if (wf.enabled) accentEmerald else Color.parseColor("#475569"), dp(6))
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    marginEnd = dp(6)
+                }
+                setOnClickListener {
+                    wf.enabled = !wf.enabled
+                    val updated = loadN8nWorkflowsFromPrefs(prefs).map { if (it.id == wf.id) wf else it }
+                    saveN8nWorkflowsToPrefs(prefs, updated)
+                    refreshN8nWorkflowCardsUi()
+                }
+            })
+
+            // Test Run Now button
+            topRow.addView(TextView(this).apply {
+                text = "▶️ Run"
+                setTextColor(textPureWhite)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+                background = roundedBox(accentRoyalBlue, dp(6))
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    marginEnd = dp(6)
+                }
+                setOnClickListener {
+                    val rawTopic = topicInput.text.toString().trim()
+                    if (rawTopic.isNotEmpty()) {
+                        prefs.edit().putString("flow_topic", rawTopic).apply()
+                    }
+                    executeN8nWorkflowNow(wf, topicInput.text.toString().trim())
+                }
+            })
+
+            // Delete Workflow button
+            if (workflows.size > 1) {
+                topRow.addView(TextView(this).apply {
+                    text = "🗑️"
+                    setTextColor(Color.parseColor("#F87171"))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                    setPadding(dp(6), dp(4), dp(6), dp(4))
+                    setOnClickListener {
+                        val updated = loadN8nWorkflowsFromPrefs(prefs).filterNot { it.id == wf.id }
+                        saveN8nWorkflowsToPrefs(prefs, updated)
+                        refreshN8nWorkflowCardsUi()
+                    }
+                })
+            }
+            wfCard.addView(topRow)
+
+            // Visual n8n Node 2: Source / Website Link + Story Mode
+            val sourceLabel = when (wf.sourceNodeType) {
+                "GOOGLE_FLOW" -> "🌊 Google Flow (${wf.sourceWebUrl.take(36)})"
+                "CUSTOM_WEB_URL" -> "🌐 Custom Link (${wf.sourceWebUrl.take(38)})"
+                else -> "📂 Folder Video Only (/Download/AutoVideos)"
+            }
+            val storyBadge = if (wf.storyContinuationMode) "📖 Story: Auto Next Episode (कहानी आगे बढ़ेगी)" else "🎬 Single Prompt"
+            wfCard.addView(TextView(this).apply {
+                text = "   ⬇️ [Node 2 - Source Link]\n   🔗 $sourceLabel\n   ✨ $storyBadge"
+                setTextColor(Color.parseColor("#93C5FD"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                setPadding(0, dp(6), 0, dp(4))
+                setOnClickListener {
+                    showAddOrEditNodeInWorkflowDialog(wf, prefs) {
+                        refreshN8nWorkflowCardsUi()
+                    }
+                }
+            })
+
+            // Visual n8n Node 3: Target Upload Action + Extra Linked Nodes
+            val targetLabel = when (wf.targetActionNode) {
+                "YOUTUBE_DIRECT" -> "📺 YouTube Shorts (बनते ही तुरंत डायरेक्ट अपलोड)"
+                "INSTA_DIRECT" -> "📸 Instagram Reels (बनते ही तुरंत रील अपलोड)"
+                "BOTH_DIRECT" -> "📺 YouTube + 📸 Instagram (दोनों पर तुरंत अपलोड)"
+                "SAVE_FOLDER_ONLY" -> "💾 Only Save in Folder (सिर्फ फोल्डर में सेव)"
+                else -> "⏰ फोल्डर से ${wf.delayedUploadTimeHm.ifBlank { wf.triggerTimeHm }} बजे YouTube पर अपलोड"
+            }
+            val extraChainText = if (wf.linkedExtraSteps.isNotEmpty()) {
+                "\n   🔗 + Linked: " + wf.linkedExtraSteps.joinToString(" ➔ ")
+            } else ""
+
+            wfCard.addView(TextView(this).apply {
+                text = "   ⬇️ [Node 3 - Target Action]\n   🚀 $targetLabel$extraChainText"
+                setTextColor(accentEmerald)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                setPadding(0, dp(2), 0, dp(8))
+                setOnClickListener {
+                    showAddOrEditNodeInWorkflowDialog(wf, prefs) {
+                        refreshN8nWorkflowCardsUi()
+                    }
+                }
+            })
+
+            // Inside-Workflow [➕ लिंक / स्टेप जोड़ें] button (n8n Node Connector!)
+            val addInsideNodeBtn = createPrimaryButton(
+                "➕ इस टाइम (${wf.triggerTimeHm}) में लिंक / YouTube / स्टेप जोड़ें (+ Node)",
+                Color.parseColor("#334155")
+            ) {
+                showAddOrEditNodeInWorkflowDialog(wf, prefs) {
+                    val listNow = loadN8nWorkflowsFromPrefs(prefs)
+                    val first = listNow.firstOrNull()
+                    if (first != null) {
+                        flowCreateTimeInput.setText(normalizeTimeHm24(first.triggerTimeHm))
+                        folderUploadTimeInput.setText(
+                            if (first.targetActionNode == "DELAYED_UPLOAD" && first.delayedUploadTimeHm.isNotBlank())
+                                normalizeTimeHm24(first.delayedUploadTimeHm)
+                            else normalizeTimeHm24(first.triggerTimeHm)
+                        )
+                    }
+                    refreshN8nWorkflowCardsUi()
+                }
+            }
+            wfCard.addView(addInsideNodeBtn)
+            n8nListLayout.addView(wfCard)
+        }
+    }
+
+    val addNewTimeWorkflowBtn = createPrimaryButton("➕ नया टाइम वर्कफ़्लो जोड़ें (+ Add New Time & Link Nodes)", accentPurple) {
+        showCreateNewTimeWorkflowDialog(prefs) { newWf ->
+            flowCreateTimeInput.setText(normalizeTimeHm24(newWf.triggerTimeHm))
+            folderUploadTimeInput.setText(
+                if (newWf.targetActionNode == "DELAYED_UPLOAD" && newWf.delayedUploadTimeHm.isNotBlank())
+                    normalizeTimeHm24(newWf.delayedUploadTimeHm)
+                else normalizeTimeHm24(newWf.triggerTimeHm)
+            )
+            prefs.edit().putBoolean("scheduler_enabled", true).apply()
+            enableSchedBtn.text = "✅ 24/7 Daily Auto-Scheduler: ON"
+            enableSchedBtn.background = roundedBox(accentEmerald, dp(12))
+            refreshN8nWorkflowCardsUi()
+        }
+    }
+
+    n8nHeaderBox.addView(addNewTimeWorkflowBtn)
+    schedCard.addView(n8nHeaderBox)
+    schedCard.addView(spacer(dp(10)))
 
     var onlyWhenIdle = prefs.getBoolean("run_only_when_idle", false)
     val idleModeToggleBtn = createPrimaryButton(
@@ -324,40 +635,62 @@ internal fun MainActivity.buildTab2AutomationsAndScheduler(): View {
     })
 
     snoozeRow.addView(createPrimaryButton("💾 Save Schedule Times", accentRoyalBlue) {
-        val tCreate = flowCreateTimeInput.text.toString().trim().ifEmpty { "18:00" }
-        val tUpload = folderUploadTimeInput.text.toString().trim().ifEmpty { "19:00" }
+        val tCreate = normalizeTimeHm24(flowCreateTimeInput.text.toString().trim().ifEmpty { "18:00" })
+        val tUpload = normalizeTimeHm24(folderUploadTimeInput.text.toString().trim().ifEmpty { tCreate }, tCreate)
+        flowCreateTimeInput.setText(tCreate)
+        folderUploadTimeInput.setText(tUpload)
         val saveDir = flowDownloadFolderEditText.text.toString().trim().ifEmpty { defaultDownloadDir }
+        val currentTopic = topicInput.text.toString().trim()
         prefs.edit()
             .putString("flow_create_time_hm", tCreate)
             .putString("folder_upload_time_hm", tUpload)
             .putString("schedule_time_hm", tUpload)
+            .putString("flow_topic", currentTopic)
+            .putBoolean("scheduler_enabled", true)
             .putString("custom_download_folder", saveDir)
             .putString("yt_folder_path", folderPathEditText.text.toString().trim().ifEmpty { saveDir })
             .putString("custom_video_description", customDescriptionInput.text.toString().trim())
             .apply()
+
+        // Also sync with first n8n workflow card
+        val wfs = loadN8nWorkflowsFromPrefs(prefs)
+        if (wfs.isNotEmpty()) {
+            wfs[0].triggerTimeHm = tCreate
+            wfs[0].targetActionNode = if (tCreate == tUpload) "YOUTUBE_DIRECT" else "DELAYED_UPLOAD"
+            wfs[0].delayedUploadTimeHm = tUpload
+            wfs[0].enabled = true
+            saveN8nWorkflowsToPrefs(prefs, wfs)
+        }
+        enableSchedBtn.text = "✅ 24/7 Daily Auto-Scheduler: ON"
+        enableSchedBtn.background = roundedBox(accentEmerald, dp(12))
+        refreshN8nWorkflowCardsUi()
+
         Toast.makeText(
             this,
-            "✅ सेव हो गया!\n🎬 Flow वीडियो बनेगा: $tCreate बजे\n📤 फोल्डर से अपलोड होगा: $tUpload बजे",
+            "✅ सेव हो गया!\n🎬 Flow वीडियो बनेगा: $tCreate बजे\n📤 अपलोड होगा: $tUpload बजे",
             Toast.LENGTH_LONG
         ).show()
     }.apply {
         layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
     })
 
-    var schedEnabled = prefs.getBoolean("scheduler_enabled", false)
-    val enableSchedBtn = createPrimaryButton(
+    var schedEnabled = prefs.getBoolean("scheduler_enabled", true)
+    enableSchedBtn = createPrimaryButton(
         if (schedEnabled) "✅ 24/7 Daily Auto-Scheduler: ON" else "⚪ 24/7 Daily Auto-Scheduler: OFF (Tap to Enable)",
         if (schedEnabled) accentEmerald else Color.parseColor("#475569")
     ) { btn ->
         schedEnabled = !schedEnabled
-        val tCreate = flowCreateTimeInput.text.toString().trim().ifEmpty { "18:00" }
-        val tUpload = folderUploadTimeInput.text.toString().trim().ifEmpty { "19:00" }
+        val tCreate = normalizeTimeHm24(flowCreateTimeInput.text.toString().trim().ifEmpty { "18:00" })
+        val tUpload = normalizeTimeHm24(folderUploadTimeInput.text.toString().trim().ifEmpty { tCreate }, tCreate)
+        flowCreateTimeInput.setText(tCreate)
+        folderUploadTimeInput.setText(tUpload)
         val saveDir = flowDownloadFolderEditText.text.toString().trim().ifEmpty { defaultDownloadDir }
         prefs.edit()
             .putBoolean("scheduler_enabled", schedEnabled)
             .putString("flow_create_time_hm", tCreate)
             .putString("folder_upload_time_hm", tUpload)
             .putString("schedule_time_hm", tUpload)
+            .putString("flow_topic", topicInput.text.toString().trim())
             .putString("custom_download_folder", saveDir)
             .putString("yt_folder_path", folderPathEditText.text.toString().trim().ifEmpty { saveDir })
             .putString("custom_video_description", customDescriptionInput.text.toString().trim())
@@ -365,6 +698,8 @@ internal fun MainActivity.buildTab2AutomationsAndScheduler(): View {
         btn.text = if (schedEnabled) "✅ 24/7 Daily Auto-Scheduler: ON" else "⚪ 24/7 Daily Auto-Scheduler: OFF (Tap to Enable)"
         btn.background = roundedBox(if (schedEnabled) accentEmerald else Color.parseColor("#475569"), dp(12))
     }
+
+    refreshN8nWorkflowCardsUi()
 
     schedCard.addView(idleModeToggleBtn)
     schedCard.addView(snoozeRow)
@@ -495,6 +830,233 @@ internal fun MainActivity.buildTab2AutomationsAndScheduler(): View {
     return scroll
 }
 
+/**
+ * Runs a single n8n Workflow card immediately (for testing or scheduled trigger)
+ */
+internal fun MainActivity.executeN8nWorkflowNow(wf: N8nScheduleWorkflow, mainBoxStoryTopic: String) {
+    val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+    val svc = AutoTouchService.instance
+    if (svc == null) {
+        Toast.makeText(this, "पहले Accessibility Service ऑन करें!", Toast.LENGTH_SHORT).show()
+        return
+    }
+    val rawTopic = wf.customStoryPrompt.trim().ifEmpty {
+        mainBoxStoryTopic.trim().ifEmpty {
+            prefs.getString("flow_topic", "Young Indian fashion designer story") ?: "Young Indian fashion designer story"
+        }
+    }
+    val finalTopic = if (wf.storyContinuationMode) "Step-by-step continuous story: $rawTopic" else rawTopic
+    val count = prefs.getInt("flow_daily_videos", 1).coerceIn(1, 5)
+
+    when (wf.targetActionNode) {
+        "YOUTUBE_DIRECT" -> {
+            prefs.edit().putBoolean("yt_link_enabled", true).apply()
+            svc.startGoogleFlowToYouTubePipeline(finalTopic, count, uploadImmediatelyAfterCreate = true)
+        }
+        "INSTA_DIRECT" -> {
+            prefs.edit().putBoolean("yt_link_enabled", false).putBoolean("insta_link_enabled", true).apply()
+            svc.startGoogleFlowToYouTubePipeline(finalTopic, count, uploadImmediatelyAfterCreate = true)
+        }
+        "BOTH_DIRECT" -> {
+            prefs.edit().putBoolean("yt_link_enabled", true).putBoolean("insta_link_enabled", true).apply()
+            svc.startGoogleFlowToYouTubePipeline(finalTopic, count, uploadImmediatelyAfterCreate = true)
+        }
+        else -> {
+            svc.startGoogleFlowToYouTubePipeline(finalTopic, count, uploadImmediatelyAfterCreate = false)
+        }
+    }
+}
+
+private fun MainActivity.showEditWorkflowTimeDialog(wf: N8nScheduleWorkflow, onSaved: () -> Unit) {
+    val box = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(14), dp(10), dp(14), dp(10))
+    }
+    val timeEdit = createCleanInput(wf.triggerTimeHm, "24-Hr Time (जैसे 03:36, 09:00, 18:30)")
+    box.addView(timeEdit)
+    darkDialogBuilder()
+        .setTitle("⏰ वर्कफ़्लो का टाइम बदलें")
+        .setView(box)
+        .setPositiveButton("💾 सेव करें") { _, _ ->
+            wf.triggerTimeHm = normalizeTimeHm24(timeEdit.text.toString(), wf.triggerTimeHm)
+            onSaved()
+        }
+        .setNegativeButton("बंद करें", null)
+        .show()
+}
+
+/**
+ * Dialog to create a brand-new n8n Time Workflow Card with + Link & + YouTube/Insta Node
+ */
+private fun MainActivity.showCreateNewTimeWorkflowDialog(
+    prefs: SharedPreferences,
+    onCreated: (N8nScheduleWorkflow) -> Unit
+) {
+    val wrapper = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(14), dp(10), dp(14), dp(10))
+    }
+    val timeInput = createCleanInput("03:36", "⏰ Node 1: किस टाइम चले? (जैसे 03:36 या 18:00)")
+    val linkInput = createCleanInput(
+        prefs.getString("saved_flow_url", "https://flow.google.com/?pli=1") ?: "https://flow.google.com/?pli=1",
+        "🔗 Node 2 (+ Link): वेबसाइट / Flow प्रोजेक्ट लिंक"
+    )
+
+    var selectedTarget = "YOUTUBE_DIRECT"
+    val targetBtn = createPrimaryButton(
+        "🚀 Node 3 (+ Action): 📺 YouTube Shorts (बनते ही डायरेक्ट अपलोड)",
+        Color.parseColor("#DC2626")
+    ) { btn ->
+        selectedTarget = when (selectedTarget) {
+            "YOUTUBE_DIRECT" -> "BOTH_DIRECT"
+            "BOTH_DIRECT" -> "INSTA_DIRECT"
+            "INSTA_DIRECT" -> "SAVE_FOLDER_ONLY"
+            else -> "YOUTUBE_DIRECT"
+        }
+        btn.text = when (selectedTarget) {
+            "YOUTUBE_DIRECT" -> "🚀 Node 3 (+ Action): 📺 YouTube Shorts (बनते ही डायरेक्ट अपलोड)"
+            "BOTH_DIRECT" -> "🚀 Node 3 (+ Action): 📺 YouTube + 📸 Insta (दोनों पर डायरेक्ट अपलोड)"
+            "INSTA_DIRECT" -> "🚀 Node 3 (+ Action): 📸 Instagram Reels (डायरेक्ट अपलोड)"
+            else -> "🚀 Node 3 (+ Action): 💾 सिर्फ फोल्डर में सेव करें"
+        }
+    }
+
+    var storyNextEp = true
+    val storyToggleBtn = createPrimaryButton(
+        "📖 Story Node: ON (हर बार कहानी का अगला भाग/पार्ट बनेगा)",
+        Color.parseColor("#1E3A8A")
+    ) { btn ->
+        storyNextEp = !storyNextEp
+        btn.text = if (storyNextEp) {
+            "📖 Story Node: ON (हर बार कहानी का अगला भाग/पार्ट बनेगा)"
+        } else {
+            "🎬 Story Node: OFF (Single Exact Prompt)"
+        }
+    }
+
+    wrapper.addView(timeInput)
+    wrapper.addView(spacer(dp(8)))
+    wrapper.addView(linkInput)
+    wrapper.addView(spacer(dp(8)))
+    wrapper.addView(storyToggleBtn)
+    wrapper.addView(spacer(dp(8)))
+    wrapper.addView(targetBtn)
+
+    darkDialogBuilder()
+        .setTitle("➕ नया n8n Time Workflow बनाएं")
+        .setView(wrapper)
+        .setPositiveButton("⚡ वर्कफ़्लो जोड़ें") { _, _ ->
+            val normHm = normalizeTimeHm24(timeInput.text.toString(), "08:00")
+            val url = linkInput.text.toString().trim().ifEmpty { "https://flow.google.com/?pli=1" }
+            val newWf = N8nScheduleWorkflow(
+                triggerTimeHm = normHm,
+                enabled = true,
+                sourceNodeType = if (url.contains("flow.google") || url.contains("labs.google")) "GOOGLE_FLOW" else "CUSTOM_WEB_URL",
+                sourceWebUrl = url,
+                customStoryPrompt = "",
+                storyContinuationMode = storyNextEp,
+                targetActionNode = selectedTarget,
+                delayedUploadTimeHm = normHm,
+                linkedExtraSteps = mutableListOf("💾 Auto-Save MP4", "✍️ AI Viral Title")
+            )
+            val currentList = loadN8nWorkflowsFromPrefs(prefs)
+            currentList.add(0, newWf)
+            saveN8nWorkflowsToPrefs(prefs, currentList)
+            onCreated(newWf)
+            Toast.makeText(this, "✅ $normHm बजे का नया n8n वर्कफ़्लो जुड़ गया!", Toast.LENGTH_SHORT).show()
+        }
+        .setNegativeButton("बंद करें", null)
+        .show()
+}
+
+/**
+ * Inside-Workflow [➕ Node Linker] Dialog: Lets user link/edit Website URL, YouTube, Insta, Story Mode, or Extra Steps
+ */
+private fun MainActivity.showAddOrEditNodeInWorkflowDialog(
+    wf: N8nScheduleWorkflow,
+    prefs: SharedPreferences,
+    onUpdated: () -> Unit
+) {
+    val wrapper = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(14), dp(10), dp(14), dp(10))
+    }
+
+    val timeInput = createCleanInput(wf.triggerTimeHm, "⏰ किस टाइम चले? (24-Hr, जैसे 03:36)")
+    val urlInput = createCleanInput(wf.sourceWebUrl, "🔗 + Website / Flow Link (यहाँ लिंक टाइप या पेस्ट करें)")
+    val extraStepInput = createCleanInput("", "➕ कोई एक्स्ट्रा स्टेप या लिंक जोड़ें (जैसे: Add Hashtags / Insta Share)")
+
+    var currentTarget = wf.targetActionNode
+    val targetCycleBtn = createPrimaryButton(
+        when (currentTarget) {
+            "YOUTUBE_DIRECT" -> "➕ Connected: 📺 YouTube Shorts (तुरंत डायरेक्ट अपलोड)"
+            "BOTH_DIRECT" -> "➕ Connected: 📺 YouTube + 📸 Insta (दोनों से जुड़ा है)"
+            "INSTA_DIRECT" -> "➕ Connected: 📸 Instagram Reels (तुरंत रील अपलोड)"
+            else -> "➕ Connected: 💾 Save to Folder Only"
+        },
+        accentEmerald
+    ) { btn ->
+        currentTarget = when (currentTarget) {
+            "YOUTUBE_DIRECT" -> "BOTH_DIRECT"
+            "BOTH_DIRECT" -> "INSTA_DIRECT"
+            "INSTA_DIRECT" -> "SAVE_FOLDER_ONLY"
+            else -> "YOUTUBE_DIRECT"
+        }
+        btn.text = when (currentTarget) {
+            "YOUTUBE_DIRECT" -> "➕ Connected: 📺 YouTube Shorts (तुरंत डायरेक्ट अपलोड)"
+            "BOTH_DIRECT" -> "➕ Connected: 📺 YouTube + 📸 Insta (दोनों से जुड़ा है)"
+            "INSTA_DIRECT" -> "➕ Connected: 📸 Instagram Reels (तुरंत रील अपलोड)"
+            else -> "➕ Connected: 💾 Save to Folder Only"
+        }
+    }
+
+    var storyCont = wf.storyContinuationMode
+    val storyBtn = createPrimaryButton(
+        if (storyCont) "📖 + Story Link: Auto Next Episode (हर बार अगली स्टोरी बनेगी)"
+        else "🎬 + Story Link: Single Exact Prompt",
+        Color.parseColor("#1E3A8A")
+    ) { btn ->
+        storyCont = !storyCont
+        btn.text = if (storyCont) {
+            "📖 + Story Link: Auto Next Episode (हर बार अगली स्टोरी बनेगी)"
+        } else {
+            "🎬 + Story Link: Single Exact Prompt"
+        }
+    }
+
+    wrapper.addView(timeInput)
+    wrapper.addView(spacer(dp(8)))
+    wrapper.addView(urlInput)
+    wrapper.addView(spacer(dp(8)))
+    wrapper.addView(targetCycleBtn)
+    wrapper.addView(spacer(dp(8)))
+    wrapper.addView(storyBtn)
+    wrapper.addView(spacer(dp(8)))
+    wrapper.addView(extraStepInput)
+
+    darkDialogBuilder()
+        .setTitle("🔗 n8n Node Linker (${wf.triggerTimeHm})")
+        .setView(wrapper)
+        .setPositiveButton("💾 लिंक सेव करें") { _, _ ->
+            wf.triggerTimeHm = normalizeTimeHm24(timeInput.text.toString(), wf.triggerTimeHm)
+            val newUrl = urlInput.text.toString().trim().ifEmpty { "https://flow.google.com/?pli=1" }
+            wf.sourceWebUrl = newUrl
+            wf.sourceNodeType = if (newUrl.contains("flow.google") || newUrl.contains("labs.google")) "GOOGLE_FLOW" else "CUSTOM_WEB_URL"
+            wf.targetActionNode = currentTarget
+            wf.storyContinuationMode = storyCont
+            val extra = extraStepInput.text.toString().trim()
+            if (extra.isNotEmpty()) {
+                wf.linkedExtraSteps.add(extra)
+            }
+            val list = loadN8nWorkflowsFromPrefs(prefs).map { if (it.id == wf.id) wf else it }
+            saveN8nWorkflowsToPrefs(prefs, list)
+            onUpdated()
+            Toast.makeText(this, "✅ n8n नोड्स और लिंक अपडेट हो गए!", Toast.LENGTH_SHORT).show()
+        }
+        .setNegativeButton("बंद करें", null)
+        .show()
+}
+
 private fun MainActivity.buildMultiPlatformLinkerBox(prefs: SharedPreferences): View {
     val box = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
@@ -542,17 +1104,29 @@ private fun MainActivity.buildMultiPlatformLinkerBox(prefs: SharedPreferences): 
     return box
 }
 
-private fun MainActivity.showMiniTaskAiAssistantDialog(topicField: EditText, countField: EditText) {
+/**
+ * FIXED Mini Task AI Configurator:
+ * 1. NEVER overwrites the user's existing story in topicField when user only speaks schedule/time instructions!
+ * 2. Normalizes spoken time (e.g. "3:36" -> "03:36") and immediately updates UI EditTexts & n8n Workflow cards!
+ */
+private fun MainActivity.showMiniTaskAiAssistantDialog(
+    topicField: EditText,
+    countField: EditText,
+    onSettingsUpdated: (createHm: String, uploadHm: String, storyEnabled: Boolean) -> Unit
+) {
     val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
+    val existingStoryInBox = topicField.text.toString().trim()
+
     val wrapper = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         setPadding(dp(14), dp(10), dp(14), dp(10))
     }
     val input = createCleanInput(
         "",
-        "जैसे: 'रोज़ शाम 6:00 बजे Flow से वीडियो बनाकर फोल्डर में सेव करो और 7:00 बजे YouTube और Insta पर अपलोड करो'"
+        "जैसे: '3:36 पर वीडियो बनाना और वही वीडियो फिर YouTube पर डायरेक्ट अपलोड करना' (आपकी ऊपर लिखी स्टोरी सुरक्षित रहेगी!)"
     ).apply { minLines = 3 }
     wrapper.addView(input)
+
     darkDialogBuilder()
         .setTitle("🤖 Mini Task AI Configurator")
         .setView(wrapper)
@@ -560,32 +1134,109 @@ private fun MainActivity.showMiniTaskAiAssistantDialog(topicField: EditText, cou
             val userWish = input.text.toString().trim()
             if (userWish.isEmpty()) return@setPositiveButton
             uiScope.launch {
-                val plan = getActiveBrain().chatAndBuildDetailedPlan("Extract video topic from: $userWish", "", "")
-                topicField.setText(plan.optString("taskTitle", userWish).ifEmpty { userWish })
-                val times = Regex("(\\d{1,2})[:.](\\d{2})").findAll(userWish).map { it.value.replace(".", ":") }.toList()
-                if (times.size >= 2) {
-                    prefs.edit()
-                        .putString("flow_create_time_hm", times[0])
-                        .putString("folder_upload_time_hm", times[1])
-                        .putString("schedule_time_hm", times[1])
-                        .putBoolean("scheduler_enabled", true)
-                        .apply()
-                } else if (times.size == 1) {
-                    prefs.edit()
-                        .putString("flow_create_time_hm", times[0])
-                        .putString("folder_upload_time_hm", times[0])
-                        .putString("schedule_time_hm", times[0])
-                        .putBoolean("scheduler_enabled", true)
-                        .apply()
+                val brain = getActiveBrain()
+                val isTimeOnly = brain.isTimeOrScheduleOnlyCommand(userWish)
+                val plan = brain.chatAndBuildDetailedPlan(userWish, "", "")
+
+                // 1. Preserve existing story in topicField unless user explicitly dictated a brand-new long story!
+                val keepExisting = isTimeOnly || plan.optBoolean("keepExistingStory", true) || existingStoryInBox.length > 25
+                val newStoryCandidate = plan.optString("storyTopicPrompt", "").trim()
+                val finalStoryTopic = if (!keepExisting && newStoryCandidate.length > 20) {
+                    newStoryCandidate
+                } else {
+                    existingStoryInBox.ifEmpty {
+                        prefs.getString("flow_topic", "Young Indian girl fashion designer story") ?: "Young Indian girl fashion designer story"
+                    }
                 }
-                if (userWish.contains("story", true) || userWish.contains("कहानी") || userWish.contains("पार्ट")) {
-                    prefs.edit().putBoolean("flow_story_mode", true).apply()
-                    countField.setText("2")
+                topicField.setText(finalStoryTopic)
+                prefs.edit().putString("flow_topic", finalStoryTopic).apply()
+
+                // 2. Extract and normalize 24-Hr times ("3:36" -> "03:36")
+                val spokenTimes = Regex("(\\d{1,2})[:.](\\d{2})")
+                    .findAll(userWish)
+                    .map { normalizeTimeHm24(it.value) }
+                    .toList()
+
+                val aiCreateHm = plan.optString("createTimeHm", "").takeIf { it.isNotBlank() }?.let { normalizeTimeHm24(it) }
+                val createHm = spokenTimes.getOrNull(0)
+                    ?: aiCreateHm
+                    ?: normalizeTimeHm24(prefs.getString("flow_create_time_hm", "18:00") ?: "18:00")
+
+                val lowerWish = userWish.lowercase(Locale.ROOT)
+                val wantsDirectUpload = lowerWish.contains("direct") ||
+                    lowerWish.contains("turant") ||
+                    lowerWish.contains("तुरंत") ||
+                    lowerWish.contains("vahi video") ||
+                    lowerWish.contains("fir youtube") ||
+                    plan.optBoolean("directUploadAfterCreate", false)
+
+                val uploadHm = when {
+                    spokenTimes.size >= 2 -> spokenTimes[1]
+                    wantsDirectUpload -> createHm // Same time = Direct Create + Immediate Upload mode!
+                    else -> createHm
                 }
-                if (userWish.contains("insta", true) || userWish.contains("इंस्टा")) {
+
+                val storyModeOn = lowerWish.contains("story") ||
+                    lowerWish.contains("कहानी") ||
+                    lowerWish.contains("पार्ट") ||
+                    finalStoryTopic.contains("story", ignoreCase = true) ||
+                    prefs.getBoolean("flow_story_mode", true)
+
+                prefs.edit()
+                    .putString("flow_create_time_hm", createHm)
+                    .putString("folder_upload_time_hm", uploadHm)
+                    .putString("schedule_time_hm", uploadHm)
+                    .putBoolean("scheduler_enabled", true)
+                    .putBoolean("flow_story_mode", storyModeOn)
+                    .apply()
+
+                if (lowerWish.contains("insta") || lowerWish.contains("इंस्टा")) {
                     prefs.edit().putBoolean("insta_link_enabled", true).apply()
                 }
-                Toast.makeText(this@showMiniTaskAiAssistantDialog, "✅ AI ने सेटिंग्स अपडेट कर दीं!", Toast.LENGTH_LONG).show()
+                if (lowerWish.contains("youtube") || lowerWish.contains("यूट्यूब")) {
+                    prefs.edit().putBoolean("yt_link_enabled", true).apply()
+                }
+
+                // 3. Add or update the n8n Time Workflow card for this spoken time!
+                val workflows = loadN8nWorkflowsFromPrefs(prefs)
+                val targetAction = when {
+                    lowerWish.contains("insta") && lowerWish.contains("youtube") -> "BOTH_DIRECT"
+                    lowerWish.contains("insta") && !lowerWish.contains("youtube") -> "INSTA_DIRECT"
+                    wantsDirectUpload || createHm == uploadHm -> "YOUTUBE_DIRECT"
+                    else -> "DELAYED_UPLOAD"
+                }
+                val existingIdx = workflows.indexOfFirst { normalizeTimeHm24(it.triggerTimeHm) == createHm }
+                if (existingIdx >= 0) {
+                    workflows[existingIdx].enabled = true
+                    workflows[existingIdx].targetActionNode = targetAction
+                    workflows[existingIdx].delayedUploadTimeHm = uploadHm
+                    workflows[existingIdx].storyContinuationMode = storyModeOn
+                    workflows[existingIdx].lastRunMinuteKey = "" // Reset so it can trigger fresh!
+                } else {
+                    workflows.add(
+                        0,
+                        N8nScheduleWorkflow(
+                            triggerTimeHm = createHm,
+                            enabled = true,
+                            sourceNodeType = "GOOGLE_FLOW",
+                            sourceWebUrl = prefs.getString("saved_flow_url", "https://flow.google.com/?pli=1") ?: "https://flow.google.com/?pli=1",
+                            customStoryPrompt = "",
+                            storyContinuationMode = storyModeOn,
+                            targetActionNode = targetAction,
+                            delayedUploadTimeHm = uploadHm,
+                            linkedExtraSteps = mutableListOf("💾 Auto-Save MP4", "📺 Direct YouTube Upload")
+                        )
+                    )
+                }
+                saveN8nWorkflowsToPrefs(prefs, workflows)
+
+                onSettingsUpdated(createHm, uploadHm, storyModeOn)
+
+                Toast.makeText(
+                    this@showMiniTaskAiAssistantDialog,
+                    "✅ सेट हो गया! ⏰ $createHm बजे वीडियो बनेगा और YouTube पर अपलोड होगा (आपकी स्टोरी सुरक्षित है)!",
+                    Toast.LENGTH_LONG
+                ).show()
             }
         }
         .setNegativeButton("बंद करें", null)
