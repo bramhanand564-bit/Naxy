@@ -522,10 +522,11 @@ class AutoTouchService : AccessibilityService() {
         val execMode = forceMode ?: prefs.getString("execution_mode", "LIVE_PHONE") ?: "LIVE_PHONE"
 
         if (execMode.startsWith("SCHEDULE_YT_")) {
-            val timeHm = execMode.removePrefix("SCHEDULE_YT_").trim().ifEmpty { "19:00" }
+            val timeHm = normalizeTimeHm24(execMode.removePrefix("SCHEDULE_YT_").trim().ifEmpty { "19:00" })
             val pipeType = if (goal.contains("flow", true)) "FLOW_YT" else "FOLDER_YT"
             prefs.edit()
                 .putBoolean("scheduler_enabled", true)
+                .putString("flow_create_time_hm", timeHm)
                 .putString("schedule_time_hm", timeHm)
                 .putString("folder_upload_time_hm", timeHm)
                 .putString("scheduled_pipeline_type", pipeType)
@@ -1069,6 +1070,11 @@ class AutoTouchService : AccessibilityService() {
         }
     }
 
+    /**
+     * 24/7 Multi-Time n8n Workflow & Dual-Stage Scheduler Loop:
+     * Checks every 10 seconds, normalizes all times to strict 24-Hr "HH:mm" (so "3:36" == "03:36"),
+     * and executes every enabled n8n Time Workflow Card + Main Schedule on the exact minute!
+     */
     private fun startDailySchedulerLoop() {
         schedulerJob?.cancel()
         schedulerJob = serviceScope.launch {
@@ -1076,7 +1082,7 @@ class AutoTouchService : AccessibilityService() {
             var lastTriggeredUploadMinute = ""
             var lastNightReportDay = ""
             while (isActive) {
-                delay(20000L)
+                delay(10_000L)
                 val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
                 if (isAgentRunning) continue
 
@@ -1105,8 +1111,9 @@ class AutoTouchService : AccessibilityService() {
                     continue
                 }
 
-                val nowHm = java.text.SimpleDateFormat("HH:mm", Locale.getDefault()).format(java.util.Date())
-                val todayStr = java.text.SimpleDateFormat("dd MMM", Locale.getDefault()).format(java.util.Date())
+                val nowHm = java.text.SimpleDateFormat("HH:mm", Locale.US).format(java.util.Date())
+                val todayStr = java.text.SimpleDateFormat("dd_MMM", Locale.US).format(java.util.Date())
+                val todayMinuteKey = "${todayStr}_$nowHm"
 
                 if (nowHm == "22:00" && lastNightReportDay != todayStr) {
                     lastNightReportDay = todayStr
@@ -1114,17 +1121,108 @@ class AutoTouchService : AccessibilityService() {
                     hud.triggerGreetingPeekIfAllowed("🌙 सर, 10 बज गए! आज की रिपोर्ट: $dailyStatus")
                 }
 
-                if (!prefs.getBoolean("scheduler_enabled", false)) continue
+                if (!prefs.getBoolean("scheduler_enabled", true)) continue
 
-                val flowCreateTimeHm = prefs.getString("flow_create_time_hm", prefs.getString("schedule_time_hm", "18:00")) ?: "18:00"
-                val folderUploadTimeHm = prefs.getString("folder_upload_time_hm", prefs.getString("schedule_time_hm", "19:00")) ?: "19:00"
-                val topic = prefs.getString("flow_topic", "Futuristic Sci-Fi World") ?: "Futuristic Sci-Fi World"
-                val credits = prefs.getInt("flow_daily_videos", 1)
                 val defaultDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
                 val folder = prefs.getString("yt_folder_path", prefs.getString("custom_download_folder", defaultDir)) ?: defaultDir
                 val oldest = prefs.getBoolean("yt_pick_oldest", true)
-                val runWhenIdleOnly = prefs.getBoolean("run_only_when_idle", false)
+                val credits = prefs.getInt("flow_daily_videos", 1).coerceIn(1, 5)
+                val mainStoryTopic = prefs.getString("flow_topic", "Young Indian fashion designer story")
+                    ?: "Young Indian fashion designer story"
 
+                // 1. Check all enabled n8n Multi-Time Workflow Cards!
+                val workflows = loadN8nWorkflowsFromPrefs(prefs)
+                var triggeredFromN8nCard = false
+
+                for (wf in workflows) {
+                    if (!wf.enabled) continue
+                    val wfTriggerHm = normalizeTimeHm24(wf.triggerTimeHm)
+                    val wfDelayedHm = if (wf.delayedUploadTimeHm.isNotBlank()) {
+                        normalizeTimeHm24(wf.delayedUploadTimeHm)
+                    } else {
+                        wfTriggerHm
+                    }
+
+                    if (nowHm == wfTriggerHm && wf.lastRunMinuteKey != todayMinuteKey) {
+                        wf.lastRunMinuteKey = todayMinuteKey
+                        lastTriggeredFlowMinute = nowHm
+                        saveN8nWorkflowsToPrefs(prefs, workflows)
+
+                        val wfTopic = wf.customStoryPrompt.trim().ifEmpty { mainStoryTopic }
+                        prefs.edit().putBoolean("flow_story_mode", wf.storyContinuationMode).apply()
+                        if (wf.sourceWebUrl.isNotBlank() && (wf.sourceWebUrl.contains("flow.google") || wf.sourceWebUrl.contains("labs.google"))) {
+                            prefs.edit().putString("saved_flow_url", wf.sourceWebUrl).apply()
+                        }
+
+                        val uploadImmediately = when (wf.targetActionNode) {
+                            "YOUTUBE_DIRECT" -> {
+                                prefs.edit().putBoolean("yt_link_enabled", true).apply()
+                                true
+                            }
+                            "INSTA_DIRECT" -> {
+                                prefs.edit().putBoolean("yt_link_enabled", false).putBoolean("insta_link_enabled", true).apply()
+                                true
+                            }
+                            "BOTH_DIRECT" -> {
+                                prefs.edit().putBoolean("yt_link_enabled", true).putBoolean("insta_link_enabled", true).apply()
+                                true
+                            }
+                            "SAVE_FOLDER_ONLY" -> false
+                            else -> (wfTriggerHm == wfDelayedHm)
+                        }
+
+                        if (uploadImmediately) {
+                            lastTriggeredUploadMinute = nowHm
+                        }
+
+                        log("🔗 n8n Workflow Triggered at $nowHm [Source=${wf.sourceNodeType}, Action=${wf.targetActionNode}, StoryEp=${wf.storyContinuationMode}]!")
+
+                        when (wf.sourceNodeType) {
+                            "FOLDER_ONLY" -> {
+                                startYouTubeFolderAutoUpload(folder, oldest)
+                            }
+                            "CUSTOM_WEB_URL" -> {
+                                val targets = if (wf.targetActionNode == "INSTA_DIRECT") "Instagram Reels" else "YouTube Shorts"
+                                startUniversalTask(
+                                    "Open ${wf.sourceWebUrl}, generate 9:16 video for '$wfTopic', save to $folder, and upload to $targets",
+                                    emptyList(),
+                                    "BACKGROUND_WEB"
+                                )
+                            }
+                            else -> {
+                                startGoogleFlowToYouTubePipeline(
+                                    topic = wfTopic,
+                                    maxVideosToCreate = credits,
+                                    uploadImmediatelyAfterCreate = uploadImmediately
+                                )
+                            }
+                        }
+                        triggeredFromN8nCard = true
+                        break
+                    }
+
+                    // Check if a workflow has a separate Delayed Upload time
+                    if (wf.targetActionNode == "DELAYED_UPLOAD" && wfDelayedHm != wfTriggerHm &&
+                        nowHm == wfDelayedHm && lastTriggeredUploadMinute != nowHm
+                    ) {
+                        lastTriggeredUploadMinute = nowHm
+                        log("🔗 n8n Delayed Upload Triggered at $nowHm from Folder [$folder]...")
+                        startYouTubeFolderAutoUpload(folder, oldest)
+                        triggeredFromN8nCard = true
+                        break
+                    }
+                }
+
+                if (triggeredFromN8nCard) continue
+
+                // 2. Fallback check on primary Flow Create & Folder Upload time boxes (normalized to "HH:mm")
+                val flowCreateTimeHm = normalizeTimeHm24(
+                    prefs.getString("flow_create_time_hm", prefs.getString("schedule_time_hm", "18:00")) ?: "18:00"
+                )
+                val folderUploadTimeHm = normalizeTimeHm24(
+                    prefs.getString("folder_upload_time_hm", prefs.getString("schedule_time_hm", "19:00")) ?: "19:00"
+                )
+                val runWhenIdleOnly = prefs.getBoolean("run_only_when_idle", false)
                 val isSameTimeForBoth = flowCreateTimeHm == folderUploadTimeHm
 
                 if (nowHm == flowCreateTimeHm && lastTriggeredFlowMinute != nowHm) {
@@ -1135,7 +1233,7 @@ class AutoTouchService : AccessibilityService() {
                     if (runWhenIdleOnly && flowExecMode != "BACKGROUND" && !isPhoneCurrentlyIdleOrFree()) {
                         hud.showScheduledTaskConfirmBanner(
                             taskTitle = "🎬 Flow Video Generation ($flowCreateTimeHm)",
-                            onRunNow = { startGoogleFlowToYouTubePipeline(topic, credits, uploadImmediatelyAfterCreate = isSameTimeForBoth) },
+                            onRunNow = { startGoogleFlowToYouTubePipeline(mainStoryTopic, credits, uploadImmediatelyAfterCreate = isSameTimeForBoth) },
                             onSkip10Min = {
                                 prefs.edit().putLong("snooze_until_ms", System.currentTimeMillis() + 600_000L).apply()
                                 lastTriggeredFlowMinute = ""
@@ -1145,12 +1243,12 @@ class AutoTouchService : AccessibilityService() {
                             },
                             onRunBackground = {
                                 prefs.edit().putString("flow_execution_mode", "BACKGROUND").apply()
-                                startGoogleFlowToYouTubePipeline(topic, credits, uploadImmediatelyAfterCreate = isSameTimeForBoth)
+                                startGoogleFlowToYouTubePipeline(mainStoryTopic, credits, uploadImmediatelyAfterCreate = isSameTimeForBoth)
                             }
                         )
                     } else {
                         log("⏰ Stage 1 Scheduler ($nowHm): Auto-Creating Flow Video & Saving to [$folder] (UploadNow=$isSameTimeForBoth)...")
-                        startGoogleFlowToYouTubePipeline(topic, credits, uploadImmediatelyAfterCreate = isSameTimeForBoth)
+                        startGoogleFlowToYouTubePipeline(mainStoryTopic, credits, uploadImmediatelyAfterCreate = isSameTimeForBoth)
                     }
                     continue
                 }
