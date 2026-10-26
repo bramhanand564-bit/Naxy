@@ -672,7 +672,7 @@ internal fun AutoTouchService.queryMediaStoreVideoByFolderName(
 
 /**
  * Real YouTube App Uploader:
- * Opens real YouTube app, clicks Next twice, fills Viral Title + Description, and taps Upload Short!
+ * Opens real YouTube app, clicks Next twice, fills Clean 95-Char Viral Title + Description, and taps Upload Short!
  */
 internal suspend fun AutoTouchService.uploadVideoUriToYouTubeShorts(
     videoUri: Uri,
@@ -686,9 +686,12 @@ internal suspend fun AutoTouchService.uploadVideoUriToYouTubeShorts(
         AutoTouchService.log("🧠 Applied ${recalledYouTubeRules.size} Learned Rules from Memory/YouTube!")
     }
 
+    // Ensure the Shorts Title is strictly clean, complete, and under 95 chars so no words are ever cut in half!
+    val cleanShortTitle = geminiBrain.formatCleanShortsTitle95(viralTitle, "Viral Short Video")
+
     withContext(Dispatchers.Main) {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("aura_yt_title", viralTitle))
+        cm.setPrimaryClip(ClipData.newPlainText("aura_yt_title", cleanShortTitle))
 
         StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
         val intent = Intent(Intent.ACTION_SEND).apply {
@@ -787,12 +790,8 @@ internal suspend fun AutoTouchService.uploadVideoUriToYouTubeShorts(
     currentRunSteps.add("Tapped Caption Box at ($capX, $capY)")
     delay(1500L)
 
-    val textForMainBox = if (isRegularUploadScreen) {
-        viralTitle.take(98)
-    } else {
-        val combined = "$viralTitle ${viralDescription.replace("\n", " ")}".trim()
-        combined.take(98)
-    }
+    // FIXED: Only paste the clean 95-char title into the Shorts Caption box so words are NEVER cut off at 100 chars!
+    val textForMainBox = cleanShortTitle
 
     val pastedSuccess = pasteTitleIntoYouTubeCaptionBoxCleanly(textForMainBox, specs)
     AutoTouchService.log("✍️ Title/Caption Paste Verified ($pastedSuccess): $textForMainBox")
@@ -863,7 +862,7 @@ internal suspend fun AutoTouchService.uploadVideoUriToYouTubeShorts(
     }
 
     hud.updateStatus("🎉 UPLOAD SUCCESS!", BotMood.HAPPY, taskRunning = false)
-    AutoTouchService.log("🎉 YouTube Short Uploaded Successfully: $viralTitle")
+    AutoTouchService.log("🎉 YouTube Short Uploaded Successfully: $cleanShortTitle")
 }
 
 private suspend fun AutoTouchService.pasteTitleIntoYouTubeCaptionBoxCleanly(
@@ -988,13 +987,20 @@ private suspend fun AutoTouchService.closeFlowVideoPlayerCardIfOpen(webView: Web
     }
 }
 
+private fun extractFlowVideoUuid(url: String): String {
+    val m = Regex("([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})").find(url)
+    return m?.value?.lowercase(Locale.ROOT) ?: url.substringBefore("?").takeLast(45)
+}
+
 /**
  * Google Flow Video Generation Pipeline:
  * Supports BOTH:
  * 1. 🌐 Background Browser Mode (`flow_execution_mode == "BACKGROUND"`)
  * 2. 📱 Real Chrome App Mode (`flow_execution_mode == "LIVE_PHONE"`)
- * And saves the generated MP4 into the user's chosen Folder (`custom_download_folder`),
- * then either uploads immediately OR leaves it in the folder for the scheduled Upload Time!
+ * Includes:
+ * - Episodic Story Continuation (Next Part every run)
+ * - Failed Policy Card Detection + Auto-Trash + Safe Prompt Auto-Retry
+ * - Duplicate Old Video Guard (NEVER downloads or uploads an old video card!)
  */
 fun AutoTouchService.startGoogleFlowToYouTubePipeline(
     topic: String,
@@ -1012,13 +1018,14 @@ fun AutoTouchService.startGoogleFlowToYouTubePipeline(
             acquireWakeLock()
             val targetUrl = prefs.getString("saved_flow_url", "https://labs.google/fx/tools/flow")
                 ?: "https://labs.google/fx/tools/flow"
-            val isStoryMode = prefs.getBoolean("flow_story_mode", false)
+            val isStoryMode = prefs.getBoolean("flow_story_mode", true)
             val flowExecMode = prefs.getString("flow_execution_mode", "BACKGROUND") ?: "BACKGROUND"
             val customDescNote = prefs.getString("custom_video_description", "") ?: ""
+            val alreadyDownloadedIds = prefs.getStringSet("downloaded_flow_video_ids", emptySet())?.toMutableSet() ?: mutableSetOf()
 
             for (vidIndex in 1..maxVideosToCreate.coerceIn(1, 3)) {
                 if (!isAgentRunning) break
-                hud.updateStatus("Flow #$vidIndex: Creating Prompt...", BotMood.THINKING, taskRunning = true)
+                hud.updateStatus("Flow #$vidIndex: Creating Story Prompt...", BotMood.THINKING, taskRunning = true)
 
                 val effectiveTopic = if (isStoryMode && maxVideosToCreate > 1) {
                     "$topic (Story Part $vidIndex of $maxVideosToCreate, continuous cinematic scene)"
@@ -1027,16 +1034,19 @@ fun AutoTouchService.startGoogleFlowToYouTubePipeline(
                 }
 
                 prefs.edit().putString("last_flow_generated_topic", effectiveTopic).apply()
-                val meta = geminiBrain.generateFlowPromptTitleAndDescription(effectiveTopic, customDescNote)
-                val safePrompt = meta.videoPrompt
+                val meta = geminiBrain.generateFlowPromptTitleAndDescription(
+                    topic = effectiveTopic,
+                    customDescriptionNote = customDescNote,
+                    forceEpisodicContinuation = isStoryMode
+                )
+                var currentSafePrompt = meta.videoPrompt
                 val viralTitle = meta.viralTitle
                 val viralDescription = meta.viralDescription
 
-                AutoTouchService.log("🎬 Flow Prompt [$flowExecMode]: $safePrompt")
-
                 // MODE B: Real Phone Chrome App Mode!
                 if (flowExecMode == "LIVE_PHONE") {
-                    val chromeFile = generateFlowVideoViaRealChromeApp(targetUrl, safePrompt)
+                    AutoTouchService.log("🎬 Flow Prompt [LIVE_PHONE]: $currentSafePrompt")
+                    val chromeFile = generateFlowVideoViaRealChromeApp(targetUrl, currentSafePrompt)
                     if (chromeFile != null && chromeFile.exists()) {
                         AutoTouchService.log("✅ Saved Flow Video from Real Chrome to Folder: ${chromeFile.absolutePath}")
                         if (uploadImmediatelyAfterCreate) {
@@ -1053,134 +1063,181 @@ fun AutoTouchService.startGoogleFlowToYouTubePipeline(
                     continue
                 }
 
-                // MODE A: Background Browser Mode (Viewable anytime by tapping the Bot Emoji!)
+                // MODE A: Background Browser Mode with Auto-Retry on Policy Failure!
                 val webView = hud.getOrCreateBackgroundWebView()
                 if (webView == null) {
                     AutoTouchService.log("⚠️ WebView not ready.")
                     break
                 }
 
-                closeFlowVideoPlayerCardIfOpen(webView)
-                val initialVideoUrl = extractExistingVideoUrlOnly(webView)
-
-                withContext(Dispatchers.Main) {
-                    val curUrl = webView.url ?: ""
-                    if (!curUrl.contains("flow.google") && !curUrl.contains("labs.google")) {
-                        webView.loadUrl(targetUrl)
-                    }
-                }
-                delay(3800L)
-
-                for (prepTick in 1..18) {
-                    if (!isAgentRunning) break
-                    val stepResult = runFlowComposerStateMachineStep(webView, safePrompt)
-                    AutoTouchService.log("🌐 Flow Background Step #$prepTick -> $stepResult")
-
-                    when {
-                        stepResult == "BACK_FROM_PLAYER" -> {
-                            dispatchInternalWebViewTouch(webView, 32f, 42f)
-                            delay(2200L)
-                        }
-                        stepResult.startsWith("CLICKED_NEW_PROJECT:") -> {
-                            hud.updateStatus("Flow: Opening + New Project...", BotMood.WORKING, taskRunning = true)
-                            val coords = stepResult.substringAfter(":").split(",")
-                            if (coords.size == 2) {
-                                dispatchInternalWebViewTouch(
-                                    webView,
-                                    coords[0].toFloatOrNull() ?: 170f,
-                                    coords[1].toFloatOrNull() ?: 480f
-                                )
-                            }
-                            delay(3500L)
-                        }
-                        stepResult.startsWith("SWITCHING_TO_VIDEO_MODE:") -> {
-                            hud.updateStatus("Flow: Switching to 9:16 Video Mode...", BotMood.WORKING, taskRunning = true)
-                            val coords = stepResult.substringAfter(":").split(",")
-                            if (coords.size == 2) {
-                                dispatchInternalWebViewTouch(
-                                    webView,
-                                    coords[0].toFloatOrNull() ?: 200f,
-                                    coords[1].toFloatOrNull() ?: 520f
-                                )
-                            }
-                            delay(2200L)
-                        }
-                        stepResult.startsWith("SUBMITTED:") -> {
-                            hud.updateStatus("Flow: Submitting 8s Prompt...", BotMood.WORKING, taskRunning = true)
-                            val coords = stepResult.substringAfter(":").split(",")
-                            if (coords.size == 2) {
-                                delay(450L)
-                                dispatchInternalWebViewTouch(
-                                    webView,
-                                    coords[0].toFloatOrNull() ?: 295f,
-                                    coords[1].toFloatOrNull() ?: 540f
-                                )
-                            }
-                            AutoTouchService.log("✅ Flow Prompt Injected & Submit Arrow Clicked!")
-                            break
-                        }
-                        else -> {
-                            hud.updateStatus("Flow: Preparing Editor ($prepTick)...", BotMood.THINKING, taskRunning = true)
-                            delay(2500L)
-                        }
-                    }
-                }
-
                 var downloadedVideoFile: File? = null
-                var sawGeneratingProgress = false
-                var ticksAfterProgressFinished = 0
 
-                for (waitTick in 1..60) {
+                for (policyRetryAttempt in 0..1) {
                     if (!isAgentRunning) break
-                    delay(3800L)
 
-                    val shouldClickCardNow = (sawGeneratingProgress && ticksAfterProgressFinished >= 1) || waitTick >= 12
-                    val pollRes = pollOrOpenGeneratedFlowVideo(
-                        webView = webView,
-                        initialVideoUrl = initialVideoUrl,
-                        allowAutoClickCard = shouldClickCardNow
-                    )
+                    AutoTouchService.log("🎬 Flow Prompt [BACKGROUND${if (policyRetryAttempt > 0) " RETRY #$policyRetryAttempt" else ""}]: $currentSafePrompt")
 
-                    when {
-                        pollRes.startsWith("VIDEO_URL:") -> {
-                            val videoUrl = pollRes.removePrefix("VIDEO_URL:").trim()
-                            hud.updateStatus("📥 Saving MP4 to Folder...", BotMood.WORKING, taskRunning = true)
-                            AutoTouchService.log("📥 Found Generated MP4 Stream: ${videoUrl.take(70)}...")
-                            downloadedVideoFile = downloadVideoFromUrlToStorage(videoUrl, "flow_${System.currentTimeMillis()}.mp4")
-                            if (downloadedVideoFile != null) {
-                                closeFlowVideoPlayerCardIfOpen(webView)
+                    closeFlowVideoPlayerCardIfOpen(webView)
+                    clearAnyFailedFlowCardsFromGrid(webView)
+                    val initialVideoUrl = extractExistingVideoUrlOnly(webView)
+                    if (initialVideoUrl.isNotBlank()) {
+                        alreadyDownloadedIds.add(extractFlowVideoUuid(initialVideoUrl))
+                    }
+
+                    withContext(Dispatchers.Main) {
+                        val curUrl = webView.url ?: ""
+                        if (!curUrl.contains("flow.google") && !curUrl.contains("labs.google")) {
+                            webView.loadUrl(targetUrl)
+                        }
+                    }
+                    delay(3500L)
+
+                    for (prepTick in 1..18) {
+                        if (!isAgentRunning) break
+                        val stepResult = runFlowComposerStateMachineStep(webView, currentSafePrompt)
+                        AutoTouchService.log("🌐 Flow Background Step #$prepTick -> $stepResult")
+
+                        when {
+                            stepResult == "BACK_FROM_PLAYER" -> {
+                                dispatchInternalWebViewTouch(webView, 32f, 42f)
+                                delay(2200L)
+                            }
+                            stepResult.startsWith("CLICKED_NEW_PROJECT:") -> {
+                                hud.updateStatus("Flow: Opening + New Project...", BotMood.WORKING, taskRunning = true)
+                                val coords = stepResult.substringAfter(":").split(",")
+                                if (coords.size == 2) {
+                                    dispatchInternalWebViewTouch(
+                                        webView,
+                                        coords[0].toFloatOrNull() ?: 170f,
+                                        coords[1].toFloatOrNull() ?: 480f
+                                    )
+                                }
+                                delay(3500L)
+                            }
+                            stepResult.startsWith("SWITCHING_TO_VIDEO_MODE:") -> {
+                                hud.updateStatus("Flow: Switching to 9:16 Video Mode...", BotMood.WORKING, taskRunning = true)
+                                val coords = stepResult.substringAfter(":").split(",")
+                                if (coords.size == 2) {
+                                    dispatchInternalWebViewTouch(
+                                        webView,
+                                        coords[0].toFloatOrNull() ?: 200f,
+                                        coords[1].toFloatOrNull() ?: 520f
+                                    )
+                                }
+                                delay(2200L)
+                            }
+                            stepResult.startsWith("SUBMITTED:") -> {
+                                hud.updateStatus("Flow: Submitting Prompt...", BotMood.WORKING, taskRunning = true)
+                                val coords = stepResult.substringAfter(":").split(",")
+                                if (coords.size == 2) {
+                                    delay(450L)
+                                    dispatchInternalWebViewTouch(
+                                        webView,
+                                        coords[0].toFloatOrNull() ?: 295f,
+                                        coords[1].toFloatOrNull() ?: 540f
+                                    )
+                                }
+                                AutoTouchService.log("✅ Flow Prompt Injected & Submit Arrow Clicked!")
                                 break
                             }
-                        }
-                        pollRes.startsWith("PROGRESS:") -> {
-                            val pct = pollRes.removePrefix("PROGRESS:")
-                            sawGeneratingProgress = true
-                            ticksAfterProgressFinished = 0
-                            hud.updateStatus("⏳ Flow Generating ($pct)...", BotMood.THINKING, taskRunning = true)
-                            AutoTouchService.log("⏳ Flow Video Progress: $pct")
-                        }
-                        pollRes.startsWith("CLICKED_CARD:") -> {
-                            ticksAfterProgressFinished++
-                            val coords = pollRes.removePrefix("CLICKED_CARD:").split(",")
-                            hud.updateStatus("🎬 Opening Generated Video Card...", BotMood.WORKING, taskRunning = true)
-                            AutoTouchService.log("👆 Auto-Opening Finished Video Card at CSS ($pollRes)!")
-                            if (coords.size == 2) {
-                                val cx = coords[0].toFloatOrNull() ?: 88f
-                                val cy = coords[1].toFloatOrNull() ?: 215f
-                                dispatchInternalWebViewTouch(webView, cx, cy)
+                            else -> {
+                                hud.updateStatus("Flow: Preparing Editor ($prepTick)...", BotMood.THINKING, taskRunning = true)
+                                delay(2500L)
                             }
                         }
-                        else -> {
-                            if (sawGeneratingProgress) {
+                    }
+
+                    var sawGeneratingProgress = false
+                    var lastSeenProgressNum = 0
+                    var ticksAfterProgressFinished = 0
+                    var promptFailedPolicy = false
+
+                    for (waitTick in 1..60) {
+                        if (!isAgentRunning) break
+                        delay(3800L)
+
+                        val shouldClickCardNow = (sawGeneratingProgress && ticksAfterProgressFinished >= 1) || waitTick >= 15
+                        val pollRes = pollOrOpenGeneratedFlowVideo(
+                            webView = webView,
+                            initialVideoUrl = initialVideoUrl,
+                            alreadyDownloadedUuidsCsv = alreadyDownloadedIds.joinToString(","),
+                            allowAutoClickCard = shouldClickCardNow
+                        )
+
+                        when {
+                            pollRes.startsWith("FLOW_PROMPT_FAILED:") -> {
+                                val reason = pollRes.removePrefix("FLOW_PROMPT_FAILED:")
+                                AutoTouchService.log("⚠️ Google Flow Prompt Failed ($reason)! Never clicking old video -> Deleting failed card & retrying with Safe Prompt...")
+                                hud.updateStatus("⚠️ Flow Policy Filter -> Retrying Safe Prompt...", BotMood.THINKING, taskRunning = true)
+                                clearAnyFailedFlowCardsFromGrid(webView)
+                                delay(1800L)
+                                promptFailedPolicy = true
+                                break
+                            }
+                            pollRes.startsWith("VIDEO_URL:") -> {
+                                val videoUrl = pollRes.removePrefix("VIDEO_URL:").trim()
+                                val vidUuid = extractFlowVideoUuid(videoUrl)
+                                if (alreadyDownloadedIds.contains(vidUuid)) {
+                                    AutoTouchService.log("⏭️ Ignoring already-downloaded old video ($vidUuid) -> Returning to grid...")
+                                    closeFlowVideoPlayerCardIfOpen(webView)
+                                    continue
+                                }
+                                hud.updateStatus("📥 Saving New MP4 to Folder...", BotMood.WORKING, taskRunning = true)
+                                AutoTouchService.log("📥 Found Newly Generated MP4 Stream: ${videoUrl.take(70)}...")
+                                downloadedVideoFile = downloadVideoFromUrlToStorage(videoUrl, "flow_${System.currentTimeMillis()}.mp4")
+                                if (downloadedVideoFile != null) {
+                                    alreadyDownloadedIds.add(vidUuid)
+                                    prefs.edit().putStringSet("downloaded_flow_video_ids", alreadyDownloadedIds).apply()
+                                    closeFlowVideoPlayerCardIfOpen(webView)
+                                    break
+                                }
+                            }
+                            pollRes.startsWith("PROGRESS:") -> {
+                                val pct = pollRes.removePrefix("PROGRESS:")
+                                sawGeneratingProgress = true
+                                lastSeenProgressNum = pct.removeSuffix("%").toIntOrNull() ?: lastSeenProgressNum
+                                ticksAfterProgressFinished = 0
+                                hud.updateStatus("⏳ Flow Generating ($pct)...", BotMood.THINKING, taskRunning = true)
+                                AutoTouchService.log("⏳ Flow Video Progress: $pct")
+                            }
+                            pollRes.startsWith("CLICKED_CARD:") -> {
                                 ticksAfterProgressFinished++
+                                val coords = pollRes.removePrefix("CLICKED_CARD:").split(",")
+                                hud.updateStatus("🎬 Opening New Video Card...", BotMood.WORKING, taskRunning = true)
+                                AutoTouchService.log("👆 Auto-Opening Finished Top-Left Video Card at CSS ($pollRes)!")
+                                if (coords.size == 2) {
+                                    val cx = coords[0].toFloatOrNull() ?: 88f
+                                    val cy = coords[1].toFloatOrNull() ?: 215f
+                                    dispatchInternalWebViewTouch(webView, cx, cy)
+                                }
                             }
-                            hud.updateStatus("⏳ Generating 8s Video (${waitTick * 4}s)...", BotMood.THINKING, taskRunning = true)
+                            else -> {
+                                if (sawGeneratingProgress) {
+                                    ticksAfterProgressFinished++
+                                }
+                                hud.updateStatus("⏳ Generating Video (${waitTick * 4}s)...", BotMood.THINKING, taskRunning = true)
+                            }
                         }
+                    }
+
+                    if (downloadedVideoFile != null && downloadedVideoFile.exists()) {
+                        break
+                    }
+
+                    if (promptFailedPolicy && policyRetryAttempt == 0) {
+                        currentSafePrompt = geminiBrain.rewriteFailedFlowPromptSafe(
+                            originalTopic = effectiveTopic,
+                            failedPrompt = currentSafePrompt,
+                            attempt = 1
+                        )
+                        continue
+                    } else {
+                        break
                     }
                 }
 
                 if (downloadedVideoFile != null && downloadedVideoFile.exists()) {
-                    AutoTouchService.log("✅ Saved 8s Video to Folder: ${downloadedVideoFile.absolutePath}")
+                    AutoTouchService.log("✅ Saved New Video to Folder: ${downloadedVideoFile.absolutePath}")
                     if (uploadImmediatelyAfterCreate) {
                         hideWebPreviewCardIfOpen()
                         dispatchVideoToLinkedPlatforms(Uri.fromFile(downloadedVideoFile), viralTitle, viralDescription)
@@ -1191,8 +1248,8 @@ fun AutoTouchService.startGoogleFlowToYouTubePipeline(
                         AutoTouchService.log("📥 Video saved in [${downloadedVideoFile.absolutePath}]. Will auto-upload at $upTime with Title & Description!")
                     }
                 } else {
-                    AutoTouchService.log("⚠️ Could not auto-catch MP4 stream; tap Bot Emoji to check Google Flow login.")
-                    hud.updateStatus("Tap Emoji to Check Flow Login", BotMood.ERROR, taskRunning = false)
+                    AutoTouchService.log("⚠️ Video generation did not complete or was blocked by Flow policy.")
+                    hud.updateStatus("Flow Generation Skipped/Failed", BotMood.ERROR, taskRunning = false)
                 }
             }
         } catch (_: CancellationException) {
@@ -1200,6 +1257,41 @@ fun AutoTouchService.startGoogleFlowToYouTubePipeline(
         } finally {
             isAgentRunning = false
             releaseWakeLock()
+        }
+    }
+}
+
+/**
+ * Deletes any "Failed: This prompt might violate our policies..." card from the Google Flow grid
+ * so it never blocks the top-left slot!
+ */
+private suspend fun AutoTouchService.clearAnyFailedFlowCardsFromGrid(webView: WebView) {
+    val jsClean = """
+        (function() {
+            const allNodes = Array.from(document.querySelectorAll('div, section, article'));
+            const failedCard = allNodes.find(el => {
+                const t = (el.innerText || '');
+                const r = el.getBoundingClientRect();
+                return r.width > 60 && r.width < 260 && r.height > 80 && r.top >= 70 && r.top <= 420 &&
+                    (t.includes('Failed') || t.includes('violate our policies') || t.includes('different prompt'));
+            });
+            if (failedCard) {
+                const btns = Array.from(failedCard.querySelectorAll('button, [role="button"]'));
+                const delBtn = btns.find(b => {
+                    const html = (b.innerHTML || b.innerText || b.getAttribute('aria-label') || '').toLowerCase();
+                    return html.includes('delete') || html.includes('trash') || html.includes('remove') || btns.indexOf(b) === btns.length - 1;
+                });
+                if (delBtn) {
+                    delBtn.click();
+                    return 'DELETED_FAILED_CARD';
+                }
+            }
+            return 'NONE';
+        })();
+    """.trimIndent()
+    suspendCancellableCoroutine<Unit> { cont ->
+        withContextOrMain(webView, jsClean) {
+            cont.resume(Unit)
         }
     }
 }
@@ -1452,13 +1544,30 @@ private suspend fun AutoTouchService.extractExistingVideoUrlOnly(webView: WebVie
         }
     }
 
+/**
+ * Polls Google Flow for:
+ * 1. Progress % ("PROGRESS:15%")
+ * 2. Policy / Generation Failure ("FLOW_PROMPT_FAILED:Policy Violation") -> auto-deletes failed card & NEVER clicks old card!
+ * 3. Newly generated video card strictly in the NEWEST top-left slot (left <= 165) that is NOT in alreadyDownloadedUuidsCsv!
+ */
 private suspend fun AutoTouchService.pollOrOpenGeneratedFlowVideo(
     webView: WebView,
     initialVideoUrl: String,
+    alreadyDownloadedUuidsCsv: String,
     allowAutoClickCard: Boolean
 ): String = suspendCancellableCoroutine { cont ->
     val js = """
         (function() {
+            const seenIds = (${JSONObject.quote(alreadyDownloadedUuidsCsv)} || '').toLowerCase().split(',').filter(Boolean);
+            function isOldSeenUrl(url) {
+                if (!url) return false;
+                const low = url.toLowerCase();
+                for (const id of seenIds) {
+                    if (id.length > 6 && low.includes(id)) return true;
+                }
+                return false;
+            }
+
             function fireFullHumanClickAt(cx, cy, extraEl) {
                 const hitEl = document.elementFromPoint(cx, cy) || extraEl;
                 const targets = [];
@@ -1505,19 +1614,16 @@ private suspend fun AutoTouchService.pollOrOpenGeneratedFlowVideo(
                 }
             }
 
+            // 1. Check if a NEW <video> element is playing/loaded that is NOT an old seen video
             const vids = Array.from(document.querySelectorAll('video'));
             for (const v of vids) {
                 const src = v.src || (v.querySelector('source') ? v.querySelector('source').src : '');
-                if (src && src.startsWith('http') && src !== ${JSONObject.quote(initialVideoUrl)}) {
+                if (src && src.startsWith('http') && src !== ${JSONObject.quote(initialVideoUrl)} && !isOldSeenUrl(src)) {
                     return 'VIDEO_URL:' + src;
                 }
             }
-            if ($allowAutoClickCard && vids.length > 0) {
-                const v0 = vids[0];
-                const s0 = v0.src || (v0.querySelector('source') ? v0.querySelector('source').src : '');
-                if (s0 && s0.startsWith('http')) return 'VIDEO_URL:' + s0;
-            }
 
+            // 2. Check if active generation % is still running
             const allEls = Array.from(document.querySelectorAll('div, span, p'));
             for (const el of allEls) {
                 if (el.children.length === 0) {
@@ -1531,27 +1637,28 @@ private suspend fun AutoTouchService.pollOrOpenGeneratedFlowVideo(
                 }
             }
 
+            // 3. CRITICAL: Detect if Google Flow showed "Failed / violate our policies" on the top-left card!
+            const pageText = document.body ? (document.body.innerText || '') : '';
+            if (pageText.includes('Failed') && (pageText.includes('violate our policies') || pageText.includes('different prompt') || pageText.includes('prominent people'))) {
+                return 'FLOW_PROMPT_FAILED:Prominent People Policy';
+            }
+
+            // 4. Only click the TOP-LEFT newest card (left <= 165) so we NEVER click the second column's old video (x=215)!
             if ($allowAutoClickCard) {
-                const gridImgs = Array.from(document.querySelectorAll('img, canvas')).filter(el => {
+                const topLeftMedia = Array.from(document.querySelectorAll('img, canvas, video')).filter(el => {
                     const r = el.getBoundingClientRect();
-                    return r.top >= 90 && r.top <= 340 && r.left >= 5 && r.left <= 180 && r.width >= 55 && r.height >= 75;
+                    return r.top >= 85 && r.top <= 350 && r.left >= 4 && r.left <= 165 && r.width >= 50 && r.height >= 70;
                 });
 
-                if (gridImgs.length > 0) {
-                    const imgEl = gridImgs[0];
+                if (topLeftMedia.length > 0) {
+                    const imgEl = topLeftMedia[0];
                     const r = imgEl.getBoundingClientRect();
                     const cx = Math.round(r.left + r.width * 0.5);
                     const cy = Math.round(r.top + r.height * 0.5);
                     fireFullHumanClickAt(cx, cy, imgEl);
                     fireFullHumanClickAt(Math.round(r.left + 22), Math.round(r.top + 22), imgEl.parentElement);
-                    fireFullHumanClickAt(cx, Math.round(r.bottom - 16), imgEl.parentElement);
                     return 'CLICKED_CARD:' + cx + ',' + cy;
                 }
-
-                const fallbackX = Math.round(window.innerWidth * 0.27);
-                const fallbackY = 215;
-                fireFullHumanClickAt(fallbackX, fallbackY, null);
-                return 'CLICKED_CARD:' + fallbackX + ',' + fallbackY;
             }
 
             return 'WAITING';
