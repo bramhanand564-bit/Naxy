@@ -3,6 +3,7 @@ package com.auradroid.os
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.annotation.SuppressLint
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -14,6 +15,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -82,6 +84,7 @@ class AutoTouchService : AccessibilityService() {
     internal var currentTaskJob: Job? = null
     private var schedulerJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var screenWakeLock: PowerManager.WakeLock? = null
 
     lateinit var hud: AiOverlayHud
     lateinit var memoryVault: MemoryVault
@@ -93,7 +96,13 @@ class AutoTouchService : AccessibilityService() {
     internal var currentAppCategory = "General"
     internal var lastStepScreenshot: Bitmap? = null
     internal var lastAgentTapTimestamp = 0L
+
+    // Universal Human Presence & Dynamic Activity Tracking State
     private var lastUserScreenInteractionTimeMs = System.currentTimeMillis()
+    private var lastDynamicScreenChangeMs = 0L
+    private var contentChangeWindowStartMs = 0L
+    private var contentChangeCountInWindow = 0
+
     private var lastScreenshotTimestamp = 0L
     private var lastAiCallTimestamp = 0L
     private var consecutiveSameScreenCount = 0
@@ -188,6 +197,34 @@ class AutoTouchService : AccessibilityService() {
         try {
             if (wakeLock?.isHeld == true) wakeLock?.release()
         } catch (_: Exception) {}
+        try {
+            if (screenWakeLock?.isHeld == true) screenWakeLock?.release()
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * FEATURE 5: Wake Up Screen If Timed Out (Off) & Verify Unlock State for Live Phone UI Tasks.
+     * Returns true if the display is awake and unlocked (no PIN/Pattern Keyguard blocking UI gestures).
+     */
+    @Suppress("DEPRECATION")
+    fun wakeUpScreenIfTimedOut(): Boolean {
+        return try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+
+            if (!pm.isInteractive) {
+                log("💡 Screen is timed out (OFF) -> Waking up display for Live UI task...")
+                val flags = PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
+                    PowerManager.ACQUIRE_CAUSES_WAKEUP or
+                    PowerManager.ON_AFTER_RELEASE
+                screenWakeLock = pm.newWakeLock(flags, "AuraDroidOS::ScreenWakeUpLock")
+                screenWakeLock?.acquire(15_000L)
+            }
+
+            !km.isKeyguardLocked
+        } catch (_: Exception) {
+            true
+        }
     }
 
     fun getCalibratedDeviceBodySpecs(): DeviceBodySpecs {
@@ -227,12 +264,91 @@ class AutoTouchService : AccessibilityService() {
         )
     }
 
-    fun isPhoneCurrentlyIdleOrFree(): Boolean {
+    /**
+     * FEATURE 4 (Part 1): Universal Screen & Human Activity Tracker (Zero App Hardcoding!).
+     * Tracks physical touches/scrolls/typing AND rolling window content changes (videos, live charts, navigation, games).
+     */
+    internal fun trackUniversalScreenActivity(event: AccessibilityEvent) {
+        val now = System.currentTimeMillis()
+        val timeSinceAgentTap = now - lastAgentTapTimestamp
+        if (timeSinceAgentTap <= 1500L) return
+
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_VIEW_CLICKED,
+            AccessibilityEvent.TYPE_VIEW_SCROLLED,
+            AccessibilityEvent.TYPE_TOUCH_INTERACTION_START,
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
+            AccessibilityEvent.TYPE_GESTURE_DETECTION_START -> {
+                lastUserScreenInteractionTimeMs = now
+            }
+
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                val pkg = event.packageName?.toString() ?: ""
+                if (pkg.isNotEmpty() && pkg != packageName && pkg != "com.android.systemui") {
+                    if (now - contentChangeWindowStartMs > 10_000L) {
+                        contentChangeWindowStartMs = now
+                        contentChangeCountInWindow = 1
+                    } else {
+                        contentChangeCountInWindow++
+                    }
+                    // >= 12 content updates within 10s indicates active video playback, live charts, captions, or animations
+                    if (contentChangeCountInWindow >= 12) {
+                        lastDynamicScreenChangeMs = now
+                    }
+                }
+            }
+            else -> {}
+        }
+    }
+
+    /**
+     * FEATURE 4 (Part 2): 100% Universal Human Presence & Activity Detector using 7 OS & Hardware Signals!
+     * Zero hardcoded app names — works across every video player, PDF reader, trading app, browser, call, or game.
+     */
+    fun isPhoneCurrentlyIdleOrFree(requiredIdleSeconds: Int = 120): Boolean {
         return try {
+            val now = System.currentTimeMillis()
+
+            // Signal 1 (Audio / Call / Mic Guard): User is on a call, VoIP meeting, or watching/listening to media
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (am.mode != AudioManager.MODE_NORMAL || am.isMusicActive) {
+                return false
+            }
+
+            // Signal 2 (Screen Off / Timeout = 100% Free): Screen timed out (after 2m or 30m) and no audio/call active
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            if (!pm.isInteractive) return true
-            val idleMs = System.currentTimeMillis() - lastUserScreenInteractionTimeMs
-            idleMs >= 90_000L
+            if (!pm.isInteractive) {
+                return true
+            }
+
+            // Signal 3 (2-Minute Human Touch Rule): User touched, scrolled, or typed within requiredIdleSeconds (default 120s)
+            val requiredIdleMs = requiredIdleSeconds.coerceAtLeast(30) * 1000L
+            val timeSinceLastTouchMs = now - lastUserScreenInteractionTimeMs
+            if (timeSinceLastTouchMs < requiredIdleMs) {
+                return false
+            }
+
+            // Signal 4 (Landscape Full-Screen Guard): Phone is held horizontally for movies, PDF reading, charts, or gaming
+            val specs = getCalibratedDeviceBodySpecs()
+            if (specs.screenWidth > specs.screenHeight) {
+                return false
+            }
+
+            // Signal 5 (Home Screen Launcher Check): Left untouched on Home Launcher or AuraDroid OS for >= 2 minutes
+            val homeIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            val homePkg = packageManager.resolveActivity(homeIntent, 0)?.activityInfo?.packageName ?: ""
+            val activePkg = rootInActiveWindow?.packageName?.toString() ?: ""
+            if (activePkg == packageName || (homePkg.isNotEmpty() && activePkg == homePkg)) {
+                return true
+            }
+
+            // Signal 6 (Live Dynamic Content Guard): Third-party app screen is actively updating/animating without touch
+            if (now - lastDynamicScreenChangeMs < 25_000L) {
+                return false
+            }
+
+            // Signal 7 (Static Screen Abandonment Fallback): Completely static app screen with 0 touch, 0 audio, 0 animation for >= 3.5 min
+            timeSinceLastTouchMs >= 210_000L
         } catch (_: Exception) {
             false
         }
@@ -240,19 +356,15 @@ class AutoTouchService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+
+        // Track universal human touch & live screen activity first
+        trackUniversalScreenActivity(event)
+
         val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
         val teachEnabled = prefs.getBoolean("passive_teach_mode", true)
-
         val timeSinceAgentTap = System.currentTimeMillis() - lastAgentTapTimestamp
-        if (timeSinceAgentTap > 1400L &&
-            (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED ||
-                event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED ||
-                event.eventType == AccessibilityEvent.TYPE_TOUCH_INTERACTION_START)
-        ) {
-            lastUserScreenInteractionTimeMs = System.currentTimeMillis()
-        }
 
-        if (teachEnabled && isAgentRunning && timeSinceAgentTap > 1400L &&
+        if (teachEnabled && isAgentRunning && timeSinceAgentTap > 1500L &&
             event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED
         ) {
             val pkg = event.packageName?.toString() ?: ""
@@ -596,6 +708,10 @@ class AutoTouchService : AccessibilityService() {
                     finalizeRunAndTriggerAutoReflection("SUCCESS")
                     return@launch
                 }
+
+                // FEATURE 5: Wake up screen if timed out before starting Live Phone UI task
+                wakeUpScreenIfTimedOut()
+                delay(600L)
 
                 val lowerGoal = goal.lowercase(Locale.ROOT)
                 val autoTargetApp = when {
@@ -950,6 +1066,7 @@ class AutoTouchService : AccessibilityService() {
     }
 
     internal suspend fun runBackgroundWebAgentLoop(goal: String, plannedSteps: List<String>) {
+        acquireWakeLock()
         val webView = hud.getOrCreateBackgroundWebView() ?: return
         val specs = getCalibratedDeviceBodySpecs()
         val history = mutableListOf<String>()
@@ -1071,16 +1188,34 @@ class AutoTouchService : AccessibilityService() {
     }
 
     /**
-     * 24/7 Multi-Time n8n Workflow & Dual-Stage Scheduler Loop:
-     * Checks every 10 seconds, normalizes all times to strict 24-Hr "HH:mm" (so "3:36" == "03:36"),
-     * and executes every enabled n8n Time Workflow Card + Main Schedule on the exact minute!
+     * FEATURE 6 (Part 1): Missed Scheduled Task Auto-Catchup Helper.
+     * Returns true if targetHm is reached OR passed earlier today and has not yet completed today!
+     */
+    private fun isTimeReachedOrMissedToday(
+        nowHm: String,
+        targetHm: String,
+        lastRunKey: String,
+        todayStr: String
+    ): Boolean {
+        if (targetHm.isBlank()) return false
+        if (lastRunKey.startsWith(todayStr)) return false
+        return nowHm >= targetHm
+    }
+
+    /**
+     * FEATURE 6 (Part 2): 24/7 Multi-Time n8n Workflow & Dual-Stage Scheduler Loop with Missed Task Auto-Catchup!
+     * Checks every 10 seconds, normalizes all times to strict 24-Hr "HH:mm" (so "7:00" == "07:00"),
+     * works while screen is OFF, and if the user is busy or screen is PIN-locked at the scheduled minute,
+     * automatically queues and executes the missed task as soon as the phone becomes idle/unlocked!
      */
     private fun startDailySchedulerLoop() {
         schedulerJob?.cancel()
         schedulerJob = serviceScope.launch {
-            var lastTriggeredFlowMinute = ""
-            var lastTriggeredUploadMinute = ""
+            var lastTriggeredFlowDate = ""
+            var lastTriggeredUploadDate = ""
             var lastNightReportDay = ""
+            var lastWaitLogMinute = ""
+
             while (isActive) {
                 delay(10_000L)
                 val prefs = getSharedPreferences("auradroid_prefs", Context.MODE_PRIVATE)
@@ -1091,7 +1226,19 @@ class AutoTouchService : AccessibilityService() {
                 if (nowMs < snoozeUntil) continue
 
                 val pendingIdleGoal = prefs.getString("pending_idle_goal", "") ?: ""
-                if (pendingIdleGoal.isNotBlank() && isPhoneCurrentlyIdleOrFree()) {
+                if (pendingIdleGoal.isNotBlank() && isPhoneCurrentlyIdleOrFree(120)) {
+                    val flowExecMode = prefs.getString("flow_execution_mode", "BACKGROUND") ?: "BACKGROUND"
+                    val bgUpload = prefs.getBoolean("bg_youtube_upload", false) && !prefs.getBoolean("insta_link_enabled", false)
+                    val needsLiveUi = when (pendingIdleGoal) {
+                        "FLOW_CREATE_ONLY" -> flowExecMode != "BACKGROUND"
+                        "FOLDER_UPLOAD_ONLY" -> !bgUpload
+                        else -> true
+                    }
+
+                    if (needsLiveUi && !wakeUpScreenIfTimedOut()) {
+                        continue
+                    }
+
                     prefs.edit().remove("pending_idle_goal").apply()
                     log("🌙 Phone is now Free/Idle -> Auto-starting queued task: $pendingIdleGoal")
                     if (pendingIdleGoal == "FLOW_CREATE_ONLY") {
@@ -1115,6 +1262,14 @@ class AutoTouchService : AccessibilityService() {
                 val todayStr = java.text.SimpleDateFormat("dd_MMM", Locale.US).format(java.util.Date())
                 val todayMinuteKey = "${todayStr}_$nowHm"
 
+                // Sync persisted run keys so service restarts don't re-run already completed tasks today
+                if (lastTriggeredFlowDate.isEmpty()) {
+                    lastTriggeredFlowDate = prefs.getString("last_flow_run_date_key", "") ?: ""
+                }
+                if (lastTriggeredUploadDate.isEmpty()) {
+                    lastTriggeredUploadDate = prefs.getString("last_upload_run_date_key", "") ?: ""
+                }
+
                 if (nowHm == "22:00" && lastNightReportDay != todayStr) {
                     lastNightReportDay = todayStr
                     val dailyStatus = prefs.getString("last_daily_action_log", "आज के सभी सिस्टम रेडी हैं!")
@@ -1127,10 +1282,13 @@ class AutoTouchService : AccessibilityService() {
                 val folder = prefs.getString("yt_folder_path", prefs.getString("custom_download_folder", defaultDir)) ?: defaultDir
                 val oldest = prefs.getBoolean("yt_pick_oldest", true)
                 val credits = prefs.getInt("flow_daily_videos", 1).coerceIn(1, 5)
-                val mainStoryTopic = prefs.getString("flow_topic", "Young Indian fashion designer story")
-                    ?: "Young Indian fashion designer story"
+                val mainStoryTopic = prefs.getString("flow_topic", "Indian family space survival adventure")
+                    ?: "Indian family space survival adventure"
+                val flowExecMode = prefs.getString("flow_execution_mode", "BACKGROUND") ?: "BACKGROUND"
+                val bgUploadEnabled = prefs.getBoolean("bg_youtube_upload", false)
+                val runWhenIdleOnly = prefs.getBoolean("run_only_when_idle", false)
 
-                // 1. Check all enabled n8n Multi-Time Workflow Cards!
+                // 1. Check all enabled n8n Multi-Time Workflow Cards (including missed tasks from earlier today!)
                 val workflows = loadN8nWorkflowsFromPrefs(prefs)
                 var triggeredFromN8nCard = false
 
@@ -1143,9 +1301,47 @@ class AutoTouchService : AccessibilityService() {
                         wfTriggerHm
                     }
 
-                    if (nowHm == wfTriggerHm && wf.lastRunMinuteKey != todayMinuteKey) {
+                    if (isTimeReachedOrMissedToday(nowHm, wfTriggerHm, wf.lastRunMinuteKey, todayStr)) {
+                        val uploadImmediately = when (wf.targetActionNode) {
+                            "YOUTUBE_DIRECT", "INSTA_DIRECT", "BOTH_DIRECT" -> true
+                            "SAVE_FOLDER_ONLY" -> false
+                            else -> (wfTriggerHm == wfDelayedHm)
+                        }
+
+                        val canRun100PercentSilentlyInBg = when (wf.sourceNodeType) {
+                            "CUSTOM_WEB_URL" -> true
+                            "FOLDER_ONLY" -> bgUploadEnabled && wf.targetActionNode != "INSTA_DIRECT" && wf.targetActionNode != "BOTH_DIRECT"
+                            else -> flowExecMode == "BACKGROUND" && (
+                                !uploadImmediately ||
+                                    (bgUploadEnabled && wf.targetActionNode == "YOUTUBE_DIRECT")
+                                )
+                        }
+
+                        val phoneIdleNow = isPhoneCurrentlyIdleOrFree(120)
+
+                        if ((!canRun100PercentSilentlyInBg || runWhenIdleOnly) && !phoneIdleNow) {
+                            if (lastWaitLogMinute != nowHm) {
+                                lastWaitLogMinute = nowHm
+                                log("⏳ Scheduled task ($wfTriggerHm) waiting: User is currently active on phone. Will auto-adjust & run as soon as phone is idle for 2 min!")
+                            }
+                            continue
+                        }
+
+                        if (!canRun100PercentSilentlyInBg) {
+                            val unlockedAndReady = wakeUpScreenIfTimedOut()
+                            if (!unlockedAndReady) {
+                                if (lastWaitLogMinute != nowHm) {
+                                    lastWaitLogMinute = nowHm
+                                    log("🔒 Scheduled Live UI task ($wfTriggerHm) waiting: Screen is PIN/Pattern locked. Will auto-run as soon as phone is unlocked & idle!")
+                                }
+                                continue
+                            }
+                        }
+
+                        // Mark completed ONLY when actually launching!
                         wf.lastRunMinuteKey = todayMinuteKey
-                        lastTriggeredFlowMinute = nowHm
+                        lastTriggeredFlowDate = todayMinuteKey
+                        prefs.edit().putString("last_flow_run_date_key", todayMinuteKey).apply()
                         saveN8nWorkflowsToPrefs(prefs, workflows)
 
                         val wfTopic = wf.customStoryPrompt.trim().ifEmpty { mainStoryTopic }
@@ -1154,28 +1350,18 @@ class AutoTouchService : AccessibilityService() {
                             prefs.edit().putString("saved_flow_url", wf.sourceWebUrl).apply()
                         }
 
-                        val uploadImmediately = when (wf.targetActionNode) {
-                            "YOUTUBE_DIRECT" -> {
-                                prefs.edit().putBoolean("yt_link_enabled", true).apply()
-                                true
-                            }
-                            "INSTA_DIRECT" -> {
-                                prefs.edit().putBoolean("yt_link_enabled", false).putBoolean("insta_link_enabled", true).apply()
-                                true
-                            }
-                            "BOTH_DIRECT" -> {
-                                prefs.edit().putBoolean("yt_link_enabled", true).putBoolean("insta_link_enabled", true).apply()
-                                true
-                            }
-                            "SAVE_FOLDER_ONLY" -> false
-                            else -> (wfTriggerHm == wfDelayedHm)
+                        when (wf.targetActionNode) {
+                            "YOUTUBE_DIRECT" -> prefs.edit().putBoolean("yt_link_enabled", true).apply()
+                            "INSTA_DIRECT" -> prefs.edit().putBoolean("yt_link_enabled", false).putBoolean("insta_link_enabled", true).apply()
+                            "BOTH_DIRECT" -> prefs.edit().putBoolean("yt_link_enabled", true).putBoolean("insta_link_enabled", true).apply()
                         }
 
                         if (uploadImmediately) {
-                            lastTriggeredUploadMinute = nowHm
+                            lastTriggeredUploadDate = todayMinuteKey
+                            prefs.edit().putString("last_upload_run_date_key", todayMinuteKey).apply()
                         }
 
-                        log("🔗 n8n Workflow Triggered at $nowHm [Source=${wf.sourceNodeType}, Action=${wf.targetActionNode}, StoryEp=${wf.storyContinuationMode}]!")
+                        log("🔗 n8n Workflow Executing at $nowHm (Scheduled: $wfTriggerHm) [Source=${wf.sourceNodeType}, Action=${wf.targetActionNode}, StoryEp=${wf.storyContinuationMode}]!")
 
                         when (wf.sourceNodeType) {
                             "FOLDER_ONLY" -> {
@@ -1201,12 +1387,29 @@ class AutoTouchService : AccessibilityService() {
                         break
                     }
 
-                    // Check if a workflow has a separate Delayed Upload time
+                    // Check if a workflow has a separate Delayed Upload time (with auto-catchup!)
                     if (wf.targetActionNode == "DELAYED_UPLOAD" && wfDelayedHm != wfTriggerHm &&
-                        nowHm == wfDelayedHm && lastTriggeredUploadMinute != nowHm
+                        isTimeReachedOrMissedToday(nowHm, wfDelayedHm, lastTriggeredUploadDate, todayStr)
                     ) {
-                        lastTriggeredUploadMinute = nowHm
-                        log("🔗 n8n Delayed Upload Triggered at $nowHm from Folder [$folder]...")
+                        val canDelayedRunSilentlyInBg = bgUploadEnabled && !prefs.getBoolean("insta_link_enabled", false)
+                        if ((!canDelayedRunSilentlyInBg || runWhenIdleOnly) && !isPhoneCurrentlyIdleOrFree(120)) {
+                            if (lastWaitLogMinute != nowHm) {
+                                lastWaitLogMinute = nowHm
+                                log("⏳ Scheduled task ($wfDelayedHm) waiting: User is currently active on phone. Will auto-adjust & run as soon as phone is idle for 2 min!")
+                            }
+                            continue
+                        }
+                        if (!canDelayedRunSilentlyInBg && !wakeUpScreenIfTimedOut()) {
+                            if (lastWaitLogMinute != nowHm) {
+                                lastWaitLogMinute = nowHm
+                                log("🔒 Scheduled Delayed Upload ($wfDelayedHm) waiting: Screen is PIN-locked. Will auto-run once unlocked & idle!")
+                            }
+                            continue
+                        }
+
+                        lastTriggeredUploadDate = todayMinuteKey
+                        prefs.edit().putString("last_upload_run_date_key", todayMinuteKey).apply()
+                        log("🔗 n8n Delayed Upload Executing at $nowHm (Scheduled: $wfDelayedHm) from Folder [$folder]...")
                         startYouTubeFolderAutoUpload(folder, oldest)
                         triggeredFromN8nCard = true
                         break
@@ -1215,67 +1418,72 @@ class AutoTouchService : AccessibilityService() {
 
                 if (triggeredFromN8nCard) continue
 
-                // 2. Fallback check on primary Flow Create & Folder Upload time boxes (normalized to "HH:mm")
+                // 2. Fallback check on primary Flow Create & Folder Upload time boxes (normalized to "HH:mm" + auto-catchup!)
                 val flowCreateTimeHm = normalizeTimeHm24(
                     prefs.getString("flow_create_time_hm", prefs.getString("schedule_time_hm", "18:00")) ?: "18:00"
                 )
                 val folderUploadTimeHm = normalizeTimeHm24(
                     prefs.getString("folder_upload_time_hm", prefs.getString("schedule_time_hm", "19:00")) ?: "19:00"
                 )
-                val runWhenIdleOnly = prefs.getBoolean("run_only_when_idle", false)
                 val isSameTimeForBoth = flowCreateTimeHm == folderUploadTimeHm
 
-                if (nowHm == flowCreateTimeHm && lastTriggeredFlowMinute != nowHm) {
-                    lastTriggeredFlowMinute = nowHm
-                    if (isSameTimeForBoth) lastTriggeredUploadMinute = nowHm
-
-                    val flowExecMode = prefs.getString("flow_execution_mode", "BACKGROUND") ?: "BACKGROUND"
-                    if (runWhenIdleOnly && flowExecMode != "BACKGROUND" && !isPhoneCurrentlyIdleOrFree()) {
-                        hud.showScheduledTaskConfirmBanner(
-                            taskTitle = "🎬 Flow Video Generation ($flowCreateTimeHm)",
-                            onRunNow = { startGoogleFlowToYouTubePipeline(mainStoryTopic, credits, uploadImmediatelyAfterCreate = isSameTimeForBoth) },
-                            onSkip10Min = {
-                                prefs.edit().putLong("snooze_until_ms", System.currentTimeMillis() + 600_000L).apply()
-                                lastTriggeredFlowMinute = ""
-                            },
-                            onRunWhenIdle = {
-                                prefs.edit().putString("pending_idle_goal", "FLOW_CREATE_ONLY").apply()
-                            },
-                            onRunBackground = {
-                                prefs.edit().putString("flow_execution_mode", "BACKGROUND").apply()
-                                startGoogleFlowToYouTubePipeline(mainStoryTopic, credits, uploadImmediatelyAfterCreate = isSameTimeForBoth)
-                            }
+                if (isTimeReachedOrMissedToday(nowHm, flowCreateTimeHm, lastTriggeredFlowDate, todayStr)) {
+                    val isSilentBgPossible = (flowExecMode == "BACKGROUND") && (
+                        !isSameTimeForBoth ||
+                            (bgUploadEnabled && !prefs.getBoolean("insta_link_enabled", false))
                         )
-                    } else {
-                        log("⏰ Stage 1 Scheduler ($nowHm): Auto-Creating Flow Video & Saving to [$folder] (UploadNow=$isSameTimeForBoth)...")
-                        startGoogleFlowToYouTubePipeline(mainStoryTopic, credits, uploadImmediatelyAfterCreate = isSameTimeForBoth)
+
+                    if ((!isSilentBgPossible || runWhenIdleOnly) && !isPhoneCurrentlyIdleOrFree(120)) {
+                        if (lastWaitLogMinute != nowHm) {
+                            lastWaitLogMinute = nowHm
+                            log("⏳ Scheduled task ($flowCreateTimeHm) waiting: User is currently active on phone. Will auto-adjust & run as soon as phone is idle for 2 min!")
+                        }
+                        continue
                     }
+
+                    if (!isSilentBgPossible && !wakeUpScreenIfTimedOut()) {
+                        if (lastWaitLogMinute != nowHm) {
+                            lastWaitLogMinute = nowHm
+                            log("🔒 Scheduled task ($flowCreateTimeHm) waiting: Screen is PIN/Pattern locked. Will auto-run once unlocked & idle!")
+                        }
+                        continue
+                    }
+
+                    lastTriggeredFlowDate = todayMinuteKey
+                    prefs.edit().putString("last_flow_run_date_key", todayMinuteKey).apply()
+                    if (isSameTimeForBoth) {
+                        lastTriggeredUploadDate = todayMinuteKey
+                        prefs.edit().putString("last_upload_run_date_key", todayMinuteKey).apply()
+                    }
+
+                    log("⏰ Stage 1 Scheduler Executing at $nowHm (Scheduled: $flowCreateTimeHm): Auto-Creating Flow Video & Saving to [$folder] (UploadNow=$isSameTimeForBoth)...")
+                    startGoogleFlowToYouTubePipeline(mainStoryTopic, credits, uploadImmediatelyAfterCreate = isSameTimeForBoth)
                     continue
                 }
 
-                if (!isSameTimeForBoth && nowHm == folderUploadTimeHm && lastTriggeredUploadMinute != nowHm) {
-                    lastTriggeredUploadMinute = nowHm
-                    val bgUpload = prefs.getBoolean("bg_youtube_upload", false)
-                    if (runWhenIdleOnly && !bgUpload && !isPhoneCurrentlyIdleOrFree()) {
-                        hud.showScheduledTaskConfirmBanner(
-                            taskTitle = "📤 Folder Video Upload ($folderUploadTimeHm)",
-                            onRunNow = { startYouTubeFolderAutoUpload(folder, oldest) },
-                            onSkip10Min = {
-                                prefs.edit().putLong("snooze_until_ms", System.currentTimeMillis() + 600_000L).apply()
-                                lastTriggeredUploadMinute = ""
-                            },
-                            onRunWhenIdle = {
-                                prefs.edit().putString("pending_idle_goal", "FOLDER_UPLOAD_ONLY").apply()
-                            },
-                            onRunBackground = {
-                                prefs.edit().putBoolean("bg_youtube_upload", true).apply()
-                                startYouTubeFolderAutoUpload(folder, oldest)
-                            }
-                        )
-                    } else {
-                        log("⏰ Stage 2 Scheduler ($nowHm): Auto-Uploading Video from Folder [$folder] with Title & Description...")
-                        startYouTubeFolderAutoUpload(folder, oldest)
+                if (!isSameTimeForBoth && isTimeReachedOrMissedToday(nowHm, folderUploadTimeHm, lastTriggeredUploadDate, todayStr)) {
+                    val isUploadSilentBg = bgUploadEnabled && !prefs.getBoolean("insta_link_enabled", false)
+
+                    if ((!isUploadSilentBg || runWhenIdleOnly) && !isPhoneCurrentlyIdleOrFree(120)) {
+                        if (lastWaitLogMinute != nowHm) {
+                            lastWaitLogMinute = nowHm
+                            log("⏳ Scheduled task ($folderUploadTimeHm) waiting: User is currently active on phone. Will auto-adjust & run as soon as phone is idle for 2 min!")
+                        }
+                        continue
                     }
+
+                    if (!isUploadSilentBg && !wakeUpScreenIfTimedOut()) {
+                        if (lastWaitLogMinute != nowHm) {
+                            lastWaitLogMinute = nowHm
+                            log("🔒 Scheduled Upload ($folderUploadTimeHm) waiting: Screen is PIN/Pattern locked. Will auto-run once unlocked & idle!")
+                        }
+                        continue
+                    }
+
+                    lastTriggeredUploadDate = todayMinuteKey
+                    prefs.edit().putString("last_upload_run_date_key", todayMinuteKey).apply()
+                    log("⏰ Stage 2 Scheduler Executing at $nowHm (Scheduled: $folderUploadTimeHm): Auto-Uploading Video from Folder [$folder] with Title & Description...")
+                    startYouTubeFolderAutoUpload(folder, oldest)
                 }
             }
         }
