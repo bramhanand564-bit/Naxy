@@ -180,6 +180,15 @@ class GeminiBrain(private var apiKey: String) {
 
     var onBrainLog: ((String) -> Unit)? = null
 
+    companion object {
+        // FEATURE 3: Locked Character Visual DNA (0.1 to 0.4) for consistent 3D stylized appearances across all episodes
+        const val LOCKED_CHARACTER_VISUAL_DNA =
+            "0.1 Main Hero (Tara): fictional young adult Indian woman, cute chubby round face, soft cheeks, big dark brown eyes, warm brown skin, vibrant electric-blue hair in twin space-buns with glowing cyan clips, wearing a sleek white-and-teal futuristic cyber space-suit. " +
+            "0.2 Brother (Aarav): slim younger adult Indian brother, spiky jet-black hair with one silver streak on front, holographic goggles on forehead, orange-and-grey tech space-suit. " +
+            "0.3 Father (Vikram): broad-shouldered Indian father, neatly trimmed salt-and-pepper beard, short swept-back hair, navy-blue commander space-armor with gold stripes. " +
+            "0.4 Mother (Meera): graceful Indian mother, small glowing bindi, long dark-brown hair in a thick braided ponytail, crimson-red and silver scientist space-suit."
+    }
+
     init {
         parseAndApplyKeyConfig(apiKey)
     }
@@ -1434,6 +1443,7 @@ class GeminiBrain(private var apiKey: String) {
         return extracted
     }
 
+    // FEATURE 3 (Part 1): Preserves multi-line story prompts and 0.1 / 1.1 numbered points without cutting dots!
     fun sanitizeRawVideoTopic(rawTopicOrFileName: String): String {
         val trimmed = rawTopicOrFileName.trim()
         if (trimmed.length > 80 || trimmed.contains("\n") || trimmed.contains("0.1") || trimmed.contains("1.1")) {
@@ -1448,17 +1458,21 @@ class GeminiBrain(private var apiKey: String) {
         return withoutExt.ifBlank { "Amazing Cinematic Viral Short Video" }
     }
 
+    // FEATURE 3 (Part 2): Policy Sanitizer & 3D Stylized Unreal Engine 5 Film Look Enforcer
     fun sanitizePromptForGoogleFlowPolicy(rawPrompt: String, retryAttempt: Int = 0): String {
         var safe = rawPrompt
             .replace(Regex("(?i)\\b20[\\s\\-]*year[\\s\\-]*old\\s*(indian\\s*)?(girl|woman)\\b"), "fictional young adult Indian woman")
             .replace(Regex("(?i)\\b16[\\s\\-]*year[\\s\\-]*old\\s*(indian\\s*)?(boy|brother)\\b"), "fictional younger adult Indian brother")
             .replace(Regex("(?i)\\b\\d{1,2}[\\s\\-]*year[\\s\\-]*old\\s*(girl|woman|boy|man|person)?\\b"), "fictional adult character")
             .replace(Regex("(?i)\\byoung\\s+girl\\b"), "fictional young adult woman")
+            .replace(Regex("(?i)\\byoung\\s+boy\\b"), "fictional younger adult brother")
             .replace(Regex("(?i)\\bteen(age|ager)?\\s*(girl|boy|woman)?\\b"), "fictional young adult character")
-            .replace(Regex("(?i)\\bphotorealistic\\b"), "3D stylized cinematic Unreal Engine 5 film look")
+            .replace(Regex("(?i)\\b(photorealistic|hyper-realistic|hyperrealistic)\\b"), "3D stylized cinematic Unreal Engine 5 film look")
             .trim()
 
-        if (retryAttempt >= 1 && !safe.contains("3D stylized", ignoreCase = true)) {
+        if (!safe.contains("3D stylized", ignoreCase = true)) {
+            safe = "3D stylized cinematic Unreal Engine 5 film look, vertical 9:16 animation: $safe"
+        } else if (retryAttempt >= 1 && !safe.contains("Pixar", ignoreCase = true)) {
             safe = "3D stylized Pixar and Unreal Engine 5 cinematic vertical 9:16 animation: $safe"
         }
         return safe
@@ -1474,13 +1488,14 @@ class GeminiBrain(private var apiKey: String) {
             "$failedPrompt"
             Original story context: "${originalTopic.take(800)}"
             
-            Rewrite it into a 100% policy-safe, 3D stylized cinematic vertical 9:16 video prompt:
+            Rewrite it into a 100% policy-safe, 3D stylized cinematic Unreal Engine 5 film look vertical 9:16 video prompt:
             - NEVER use exact age numbers (like "20-year-old", "16-year-old", "girl", "boy", "minor", or "photorealistic").
-            - Instead use "3D stylized cinematic fictional young adult Indian woman (cute chubby round face, electric-blue hair in twin space-buns, white-and-teal futuristic space-suit)" and "fictional adult Indian family members".
-            - Keep the exact alien planet survival scene and Indian Hindi talking dialogue with lip-sync intact!
+            - Lock Character Visual DNA (0.1 to 0.4):
+              $LOCKED_CHARACTER_VISUAL_DNA
+            - Keep the exact alien planet survival scene and Indian Hindi talking dialogue with natural lip-sync intact!
             Return ONLY valid JSON:
             {
-              "safePrompt": "3D stylized cinematic 9:16 vertical sci-fi scene..."
+              "safePrompt": "3D stylized cinematic Unreal Engine 5 film look 9:16 vertical sci-fi scene..."
             }
         """.trimIndent()
 
@@ -1533,17 +1548,29 @@ class GeminiBrain(private var apiKey: String) {
         val episodicKeywords = listOf(
             "0.1", "1.1", "1.2", "badalatai", "badalti", "badalta", "nest story", "next story",
             "age badti", "aage badhti", "story full", "story sem", "story same",
-            "har bar", "episode", "part ", "कहानी आगे", "अगला पार्ट", "स्टेप-बाय-स्टेप", "सीरीज़", "series"
+            "har bar", "episode", "part ", "कहानी आगे", "अगला पार्ट", "स्टेप-बाय-स्टेप", "सीरीज़", "series",
+            "alien", "space", "indian family", "tara"
         )
         return episodicKeywords.any { lower.contains(it) }
     }
 
+    private fun isIndianFamilySpaceStory(rawTopic: String): Boolean {
+        val lower = rawTopic.lowercase(Locale.ROOT)
+        return lower.contains("0.1") ||
+            lower.contains("1.1") ||
+            lower.contains("tara") ||
+            lower.contains("aarav") ||
+            (lower.contains("indian") && (lower.contains("space") || lower.contains("alien") || lower.contains("planet") || lower.contains("family")))
+    }
+
+    // Matches exact numbered beat (e.g. "1.1" will never accidentally match "1.10")
     private fun extractNumberedEpisodeBeat(fullTopic: String, episodeNum: Int): String {
-        val targetMarker = "1.$episodeNum"
-        val lineMatch = fullTopic.lines().firstOrNull { it.trim().startsWith(targetMarker) }
+        val beatRegex = Regex("^1\\.$episodeNum(?!\\d)[\\s:.)-]*.*")
+        val lineMatch = fullTopic.lines().firstOrNull { beatRegex.matches(it.trim()) }
         return lineMatch?.trim() ?: ""
     }
 
+    // FEATURE 3 (Part 3): Generates 3D Stylized Prompt with Locked Character DNA (0.1-0.4), Sequential Episodes (1.1-1.10+), and Indian Hindi Lip-Sync
     suspend fun generateFlowPromptTitleAndDescription(
         topic: String,
         customDescriptionNote: String = "",
@@ -1552,6 +1579,7 @@ class GeminiBrain(private var apiKey: String) {
     ): FlowVideoMetadata {
         val cleanTopic = sanitizeRawVideoTopic(topic)
         val isEpisodic = forceEpisodicContinuation || isEpisodicStoryTopic(topic)
+        val isSpaceFamilyStory = isIndianFamilySpaceStory(cleanTopic)
 
         var episodeNum = 1
         var pastScenesText = ""
@@ -1571,6 +1599,25 @@ class GeminiBrain(private var apiKey: String) {
 
         val specificBeatForThisEpisode = extractNumberedEpisodeBeat(cleanTopic, episodeNum)
 
+        val defaultEpisode1To10Beats = mapOf(
+            1 to "1.1 Crash Landing on glowing bioluminescent alien planet: damaged Indian family spaceship smoking in background, Tara and family step out in awe and danger, speaking in Hindi: \"पापा, हमारा यान यहाँ क्रैश हो गया है, यह कौन सा अनजान एलियन ग्रह है?!\"",
+            2 to "1.2 Exploring the crystal jungle: giant glowing alien flora and floating rocks, brother Aarav scans with holographic goggles while giant shadow moves behind them, speaking in Hindi: \"दीदी, मेरे स्कैनर पर कोई बहुत बड़ा एलियन जीव पास आता दिख रहा है!\"",
+            3 to "1.3 Escaping the bioluminescent alien beast: six-legged glowing predator chases the family across a narrow energy bridge, father Vikram fires warning pulse shield, speaking in Hindi: \"सब लोग तेज़ी से गुफा की तरफ भागो, पीछे मत देखो!\"",
+            4 to "1.4 Discovering ancient alien ruins & power core: mother Meera decodes glowing holographic symbols inside a crystal cave to find energy for their ship, speaking in Hindi: \"इस एलियन क्रिस्टल से हम अपने स्पेसशिप का इंजन फिर से चालू कर सकते हैं!\"",
+            5 to "1.5 Crossing the acid-mist canyon: Tara uses her jet-boots and grapple tether to help Aarav and parents cross floating magnetic boulders, speaking in Hindi: \"मेरा हाथ कसकर पकड़ो आरव, नीचे मत देखना!\"",
+            6 to "1.6 Night storm of glowing meteors: the family takes shelter under a plasma dome while electric alien creatures circle outside, speaking in Hindi: \"हमें सुबह होने से पहले यह पावर कोर स्पेसशिप तक पहुँचाना ही होगा!\"",
+            7 to "1.7 Repairing the spaceship thruster in the alien swamp: sparks flying as Tara and Vikram install the glowing cyan crystal core while alien vines creep closer, speaking in Hindi: \"बस आखिरी केबल जोड़नी बाकी है, इंजन चार्ज हो रहा है!\"",
+            8 to "1.8 Countdown to Earth launch interrupted: cockpit holographic screens flash red as a colossal flying Leviathan grabs the ship's wing, speaking in Hindi: \"ओह नहीं! इंजन स्टार्ट होते ही इस विशाल एलियन ने हमारे शिप को जकड़ लिया!\"",
+            9 to "1.9 High-voltage defense pulse: Tara and Aarav climb onto the hull wing in glowing space-suits to fire a sonic shockwave and free the ship, speaking in Hindi: \"अभी पल्स फायर करो आरव, हमें पृथ्वी पर वापस लौटना ही है!\"",
+            10 to "1.10 Liftoff into orbit & sudden wormhole twist: the spaceship blasts off from the alien planet, but a giant purple cosmic portal opens in front of them, pulling them into an unknown galaxy, speaking in Hindi: \"हम उड़ तो गए, लेकिन यह रहस्यमयी पोर्टल हमें कहाँ खींच रहा है?!\""
+        )
+
+        val effectiveEpisodeBeat = when {
+            specificBeatForThisEpisode.isNotBlank() -> specificBeatForThisEpisode
+            isSpaceFamilyStory && episodeNum in 1..10 -> defaultEpisode1To10Beats[episodeNum] ?: ""
+            else -> ""
+        }
+
         val descHint = if (customDescriptionNote.isNotBlank()) {
             "Also include or follow this user description note: '$customDescriptionNote'."
         } else {
@@ -1588,12 +1635,12 @@ class GeminiBrain(private var apiKey: String) {
             EPISODIC STORY CONTINUATION MODE (CURRENT EPISODE #$episodeNum):
             - Master Story & Character Bible provided by user:
               "$cleanTopic"
-            - CHARACTER LOCK (NEVER CHANGE FACES, HAIR, OR SUITS):
-              Strictly include the exact physical appearance of the characters from 0.1, 0.2, 0.3, 0.4 in the videoPrompt (especially 0.1 Main Hero Tara: cute chubby round face, big dark brown eyes, warm brown skin, vibrant electric-blue hair styled in twin space-buns with glowing cyan clips, wearing a white-and-teal futuristic cyber space-suit, along with her brother Aarav in orange-grey suit with spiky black hair & silver streak, father Vikram in navy-gold commander armor with salt-and-pepper beard, and mother Meera in crimson-red scientist suit with glowing bindi & braided hair).
-            - HINDI TALKING DIALOGUE LOCK:
-              This MUST be a talking video with natural lip-sync where the characters speak aloud in clear, emotional Indian Hindi dialogue! Include the exact Hindi line they speak in quotes inside "videoPrompt".
+            - LOCKED CHARACTER VISUAL DNA (0.1 TO 0.4 — NEVER CHANGE FACES, HAIR, OR SUITS):
+              $LOCKED_CHARACTER_VISUAL_DNA
+            - MANDATORY INDIAN HINDI TALKING DIALOGUE (LIP-SYNC):
+              This MUST be a talking video with natural lip-sync where the characters speak aloud in clear, emotional Indian Hindi dialogue! Include the exact spoken Hindi line in quotes inside "videoPrompt".
             - SCENE FOR THIS EPISODE #$episodeNum:
-              ${if (specificBeatForThisEpisode.isNotBlank()) "Execute this exact story beat: '$specificBeatForThisEpisode'" else "All initial numbered beats are complete! Now advance the story to Episode #$episodeNum: invent a thrilling new alien planet location, a new alien creature or mystery, and a new attempt to repair/launch their spaceship back to Earth that gets blocked by an unexpected twist!"}
+              ${if (effectiveEpisodeBeat.isNotBlank()) "Execute this exact story beat (1.$episodeNum): '$effectiveEpisodeBeat'" else "Episode #$episodeNum (11+ Continuation): Invent the next sequential alien planet survival adventure where Tara (0.1), Aarav (0.2), Vikram (0.3), and Meera (0.4) explore a brand-new alien zone, escape a terrifying new alien beast, repair their spaceship, and face a sudden unexpected twist right as they attempt to launch back to Earth!"}
             - Previous episodes already generated (DO NOT repeat these): ${pastScenesText.ifBlank { "None yet (This is Episode 1!)" }}
             """.trimIndent()
         } else ""
@@ -1602,13 +1649,13 @@ class GeminiBrain(private var apiKey: String) {
             "Look at the attached video frame image and write a catchy, 100% matching viral YouTube Shorts / Instagram Reels title and description for what is shown in the video. NEVER include random file numbers or timestamps in the title!"
         } else {
             """
-            Create a vertical 9:16 3D cinematic video generation prompt for Google Flow (Veo), a viral Hinglish/Hindi YouTube Shorts title, and a full description based on the user's topic:
+            Create a vertical 9:16 "3D stylized cinematic Unreal Engine 5 film look" video generation prompt for Google Flow (Veo), a viral Hinglish/Hindi YouTube Shorts title, and a full description based on the user's topic:
             $episodicInstruction
             ${if (!isEpisodic) "User Topic: '$cleanTopic'" else ""}
             
-            CRITICAL GOOGLE FLOW SAFETY RULES FOR "videoPrompt":
-            1. Write "videoPrompt" in rich English visual descriptions (so Google Flow renders exact faces, hair, suits, and camera action) PLUS include the exact spoken Indian Hindi dialogue line in quotes (e.g., speaking in Hindi with expressive lip-sync: "...").
-            2. NEVER use age numbers like "20-year-old", "16-year-old", "girl", "boy", or "photorealistic" because Google Flow blocks age numbers! Always write "3D stylized cinematic fictional young adult Indian woman" and "fictional younger adult Indian brother".
+            CRITICAL GOOGLE FLOW SAFETY & VISUAL RULES FOR "videoPrompt":
+            1. ALWAYS use "3D stylized cinematic Unreal Engine 5 film look" (NEVER use "photorealistic" or age numbers like "20-year-old" or "16-year-old").
+            2. Write "videoPrompt" in rich English visual descriptions (explicitly including the locked character visual DNA 0.1 Tara's electric-blue twin space-buns, chubby round face, white-and-teal space-suit, 0.2 Aarav's spiky black hair with silver streak & orange-grey suit, 0.3 Vikram's navy-gold commander armor, and 0.4 Meera's crimson-red scientist suit & bindi) PLUS include the exact spoken Indian Hindi dialogue line in quotes with natural lip-sync!
             CRITICAL YOUTUBE SHORTS TITLE RULE FOR "youtubeTitle":
             1. "youtubeTitle" MUST be a punchy, curiosity-inducing Hindi/Hinglish viral title (including "Ep $episodeNum" if episodic) ending with "#shorts #viral" and strictly UNDER 85 characters total!
             """.trimIndent()
@@ -1619,7 +1666,7 @@ class GeminiBrain(private var apiKey: String) {
             $descHint
             Return ONLY valid JSON:
             {
-              "videoPrompt": "3D stylized Unreal Engine 5 cinematic 9:16 vertical shot...",
+              "videoPrompt": "3D stylized cinematic Unreal Engine 5 film look, 9:16 vertical sci-fi scene...",
               "youtubeTitle": "अंतरिक्ष में फंसा भारतीय परिवार Ep $episodeNum! 😱🚀 #shorts #viral",
               "youtubeDescription": "Full engaging Hindi/Hinglish description with hashtags..."
             }
@@ -1632,6 +1679,18 @@ class GeminiBrain(private var apiKey: String) {
             preferredGear = if (frameB64List.isNotEmpty()) "COPILOT_38_ROBOTICS" else "GEMMA_TEXT",
             callPurpose = if (isEpisodic) "Story Ep #$episodeNum Prompt & Title" else "Flow Prompt + Viral Title & Description"
         )
+
+        val defaultSpacePrompt = buildString {
+            append("3D stylized cinematic Unreal Engine 5 film look, 9:16 vertical sci-fi scene on a glowing alien planet: ")
+            append(LOCKED_CHARACTER_VISUAL_DNA).append(" ")
+            if (effectiveEpisodeBeat.isNotBlank()) {
+                append("Current Scene: ").append(effectiveEpisodeBeat).append(" ")
+            } else {
+                append("Current Scene (Episode $episodeNum): The family explores a mysterious new alien zone while repairing their spaceship to return to Earth, when a sudden alien twist blocks their launchpad, speaking aloud in emotional Indian Hindi dialogue with natural lip-sync: \"पापा, लॉन्चपैड के नीचे से कोई विशाल एलियन जाग रहा है, जल्दी इंजन स्टार्ट करो!\" ")
+            }
+            append("Dramatic volumetric lighting, expressive facial animation and natural Hindi lip-sync.")
+        }
+
         return try {
             val j = parseCleanJson(raw)
             val fallbackTitle = formatCleanShortsTitle95(
@@ -1644,10 +1703,19 @@ class GeminiBrain(private var apiKey: String) {
                 if (customDescriptionNote.isNotBlank()) append("\n\n").append(customDescriptionNote)
                 append("\n\n#shorts #viral #trending #scifi #hindistory #youtubeshorts #reels")
             }
-            val defaultSpacePrompt =
-                "3D stylized Unreal Engine 5 cinematic 9:16 vertical sci-fi scene on a glowing alien planet: main hero Tara (fictional young adult Indian woman with a cute chubby round face, big dark brown eyes, vibrant electric-blue hair in twin space-buns with glowing cyan clips, wearing a white-and-teal futuristic space-suit) with her Indian family (brother Aarav with spiky black hair and silver streak in orange-grey suit, father Vikram with salt-and-pepper beard in navy-gold armor, mother Meera with glowing bindi and braided brown hair in crimson-red scientist suit), speaking aloud in emotional Indian Hindi dialogue with natural lip-sync: \"पापा, हमें जल्दी सुरक्षित रास्ता ढूँढना होगा!\", dramatic volumetric lighting, ultra detailed."
 
-            val rawVideoPrompt = j.optString("videoPrompt", defaultSpacePrompt).ifBlank { defaultSpacePrompt }
+            var rawVideoPrompt = j.optString("videoPrompt", defaultSpacePrompt).ifBlank { defaultSpacePrompt }
+
+            // Enforce Character DNA & Hindi Lip-Sync if the model omitted them in Space Family Story mode
+            if ((isSpaceFamilyStory || isEpisodic) && frameB64List.isEmpty()) {
+                if (!rawVideoPrompt.contains("electric-blue", ignoreCase = true) && !rawVideoPrompt.contains("space-buns", ignoreCase = true)) {
+                    rawVideoPrompt = "$LOCKED_CHARACTER_VISUAL_DNA Scene: $rawVideoPrompt"
+                }
+                if (!rawVideoPrompt.contains("Hindi", ignoreCase = true) && !rawVideoPrompt.contains("lip-sync", ignoreCase = true)) {
+                    rawVideoPrompt = "$rawVideoPrompt Speaking aloud in clear emotional Indian Hindi dialogue with natural lip-sync: \"पापा, हमें जल्दी अपने स्पेसशिप को ठीक करके पृथ्वी पर लौटना होगा!\""
+                }
+            }
+
             val safeVideoPrompt = sanitizePromptForGoogleFlowPolicy(rawVideoPrompt, 0)
             val cleanShortTitle = formatCleanShortsTitle95(j.optString("youtubeTitle", fallbackTitle), cleanTopic)
 
@@ -1668,10 +1736,7 @@ class GeminiBrain(private var apiKey: String) {
                 if (customDescriptionNote.isNotBlank()) append("\n\n").append(customDescriptionNote)
                 append("\n\n#shorts #viral #trending #scifi #hindistory #youtubeshorts #reels")
             }
-            val safeFallbackPrompt = sanitizePromptForGoogleFlowPolicy(
-                "3D stylized Unreal Engine 5 cinematic 9:16 vertical sci-fi scene on a glowing alien planet: main hero Tara (fictional young adult Indian woman with a cute chubby round face, big dark brown eyes, vibrant electric-blue hair in twin space-buns with glowing cyan clips, wearing a white-and-teal futuristic space-suit) leading her Indian family (brother in orange-grey suit with spiky black hair and silver streak, father in navy-gold commander armor, mother in crimson-red scientist suit with bindi and braided hair), speaking aloud in clear Indian Hindi dialogue with natural lip-sync, cinematic lighting",
-                0
-            )
+            val safeFallbackPrompt = sanitizePromptForGoogleFlowPolicy(defaultSpacePrompt, 0)
             FlowVideoMetadata(
                 videoPrompt = safeFallbackPrompt,
                 viralTitle = formatCleanShortsTitle95("एलियन ग्रह पर भारतीय परिवार Ep $episodeNum! 😱🚀 #shorts #viral", cleanTopic),
